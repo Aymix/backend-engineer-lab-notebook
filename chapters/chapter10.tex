@@ -1,0 +1,548 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 10 ============================
+\daychapter{10}{Distributed Systems}{Messaging \& Event-Driven Architecture}{RabbitMQ, Kafka, retries \& the dead letter queue}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Decide \emph{when} to replace a direct synchronous call with asynchronous messaging --- and when messaging is the wrong tool.
+  \item Explain the RabbitMQ broker model (exchange $\rightarrow$ binding $\rightarrow$ queue) and the Kafka log model, and pick correctly for a given access pattern.
+  \item Implement a producer and a consumer with Spring AMQP, including a bounded retry policy with exponential backoff.
+  \item Route messages that fail persistently to a Dead Letter Queue so failures are visible and inspectable, never silent.
+  \item Design consumers to be \keyterm{idempotent} under at-least-once delivery, so a redelivered message never charges a card or sends an email twice.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Until now every part of ShopFlow that needed to happen when an order was placed happened \emph{inline}, on the request thread: validate, persist, then send the confirmation email. That works until the email provider is slow or down --- and now the customer waits three seconds for a spinner, or the whole \code{placeOrder} call fails because a mail server hiccupped. This day answers the question that turns a monolith into a \emph{distributed system}: how do you let one part of the application tell another part "this happened" without waiting for it, without being coupled to it, and without losing the message if the other part is temporarily broken?
+
+\glabel{Why backend engineers need it.} Every backend of meaningful size is eventually a set of services (or modules) that must react to each other's events: an order triggers an email, a payment triggers a receipt, a signup triggers a welcome flow. Wiring these with direct calls makes the slowest and least reliable link determine your entire response time and failure rate. \keyterm{Messaging} is how the industry decouples them. Knowing \emph{when} to use it, and how to make it reliable, is a defining mid-to-senior skill --- and it is where a lot of production incidents are born.
+
+\begin{keyidea}
+A message broker is a \keyterm{buffer with delivery guarantees} placed between a producer and a consumer. The producer's job ends when the broker has durably accepted the message; the consumer processes it later, at its own pace, and can fail and retry without the producer ever knowing. That one indirection buys you decoupling, resilience, and independent scaling --- and costs you the certainties of a synchronous call: ordering, exactly-once, and an immediate answer.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} Messaging sits at the \emph{edges} of your service, alongside the database. Your controller (Day 4) and service layer still do the synchronous work that must return an answer --- "is this order valid, did it persist?" --- and then hand off the \emph{consequences} of that work ("tell the customer") to a broker. The consumer is just another Spring bean, wrapped by a listener-container proxy, driven by the same lifecycle you learned on Day 1.
+
+\begin{wbfigure}{Fig 10.0 --- The broker sits between two independent flows: the request path returns fast; the email path runs on its own thread, later.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=26mm] (client) {\textbf{Client}\\\scriptsize POST /orders};
+  \node[wbbox, right=of client, text width=30mm] (svc) {\textbf{Order Service}\\\scriptsize validate + persist\\then \emph{publish}};
+  \node[wbboxaccent, right=of svc, text width=26mm] (broker) {\textbf{Broker}\\\scriptsize durable buffer};
+  \node[wbboxgood, below=14mm of broker, text width=30mm] (consumer) {\textbf{Email Consumer}\\\scriptsize sends mail, retries,\\own thread};
+  \draw[wbarrow] (client)--(svc);
+  \draw[wbarrow] (svc)--(broker);
+  \draw[wbarrow, dashed] (svc.south) to[out=-90,in=180] node[wbcap, below, midway]{201 Created (fast)} ([xshift=-6mm]client.south);
+  \draw[wbarrow] (broker)--(consumer);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} On Day 7 you already decoupled the email using an in-process Spring \code{ApplicationEvent} --- a publisher and an \code{@EventListener} in the \emph{same} JVM. That was the right first step, and it taught the shape. But an in-process event dies with the process: if the JVM crashes between "order saved" and "email sent," the email is lost forever, because the event lived only in memory. Today you move that same publish/subscribe pattern onto a \emph{real broker} so the message survives a crash, survives a slow consumer, and can be retried. Day 9's caching stays exactly as it was; messaging is orthogonal to it.
+
+\glabel{Real company examples.} Uber's dispatch, receipts and analytics pipelines are event-driven at their core. Netflix moves billions of events a day through Kafka for its data platform. Banks use RabbitMQ for transactional workflow queues where each task must be processed exactly once by exactly one worker. Almost every "we send you an email / push / receipt after you do X" feature you have ever used is a message on a queue.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture before the details. A message is \emph{published} by a producer, \emph{routed} by the broker to one or more queues, \emph{consumed} by a worker, and --- if the worker keeps failing --- \emph{dead-lettered} for a human to inspect.
+
+\begin{wbfigure}{Fig 10.1 --- The Day 10 concept map: publish, route, consume, retry, and dead-letter. Idempotency guards the consumer against duplicates.}
+\wbscale{\begin{tikzpicture}[node distance=5.5mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=24mm] (prod) {\textbf{Producer}\\\scriptsize publishes event};
+  \node[wbboxaccent, right=of prod, text width=24mm] (ex) {\textbf{Exchange}\\\scriptsize routes by key};
+  \node[wbbox, right=of ex, text width=24mm] (queue) {\textbf{Queue}\\\scriptsize durable buffer};
+  \node[wbboxgood, below=10mm of queue, text width=26mm] (cons) {\textbf{Consumer}\\\scriptsize idempotent worker};
+  \node[wbboxghost, left=of cons, text width=24mm] (retry) {\textbf{Retry}\\\scriptsize backoff x3};
+  \node[wbboxwarn, left=of retry, text width=24mm] (dlq) {\textbf{Dead Letter}\\\scriptsize after max tries};
+  \draw[wbarrow] (prod)--(ex);
+  \draw[wbarrow] (ex)--(queue);
+  \draw[wbarrow] (queue)--(cons);
+  \draw[wbarrow] (cons)--(retry);
+  \draw[wbarrow] (retry)--(dlq);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Producer} $\rightarrow$ \keyterm{Exchange} $\rightarrow$ \keyterm{Binding} $\rightarrow$ \keyterm{Queue} $\rightarrow$ \keyterm{Consumer} $\rightarrow$ \keyterm{Ack/Nack} $\rightarrow$ \keyterm{Retry} $\rightarrow$ \keyterm{Dead Letter Queue} $\rightarrow$ \keyterm{Idempotency}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Why Go Async At All}
+
+\glabel{What is it?} Asynchronous messaging replaces a direct in-process or in-request call (\code{emailService.send(...)}, which blocks until it returns) with a \emph{fire-and-hand-off}: the producer writes a message to a broker and returns immediately. Someone else reads it later.
+
+\glabel{Why does it exist?} Consider the classic synchronous chain: order service calls payment, which calls email, all inline on one thread. Three problems compound. First, \keyterm{latency adds up} --- the customer waits for the sum of every hop. Second, \keyterm{failure couples} --- if the email server is down, the order fails, even though the order itself was perfectly valid. Third, \keyterm{scaling couples} --- you cannot scale the slow email work independently of the fast order work. Event-driven architecture cuts all three: the order service publishes \code{OrderPlaced} and moves on; email, analytics and inventory each react on their own thread, at their own pace, and a failure in one does not block the others.
+
+\begin{wbfigure}{Fig 10.2 --- Synchronous (top): total time and failure are the sum of the chain. Async (bottom): the request returns after persist; consumers fan out independently.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\footnotesize}]
+  % synchronous row
+  \node[wbboxghost, text width=18mm] (o1) {\textbf{Order}};
+  \node[wbboxwarn, right=of o1, text width=18mm] (p1) {\textbf{Payment}};
+  \node[wbboxwarn, right=of p1, text width=18mm] (e1) {\textbf{Email}};
+  \node[wbboxwarn, right=of e1, text width=20mm] (r1) {\textbf{Response}\\\scriptsize sum of all};
+  \draw[wbarrow] (o1)--(p1); \draw[wbarrow] (p1)--(e1); \draw[wbarrow] (e1)--(r1);
+  \node[wbcap, left=2mm of o1, align=right, text width=16mm] {sync\\chain};
+  % async row
+  \node[wbbox, below=14mm of o1, text width=18mm] (o2) {\textbf{Order}\\\scriptsize persist};
+  \node[wbboxaccent, right=of o2, text width=18mm] (b2) {\textbf{Broker}};
+  \node[wbboxgood, above right=1mm and 8mm of b2, text width=18mm] (e2) {\textbf{Email}};
+  \node[wbboxgood, right=of b2, text width=18mm] (a2) {\textbf{Analytics}};
+  \node[wbboxgood, below right=1mm and 8mm of b2, text width=18mm] (i2) {\textbf{Inventory}};
+  \draw[wbarrow] (o2)--(b2);
+  \draw[wbarrow] (b2)--(e2); \draw[wbarrow] (b2)--(a2); \draw[wbarrow] (b2)--(i2);
+  \node[wbcap, left=2mm of o2, align=right, text width=16mm] {async\\fan-out};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} When the work is a \emph{consequence} of the main action, not part of deciding whether the main action succeeds. Sending a confirmation email, updating a search index, emitting an analytics event, warming a cache --- none of these need to finish before you tell the customer "order placed." Also use it to smooth load spikes: the queue absorbs a burst and the consumer drains it at a sustainable rate.
+
+\glabel{When should I \emph{not}?} When the caller genuinely needs the answer to proceed. "Is this coupon valid?" "Is this seat still available?" "Did the payment authorise?" --- these are \emph{questions}, and a question needs a synchronous reply. Pushing them onto a queue just to look modern gives you all the complexity of distributed systems with none of the benefit, and forces you to invent a fragile request/response-over-messaging protocol to get the answer back.
+
+\begin{misconception}
+"Async is always faster." It is not --- the \emph{total} work is the same or slightly more (you added a broker hop and serialization). What changes is \emph{perceived} latency for the caller and \emph{isolation} of failures. If you measured end-to-end time from click to email-delivered, async is often marginally slower. You trade a little total time for a lot of resilience and responsiveness.
+\end{misconception}
+
+\wbsub{3.2\quad The Broker's Anatomy --- Exchanges, Bindings, Queues}
+
+\glabel{What is it?} In RabbitMQ a producer never publishes to a queue directly. It publishes to an \keyterm{exchange} with a \keyterm{routing key}. The exchange applies its type's rules to route a copy of the message into zero or more \keyterm{queues} it is \keyterm{bound} to. Consumers read from queues. This indirection is what lets you add a new consumer (analytics) later without the producer ever changing.
+
+\glabel{How does it work internally?} The exchange \emph{type} decides the routing rule: a \code{direct} exchange delivers to queues whose binding key exactly equals the routing key; a \code{topic} exchange matches wildcard patterns like \code{order.*}; a \code{fanout} exchange ignores the key and copies to every bound queue. A message accepted by the broker is held in the queue --- in memory and, if the queue is \code{durable} and the message \code{persistent}, on disk --- until a consumer \keyterm{acknowledges} it. Until the ack arrives, the broker considers the message unprocessed and will redeliver it if the consumer dies.
+
+\begin{wbfigure}{Fig 10.3 --- One publish, two queues. The exchange routes by key; adding the analytics queue needs no change to the producer.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=28mm] (prod) {\textbf{Producer}\\\scriptsize key = order.placed};
+  \node[wbboxaccent, right=of prod, text width=30mm] (ex) {\textbf{orders.exchange}\\\scriptsize topic exchange};
+  \node[wbboxgood, above right=2mm and 12mm of ex, text width=30mm] (q1) {\textbf{orders.placed}\\\scriptsize $\rightarrow$ email consumer};
+  \node[wbboxgood, below right=2mm and 12mm of ex, text width=30mm] (q2) {\textbf{orders.analytics}\\\scriptsize $\rightarrow$ analytics consumer};
+  \draw[wbarrow] (prod)--(ex);
+  \draw[wbarrow] (ex)-- node[wbcap, above, sloped]{order.*} (q1);
+  \draw[wbarrow] (ex)-- node[wbcap, below, sloped]{order.*} (q2);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+The \keyterm{acknowledgement} is the heart of reliability. In the default \code{AUTO} ack mode, Spring AMQP acks a message only after your \code{@RabbitListener} method returns \emph{normally}. If the method throws, the message is \code{nack}ed and (depending on config) requeued or dead-lettered. This is why "at-least-once" is the natural default: the broker will not forget a message until someone confirms success, so a crash mid-processing means redelivery, not loss.
+\end{behind}
+
+\wbsub{3.3\quad RabbitMQ vs Kafka --- Pick Based On The Actual Problem}
+
+\glabel{What is it?} They are both called "message systems," but they are different data structures wearing similar clothes. RabbitMQ is a \keyterm{smart broker with dumb consumers}: it routes, tracks per-message acknowledgement, and \emph{deletes a message once it is consumed}. Kafka is a \keyterm{dumb broker with smart consumers}: it is an append-only, partitioned \keyterm{commit log} that \emph{retains every message for a configured time regardless of consumption}, and each consumer tracks its own read position (offset).
+
+\glabel{How does it work internally?} In RabbitMQ, a message is a transient thing en route to a worker; once acked, it is gone. Ordering is per-queue, and competing consumers on one queue share the load (a work queue). In Kafka, a topic is split into \keyterm{partitions}; each partition is an ordered, immutable log. A message's key decides its partition, so ordering is guaranteed only \emph{within} a partition. A brand-new consumer group can start reading from offset zero and \keyterm{replay} the entire history --- something RabbitMQ simply cannot do, because the messages were deleted on consumption.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{24mm} X X@{}}
+\wbtablehead{Dimension} & \wbtablehead{RabbitMQ} & \wbtablehead{Kafka}\\\midrule
+Model & Broker with smart routing (exchanges/queues) & Distributed, partitioned commit log\\
+Best for & Task queues, RPC-style workflows, complex routing & High-throughput streaming, event sourcing, replay\\
+Retention & Deleted once consumed (by default) & Retained for a configured period regardless of consumption\\
+Ordering & Per-queue & Per-partition\\
+Consumer model & Broker pushes; competing workers share a queue & Consumer pulls; tracks its own offset\\
+Typical line & "Send this email," "process this job" & "Every order-placed event, replayable by any new consumer"\\
+\end{tabularx}\end{center}
+
+\glabel{When should I use RabbitMQ?} When each message is a \emph{task} to be done once by one worker, when you need rich routing (topic/header-based), and when the natural lifecycle is "do it, ack it, forget it." ShopFlow's confirmation email is exactly this: one order-placed event, one email, done. That is why this chapter builds on RabbitMQ.
+
+\glabel{When should I use Kafka?} When you need \emph{throughput} (hundreds of thousands of events a second), \emph{replay} (a new fraud-detection service wants to re-read the last month of orders), or \emph{event sourcing} (the log \emph{is} the source of truth). If your answer to "what if we add a new consumer next year that needs the old events?" is "it must see history," you want Kafka's retention.
+
+\begin{seniornote}
+The junior framing is "Kafka is newer/faster, so default to Kafka." The senior framing is "what is the \emph{shape} of my data access?" A task that must be done once by one worker and then forgotten is a RabbitMQ queue. A stream of facts that many independent consumers read at their own pace, possibly replaying history, is a Kafka log. Choosing the log for a task queue means you now hand-roll "has this been processed?" tracking that Rabbit gave you for free; choosing the queue for a replayable stream means the data you will want next quarter is already deleted.
+\end{seniornote}
+
+\wbsub{3.4\quad Retries, Backoff, and the Dead Letter Queue}
+
+\glabel{What is it?} A consumer will sometimes fail to process a message: the mail server had a brief blip, the database held a momentary lock, a downstream API timed out. These are \keyterm{transient} failures --- the same message would probably succeed if tried again in a second. A \keyterm{retry policy} re-attempts processing a bounded number of times, ideally with \keyterm{exponential backoff} (wait 1s, then 2s, then 4s) so you do not hammer a struggling dependency. When the retries are \emph{exhausted}, the message is routed to a \keyterm{Dead Letter Queue} (DLQ) --- a separate holding queue for messages that could not be processed --- instead of being retried forever or silently dropped.
+
+\glabel{Why does it exist?} Two failure modes must be told apart. A \keyterm{transient} failure clears on its own; blind retry fixes it. A \keyterm{poison message} --- malformed payload, a bug that throws on this specific input, a permanently deleted referenced record --- will \emph{never} succeed. If you retry a poison message forever, it sits at the head of the queue and \keyterm{blocks every message behind it} (head-of-line blocking), starving the whole system for one bad input. The DLQ is the escape valve: after a bounded number of tries, move the poison message aside so the queue keeps flowing, and so a human (or an alert) can inspect exactly what failed and why.
+
+\begin{wbfigure}{Fig 10.4 --- The retry-then-dead-letter flow. Transient failures resolve on retry; persistent failures are parked in the DLQ for inspection, never lost, never blocking.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=60mm, minimum height=8mm, align=left, text width=54mm}]
+  \node[stage] (in) {\textbf{Message delivered} to consumer};
+  \node[stage, wbboxgood, below=of in] (ok) {\textbf{Process succeeds} $\rightarrow$ ack, done};
+  \node[stage, wbboxwarn, below=9mm of ok] (fail) {\textbf{Process throws} $\rightarrow$ attempt < 3? backoff \& retry};
+  \node[stage, wbboxaccent, below=of fail] (retry) {\textbf{Retry with backoff} (1s, 2s, 4s)};
+  \node[stage, wbboxwarn, below=of retry, text width=54mm] (dead) {\textbf{Attempts exhausted} $\rightarrow$ route to Dead Letter Queue};
+  \node[stage, wbboxghost, below=of dead] (alert) {\textbf{DLQ} $\rightarrow$ alert / manual review / replay};
+  \draw[wbarrow] (in)--(ok);
+  \draw[wbarrow] (in.south) to[out=-90,in=90] (fail.north);
+  \draw[wbarrow] (fail)--(retry);
+  \draw[wbarrow] (retry.east) to[out=0,in=0] node[wbcap, right, midway]{try again} (in.east);
+  \draw[wbarrow] (fail.west) to[out=180,in=180] node[wbcap, left, midway]{no more tries} (dead.west);
+  \draw[wbarrow] (dead)--(alert);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} In Spring AMQP the simplest retry lives \emph{in the listener container}: when your \code{@RabbitListener} throws, a \code{RetryTemplate} catches it and re-invokes your method after a backoff, up to \code{max-attempts}. If all attempts fail, the container gives up and, because you set \code{default-requeue-rejected: false}, the message is \code{nack}ed \emph{without} requeue --- which, on a queue configured with a \code{x-dead-letter-exchange}, routes it to the DLQ. A common production alternative is \keyterm{broker-side retry via TTL}: the message goes to a "wait" queue with a time-to-live and a dead-letter binding back to the work queue, so the backoff happens in the broker rather than by blocking a consumer thread.
+
+\begin{perfnote}
+In-container retry blocks the consumer thread during the backoff sleep. With \code{max-attempts: 3} and a max interval of a few seconds that is fine. But do not set a 5-minute backoff on an in-container retry --- you would tie up a worker thread doing nothing for five minutes, throttling your whole consumer. Long backoffs belong in a broker-side TTL/DLX delay queue, where the wait costs no thread.
+\end{perfnote}
+
+\begin{secwarn}[never requeue a poison message forever]
+The single most damaging misconfiguration here is leaving \code{default-requeue-rejected} at its default of \code{true} with \emph{no} retry limit. A message that always throws is nacked, requeued at the head, redelivered, throws again --- an infinite hot loop that pins a CPU, spams your logs, and blocks the queue. Always bound the attempts and always give the queue a dead-letter target.
+\end{secwarn}
+
+\wbsub{3.5\quad Delivery Guarantees \& Idempotency}
+
+\glabel{What is it?} A \keyterm{delivery guarantee} is the contract for how many times a message may reach your consumer. \keyterm{At-most-once} (fire and forget) can lose messages if the consumer dies before processing --- acceptable only for disposable data like metrics samples. \keyterm{At-least-once} is the default for any reliable setup: the broker keeps the message until you ack success, so a crash mid-processing means the message is \emph{redelivered}. \keyterm{Exactly-once} is the holy grail and is genuinely expensive; in practice it is \emph{approximated} by making an at-least-once consumer \keyterm{idempotent}, so processing the same message twice has the same effect as processing it once.
+
+\glabel{Why does it exist?} The moment you cross a network you cannot have both "never lose a message" and "never deliver twice" without heavy coordination. Consider: the consumer processes the message, sends the ack, and the ack is lost on the wire. The broker never heard the ack, so it redelivers. Your consumer now sees the same message a second time. At-least-once accepts this reality; the burden shifts to \emph{you} to make a duplicate harmless.
+
+\glabel{How does it work internally?} An \keyterm{idempotent} consumer records which messages it has already handled and skips repeats. The standard technique is a \keyterm{processed-message table}: each event carries a unique message ID; before doing the work, the consumer tries to insert that ID into a \code{processed\_messages} table with a unique constraint. If the insert succeeds, this is the first time --- do the work. If it violates the unique constraint, this is a duplicate --- ack and skip. Because the insert and the work commit in the same transaction, a crash between them redelivers and safely retries; a successful duplicate is caught by the constraint.
+
+\begin{wbfigure}{Fig 10.5 --- Idempotent consume: the unique constraint on the message ID is the guard that turns "at-least-once" into "effectively once."}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=58mm, minimum height=8mm, align=left, text width=52mm}]
+  \node[stage] (recv) {\textbf{Receive} event with messageId};
+  \node[stage, wbboxdb, below=of recv] (ins) {\textbf{INSERT messageId} into processed\_messages};
+  \node[stage, wbboxgood, below=9mm of ins] (new) {\textbf{Insert OK (new)} $\rightarrow$ send email, commit};
+  \node[stage, wbboxghost, below=of new] (dup) {\textbf{Constraint violated (duplicate)} $\rightarrow$ skip, ack};
+  \draw[wbarrow] (recv)--(ins);
+  \draw[wbarrow] (ins.south) to[out=-90,in=90] (new.north);
+  \draw[wbarrow] (ins.east) to[out=0,in=0] node[wbcap, right, midway]{already seen} (dup.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{misconception}
+"We use exactly-once delivery, so we do not need idempotency." Almost no real system has true end-to-end exactly-once across a broker and an external side effect like sending an email. Even Kafka's "exactly-once semantics" applies to reads-and-writes \emph{within} Kafka, not to the SMTP call your consumer makes. Treat idempotency as mandatory: assume redelivery will happen, and make it harmless. The consumer that assumes it will never see a duplicate is the consumer that double-charges a customer.
+\end{misconception}
+
+\begin{interview}
+Expect: \emph{"How do you handle duplicate message delivery?"} The answer that lands is not "we use exactly-once." It is: "at-least-once is the realistic guarantee, so I make the consumer idempotent --- dedupe on a unique message ID, typically via a unique constraint on a processed-messages table inside the same transaction as the side effect, so a redelivery is caught and skipped." Name the mechanism.
+\end{interview}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Make consumers idempotent (dedupe by message ID) --- assume at-least-once delivery, always.
+  \item Always configure a DLQ and a bounded retry count; never let a poison message block or loop forever.
+  \item Keep payloads small and versioned; a schema field lets consumers evolve without breaking on old messages.
+  \item Propagate a correlation ID from the producing request into the message headers, so you can trace one event across service logs.
+  \item Publish only \emph{after} the source-of-truth write commits, so you never announce an order that was rolled back.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Assuming exactly-once delivery and not handling duplicates --- the classic double-email, double-charge bug.
+  \item No retry limit, so a bad message loops forever and starves the queue.
+  \item Using messaging for something that needs a synchronous answer ("is this coupon valid?").
+  \item Ignoring ordering requirements when they genuinely matter (state transitions arriving out of order).
+  \item Fat, unversioned payloads that break every consumer the day you add a field.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have met five diagrams. Redraw two \emph{from memory} --- reproducing them is what moves them from "recognised" to "known."
+
+\begin{writespace}[Redraw: the retry-then-dead-letter flow (Fig 10.4), labelling where backoff happens and where the DLQ catches poison messages]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the idempotent-consume path (Fig 10.5) --- show the unique constraint deciding "new" vs "duplicate"]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Publish, Consume, Retry, DLQ}
+
+\textbf{Goal of this lab:} take ShopFlow's confirmation email off the request thread and onto RabbitMQ. You will publish an \code{OrderPlacedEvent}, consume it in a listener that sends the email, add a bounded retry with backoff, route exhausted messages to a DLQ, and make the consumer idempotent. Guide yourself through it --- do not paste a finished solution.
+
+\resetlab
+\labstep{Run a broker and add the starter}
+Start RabbitMQ locally (\code{docker run -p 5672:5672 -p 15672:15672 rabbitmq:3-management}) and add \code{spring-boot-starter-amqp}. Open the management UI at \code{localhost:15672} (guest/guest).
+\labwhy{Seeing the exchanges, queues and message counts in the UI turns the abstract broker into something you can watch fill and drain --- indispensable for debugging.}
+
+\labstep{Declare the topology as beans}
+In a \code{RabbitConfig}, declare a durable work queue \code{orders.placed} whose arguments set \code{x-dead-letter-exchange} to \code{orders.dlx}, a dead-letter queue \code{orders.placed.dlq}, the exchanges, and the bindings.
+\labwhy{Declaring topology in code (not by hand in the UI) makes it reproducible across every environment and versioned with the app --- the same "one artifact, many environments" principle as Day 1's profiles.}
+
+\labstep{Publish after the commit}
+In the order service, after the order row commits, call a \code{RabbitTemplate} to \code{convertAndSend} an \code{OrderPlacedEvent} (orderId, email, total, and a generated \code{messageId}) to \code{orders.exchange} with routing key \code{order.placed}.
+\labwhy{Publishing after commit guarantees you never send a confirmation for an order that was rolled back --- the message must reflect committed truth, not an in-flight transaction.}
+
+\labstep{Consume and send the email}
+Write an \code{@RabbitListener(queues = "orders.placed")} method that deserialises the event and calls your Day 7 email service. Configure a \code{Jackson2JsonMessageConverter} so the payload is JSON, not Java serialization.
+\labwhy{JSON payloads are language-agnostic and human-readable in the UI; Java serialization couples producer and consumer to the same class bytes and is a known security risk.}
+
+\labstep{Add bounded retry with backoff}
+In \code{application.yml} enable listener retry: \code{max-attempts: 3}, \code{initial-interval: 1000}, \code{multiplier: 2.0}, and \code{default-requeue-rejected: false}. Throw a \code{RuntimeException} from the consumer on purpose and watch three attempts in the log.
+\labwhy{You are proving the transient-failure path by hand: three spaced attempts, then a nack --- exactly the behaviour a real flaky mail server would exercise for you.}
+
+\labstep{Verify the DLQ catches the poison message}
+Keep the consumer throwing so all retries fail. Watch the message land in \code{orders.placed.dlq} in the UI. Inspect its headers --- \code{x-death} records why and how many times it failed.
+\labwhy{The DLQ is only useful if you can trust it catches what you think it does; verifying it now means you will not discover a leak during a real incident.}
+
+\labstep{Make the consumer idempotent}
+Add a \code{processed\_messages} table with a unique \code{message\_id} column. At the top of the consumer, insert the id; on a duplicate-key exception, log and return (ack without re-sending). Redeliver the same message and confirm only one email is sent.
+\labwhy{This is the line that makes at-least-once safe: the unique constraint, not your hope, guarantees the email goes out exactly once.}
+
+\begin{prodtip}
+Do not test the DLQ only in theory. In the management UI, publish a deliberately malformed message straight to \code{orders.placed}, watch it fail every retry, and confirm it lands in the DLQ with a readable \code{x-death} header. The five minutes you spend proving the safety net works is worth more than any amount of reading about it.
+\end{prodtip}
+
+\begin{javabox}[RabbitConfig.java]
+@Configuration
+public class RabbitConfig {
+
+  @Bean
+  Queue ordersQueue() {
+    return QueueBuilder.durable("orders.placed")
+        .withArgument("x-dead-letter-exchange", "orders.dlx")
+        .withArgument("x-dead-letter-routing-key", "order.dead")
+        .build();
+  }
+
+  @Bean
+  Queue deadLetterQueue() {
+    return QueueBuilder.durable("orders.placed.dlq").build();
+  }
+
+  @Bean
+  TopicExchange ordersExchange() { return new TopicExchange("orders.exchange"); }
+
+  @Bean
+  DirectExchange deadLetterExchange() { return new DirectExchange("orders.dlx"); }
+
+  @Bean
+  Binding workBinding(Queue ordersQueue, TopicExchange ordersExchange) {
+    return BindingBuilder.bind(ordersQueue).to(ordersExchange).with("order.*");
+  }
+
+  @Bean
+  Binding dlqBinding(Queue deadLetterQueue, DirectExchange deadLetterExchange) {
+    return BindingBuilder.bind(deadLetterQueue).to(deadLetterExchange).with("order.dead");
+  }
+
+  @Bean
+  Jackson2JsonMessageConverter converter() {
+    return new Jackson2JsonMessageConverter();
+  }
+}
+\end{javabox}
+
+\begin{javabox}[OrderEmailConsumer.java]
+@Component
+public class OrderEmailConsumer {
+
+  private final ProcessedMessageRepo processed;
+  private final EmailService email;
+
+  public OrderEmailConsumer(ProcessedMessageRepo processed, EmailService email) {
+    this.processed = processed;
+    this.email = email;
+  }
+
+  @RabbitListener(queues = "orders.placed")
+  @Transactional
+  public void onOrderPlaced(OrderPlacedEvent event) {
+    // idempotency guard: unique constraint on message_id
+    if (!processed.tryClaim(event.messageId())) {
+      return;                 // duplicate delivery -> ack and skip
+    }
+    email.sendConfirmation(event.email(), event.orderId(), event.total());
+    // throwing here triggers retry; after max-attempts -> DLQ
+  }
+}
+\end{javabox}
+
+\begin{yamlbox}[application.yml]
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        acknowledge-mode: auto
+        default-requeue-rejected: false   # nack -> DLQ, do not requeue
+        retry:
+          enabled: true
+          max-attempts: 3                 # 1 initial + 2 retries
+          initial-interval: 1000ms
+          multiplier: 2.0                 # 1s, 2s backoff
+          max-interval: 10000ms
+\end{yamlbox}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+These are reflection prompts, not quiz questions. Write a sentence or two --- the goal is to make your reasoning explicit.
+
+\begin{thinkbox}
+ShopFlow publishes \code{OrderPlacedEvent} \emph{after} the order row commits. What could go wrong if the process crashes in the tiny window between the commit and the publish? What pattern (hint: outbox) would close that gap, and what does it cost you?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your idempotency guard dedupes on \code{messageId}. Suppose instead you deduped on \code{orderId}. Describe a legitimate scenario where the \emph{same} order should produce two messages, and explain why choosing the wrong dedupe key would silently drop the second one.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+The email consumer retries three times over a few seconds, then dead-letters. If the mail provider is down for a full hour, all those messages pile up in the DLQ. Is that the right behaviour, or would a longer broker-side delay have been better? What is the trade-off between failing fast to the DLQ and holding messages for a slow retry?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Customers receive two confirmation emails}
+\textbf{Symptom.} Occasionally --- not always --- a customer gets the same order-confirmation email twice, seconds apart. The order itself is fine; only the email duplicates.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderEmailConsumer.java]
+@RabbitListener(queues = "orders.placed")
+public void onOrderPlaced(OrderPlacedEvent event) {
+  email.sendConfirmation(event.email(), event.orderId(), event.total());
+  // no dedupe; ack happens after this returns
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The mail log shows two sends with the same \code{orderId} and \code{messageId}, milliseconds apart, both after a broker connection blip.
+  \item \textbf{Hypothesise.} Delivery is at-least-once: the consumer processed and sent, but the ack was lost (connection dropped), so the broker redelivered the same message.
+  \item \textbf{Verify.} Reproduce by killing the connection right after the email send but before the ack; confirm a redelivery arrives with the identical \code{messageId}.
+  \item \textbf{Fix.} Add the idempotency guard: claim \code{messageId} in \code{processed\_messages} under a unique constraint before sending; on duplicate key, skip and ack.
+  \item \textbf{Prevent.} Make idempotency a checklist item for every new consumer; add a test that delivers the same event twice and asserts a single email.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The queue stops draining and one message is stuck}
+\textbf{Symptom.} The \code{orders.placed} queue depth climbs and never falls. Logs show the same stack trace repeating every second forever. New orders' emails never go out.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} In the management UI the "unacked" count is 1 and the same \code{NullPointerException} loops in the log with an unchanging \code{messageId}.
+  \item \textbf{Hypothesise.} A poison message throws on every attempt, and with \code{default-requeue-rejected: true} and no retry limit it is requeued at the head, blocking everything behind it (head-of-line blocking).
+  \item \textbf{Verify.} Inspect the stuck message payload; confirm it is malformed (e.g. \code{email} is null) so it will \emph{never} succeed.
+  \item \textbf{Fix.} Set \code{default-requeue-rejected: false} and bound \code{max-attempts}, and give the queue an \code{x-dead-letter-exchange} so the poison message is parked in the DLQ instead of looping.
+  \item \textbf{Prevent.} Never deploy a queue without a DLQ and a retry bound; alert on DLQ depth $>$ 0 so poison messages surface immediately.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Watch at-least-once delivery redeliver a message with your own eyes.\\
+\textbf{Context.} A single \code{@RabbitListener} that logs the \code{messageId} and then throws.\\
+\textbf{Requirements.} Enable retry with \code{max-attempts: 3}; publish one message; read the log.\\
+\textbf{Hints.} Log the delivery attempt count; the same \code{messageId} appears three times before the nack.\\
+\textbf{Expected outcome.} Three spaced log lines for one publish, then the message leaves the queue.\\
+\textbf{Common pitfalls.} Forgetting to enable retry, so you see only one attempt and conclude retries "don't work."
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Make a consumer idempotent with a processed-message table.\\
+\textbf{Context.} An email consumer that must send exactly one mail per order even under redelivery.\\
+\textbf{Requirements.} Add a \code{processed\_messages(message\_id UNIQUE)} table; claim the id before sending; on duplicate-key, skip.\\
+\textbf{Hints.} Do the claim and the side effect in one \code{@Transactional} method so a crash between them safely retries.\\
+\textbf{Expected outcome.} Delivering the same event twice sends exactly one email; the second is skipped.\\
+\textbf{Common pitfalls.} Checking "does the id exist?" then inserting in two steps --- a race lets two threads both pass the check. Rely on the unique constraint, not a pre-read.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Prove the DLQ safety net end to end and alert on it.\\
+\textbf{Context.} You want confidence that persistently failing messages are parked, not lost, and that someone is told.\\
+\textbf{Requirements.} Configure \code{orders.placed} with a DLX; force a poison message through all retries; confirm it lands in \code{orders.placed.dlq}; expose the DLQ depth as a metric and log a warning when it rises.\\
+\textbf{Hints.} Read the dead-lettered message's \code{x-death} header --- it records the reason, original queue, and count.\\
+\textbf{Expected outcome.} The poison message sits in the DLQ with a readable \code{x-death}; the work queue keeps flowing; DLQ depth is observable.\\
+\textbf{Common pitfalls.} Declaring the DLX but never binding a queue to it --- the message is dead-lettered into the void and silently lost, the exact failure the DLQ was meant to prevent.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+A curated margin from engineers who have carried a pager. Read these as judgment, not trivia.
+
+\begin{seniornote}
+The moment you introduce a broker you have a \emph{distributed} system, and the dual-write problem arrives: you must both commit the order to the database \emph{and} publish the event, and there is no single transaction across both. If you publish inside the DB transaction and it rolls back, you announced a phantom order; if you publish after commit and crash, you lost the event. The mature answer is the \keyterm{transactional outbox}: write the event to an \code{outbox} table in the same transaction as the order, and a separate relay publishes committed outbox rows to the broker. Know that this problem exists before it bites you in production.
+\end{seniornote}
+
+\begin{perfnote}
+Prefetch count is the throughput dial most teams never touch. By default a consumer may fetch many unacked messages at once; if one is slow, the rest wait behind it. For slow, side-effect-heavy work like sending email, a low prefetch (1--10) spreads messages evenly across worker instances and avoids one consumer hoarding a batch it cannot drain. Measure before and after --- the right value depends entirely on per-message processing time.
+\end{perfnote}
+
+\begin{interview}
+Expect: \emph{"When would you choose Kafka over RabbitMQ?"} A crisp answer names the access pattern, not the brand: "Kafka when I need high-throughput streaming, retention, and \emph{replay} --- a new consumer re-reading history. RabbitMQ when each message is a task done once by one worker with rich routing, and deleted on ack. ShopFlow's confirmation email is a task queue, so RabbitMQ; our clickstream that three teams re-process is a log, so Kafka."
+\end{interview}
+
+\begin{secwarn}[do not put secrets or PII in message payloads carelessly]
+Messages are durable and often replayed, logged, and inspected in a management UI. A payload carrying a full credit-card number or password is now sitting on disk in the broker and in every DLQ dump. Keep payloads to identifiers and non-sensitive fields; let the consumer fetch sensitive data from the source of truth by ID. Treat the broker as a place data lingers, not a transient wire.
+\end{secwarn}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+On Day 7 ShopFlow's order-confirmation email was decoupled with an in-process \code{ApplicationEvent}; Day 9 added caching. Today you move that email onto a real broker so it survives a crash, retries transient failures, and never silently loses a confirmation.
+
+\begin{buildalong}[Day 10 --- order email over RabbitMQ]
+\begin{wbitem}
+  \item Add \code{spring-boot-starter-amqp} and declare the topology in a \code{RabbitConfig}: a durable \code{orders.placed} queue with an \code{x-dead-letter-exchange}, the \code{orders.dlx} dead-letter exchange, an \code{orders.placed.dlq}, the exchanges and bindings.
+  \item Replace the Day 7 in-process listener's transport: after the order commits, publish an \code{OrderPlacedEvent} (\code{orderId}, \code{email}, \code{total}, generated \code{messageId}) to \code{orders.exchange} with key \code{order.placed}, using a \code{Jackson2JsonMessageConverter}.
+  \item Build an \code{@RabbitListener} consumer that sends the confirmation email via the existing Day 7 email service.
+  \item Configure bounded retry with backoff (\code{max-attempts: 3}, \code{multiplier: 2.0}, \code{default-requeue-rejected: false}); on exhaustion the message routes to the DLQ.
+  \item Make the consumer idempotent: a \code{processed\_messages} table with a unique \code{message\_id}, claimed in the same transaction as the send, so redelivery never double-emails.
+  \item Verify: force a permanently failing send and confirm the message lands in \code{orders.placed.dlq} with a readable \code{x-death}; redeliver a success twice and confirm exactly one email.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} placing an order returns immediately; the confirmation email is sent by a separate consumer; a transient failure retries and succeeds; a persistent failure lands in the DLQ (not lost, not looping); and a redelivered message sends the email exactly once.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item A broker is a durable buffer between producer and consumer; it buys decoupling and resilience, and costs you synchronous certainties.
+  \item Use messaging for \emph{consequences} of an action, not for questions that need an answer to proceed.
+  \item RabbitMQ = smart routing, delete-on-consume, task queues. Kafka = partitioned log, retention, replay, streaming. Pick by access pattern.
+  \item Retry transient failures with bounded backoff; route exhausted (poison) messages to a Dead Letter Queue so they are visible, not silent.
+  \item Delivery is realistically at-least-once, so make consumers idempotent --- dedupe on a unique message ID.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{default-requeue-rejected: false} plus a bounded \code{max-attempts} plus an \code{x-dead-letter-exchange} is the minimum safe consumer config.
+  \item Publish after commit (or use a transactional outbox); never announce an order that might roll back.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Assuming exactly-once $\rightarrow$ duplicate emails and double charges. \quad$\bullet$\quad No retry limit $\rightarrow$ poison message loops forever.
+  \item DLX declared but no bound DLQ $\rightarrow$ dead-lettered into the void. \quad$\bullet$\quad Messaging a question that needed a synchronous answer.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Exchange types}{direct = exact key; topic = wildcard \code{order.*}; fanout = every bound queue.}
+\cheatitem{Ack model}{AUTO acks on normal return; a thrown listener nacks $\rightarrow$ retry or DLQ.}
+\cheatitem{DLQ trio}{\code{x-dead-letter-exchange} on the queue + a DLX + a bound DLQ. Miss one and messages vanish.}
+\cheatitem{Retry}{\code{max-attempts}, \code{initial-interval}, \code{multiplier}; keep backoff short for in-container retry.}
+\cheatitem{Delivery}{at-most-once (lossy), at-least-once (default, dedupe), exactly-once (approximate via idempotency).}
+\cheatitem{Idempotency}{unique constraint on \code{message\_id} in the same transaction as the side effect.}
+\cheatitem{Rabbit vs Kafka}{task done once + routing = Rabbit; throughput + retention + replay = Kafka.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{When would you choose Kafka over RabbitMQ?}
+\iq{What is a dead letter queue and why does it matter?}
+\iq{How do you handle duplicate message delivery?}
+\iq{What is the trade-off between synchronous and event-driven service communication?}
+\iq{What delivery guarantees exist, and which is realistic in production?}
+\iq{What is the dual-write problem and how does a transactional outbox solve it?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Spring AMQP Reference} --- "Message Listener Containers," retry, and dead-lettering.
+  \item \emph{RabbitMQ documentation} --- exchanges, bindings, and the dead-letter-exchange guide.
+  \item \emph{Designing Data-Intensive Applications} (Kleppmann) --- Ch. 11, "Stream Processing," for the log vs queue distinction.
+  \item \emph{microservices.io} --- the Transactional Outbox and Saga patterns.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 11).} You just moved work off the request thread and onto a broker. Tomorrow you stay on the theme of doing work in the background but \emph{inside} one JVM: \code{@Async}, thread pools, \code{CompletableFuture}, and scheduled tasks --- when in-process concurrency is enough and when you genuinely need the broker you built today.
+\end{keyidea}
+

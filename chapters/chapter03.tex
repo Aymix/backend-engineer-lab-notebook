@@ -1,0 +1,580 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 03 ============================
+\daychapter{03}{Data Layer}{JPA \& Hibernate Deep Dive}{The persistence context, N+1, locking, and fetching under control}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what the \keyterm{persistence context} actually does at runtime — dirty checking, identity, and the flush — not just which annotation to type.
+  \item Diagnose and eliminate the \keyterm{N+1 problem} from the SQL log, the single most common Hibernate performance bug in real codebases.
+  \item Choose \keyterm{cascade} types and \keyterm{locking} strategies deliberately from the ownership and contention model, never by copy-paste.
+  \item Control fetching explicitly with \code{JOIN FETCH}, \code{@EntityGraph}, and DTO projections instead of scattering \code{FetchType.EAGER}.
+  \item Stop leaking entities out of the transaction and understand exactly why a \code{LazyInitializationException} happens.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Yesterday you wrote SQL by hand and could see exactly what hit the database. Today an ORM writes the SQL \emph{for} you --- and that convenience is where careers quietly stall. The engineer who treats Hibernate as "annotations that make the database go away" ships a product page that fires 500 queries; the engineer who knows what the persistence context is doing ships one that fires two. This day is about keeping the ORM's automation \emph{visible and under control}.
+
+\glabel{Why backend engineers need it.} JPA/Hibernate is the default persistence layer on the JVM. Almost every slow endpoint, every "why is this row still here?", every \code{LazyInitializationException} in a stack trace, and every lost-update bug in inventory is ultimately a story about the persistence context, fetch strategy, cascade rules, or locking. These four topics are the difference between an ORM that serves you and one that ambushes you in production.
+
+\begin{keyidea}
+Hibernate is not "SQL you don't have to write." It is a \keyterm{unit of work}: a per-transaction workspace that tracks your objects, remembers what changed, and decides \emph{when} and \emph{what} SQL to emit. Master three questions --- \emph{is this entity managed? when does it flush? what does it fetch?} --- and the ORM stops surprising you.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} The data layer sits between your service beans and the schema you designed on Day 2. A \code{@Transactional} service method opens a persistence context, your repository loads and mutates entities inside it, and on commit Hibernate flushes the accumulated changes as SQL. Every layer above --- controllers, DTOs, the API contract on Day 4 --- depends on this layer returning the right data without leaking lazy proxies.
+
+\begin{wbfigure}{Fig 3.1 — Where today sits: JPA/Hibernate is the mapping layer between your service beans (Day 1) and the SQL schema (Day 2).}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=42mm] (svc) {\textbf{Service bean} \\ \scriptsize @Transactional (Day 1 proxy)};
+  \node[wbboxaccent, below=of svc, text width=42mm] (jpa) {\textbf{JPA / Hibernate} \\ \scriptsize persistence context · dirty check · fetch};
+  \node[wbboxdb, below=of jpa, text width=42mm] (sql) {\textbf{JDBC + SQL} \\ \scriptsize the queries Hibernate emits};
+  \node[wbcyl, below=of sql, text width=30mm] (db) {Schema \\ \scriptsize (Day 2)};
+  \draw[wbarrow] (svc)--(jpa); \draw[wbarrow] (jpa)--(sql); \draw[wbarrow] (sql)--(db);
+  \node[wbcap, right=6mm of jpa, text width=30mm, anchor=west] {this chapter lives here};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} The \code{EntityManager} is a Spring bean (Day 1). The transaction that scopes it is opened by the \code{@Transactional} proxy you studied on Day 1 --- which is exactly why a self-invoked \code{@Transactional} method silently gets no persistence context. And the SQL Hibernate generates lands on the indexes, constraints and isolation levels you designed by hand on Day 2. Today ties those two threads together.
+
+\glabel{Real company examples.} The N+1 problem is so universal it is a rite of passage: teams at every scale --- from a two-person startup to banks running thousands of Spring services --- have shipped a listing page that quietly issued one query per row. Hibernate has powered JVM persistence for two decades precisely because the unit-of-work model makes the common case effortless; the senior skill is knowing when the common case is silently doing something expensive.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture. The persistence context is the hub; everything else --- state, fetching, cascade, locking --- is a rule about how that hub behaves.
+
+\begin{wbfigure}{Fig 3.2 — The Day 3 concept map. The persistence context tracks entity state; fetch strategy, cascade, and locking are the rules that govern its SQL.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=34mm] (pc) {\textbf{Persistence Context} \\ \scriptsize 1st-level cache · unit of work};
+  \node[wbbox, above left=of pc, text width=26mm] (state) {\textbf{Entity State} \\ \scriptsize managed = dirty-checked};
+  \node[wbbox, above right=of pc, text width=26mm] (flush) {\textbf{Flush} \\ \scriptsize changes $\rightarrow$ SQL on commit};
+  \node[wbbox, below left=of pc, text width=26mm] (fetch) {\textbf{Fetch Strategy} \\ \scriptsize LAZY default · N+1 risk};
+  \node[wbboxdb, below right=of pc, text width=26mm] (lock) {\textbf{Locking} \\ \scriptsize optimistic · pessimistic};
+  \node[wbboxwarn, below=16mm of pc, text width=30mm] (n1) {\textbf{N+1 problem} \\ \scriptsize fix: JOIN FETCH · @EntityGraph · DTO};
+  \draw[wbarrowg] (state)--(pc); \draw[wbarrowg] (pc)--(flush);
+  \draw[wbarrowg] (fetch)--(pc); \draw[wbarrowg] (pc)--(lock);
+  \draw[wbarrow] (fetch)--(n1);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{EntityManager} $\rightarrow$ \keyterm{Persistence Context} $\rightarrow$ \keyterm{Entity State} $\rightarrow$ \keyterm{Dirty Checking} $\rightarrow$ \keyterm{Flush} $\rightarrow$ \keyterm{Fetch Strategy} $\rightarrow$ \keyterm{N+1} $\rightarrow$ \keyterm{Cascade} $\rightarrow$ \keyterm{Locking}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Entity Lifecycle \& the Persistence Context}
+
+\glabel{What is it?} The \keyterm{persistence context} is a per-transaction workspace managed by the \code{EntityManager}. Every entity you load or persist inside it moves through four states: \keyterm{Transient} (a plain \code{new} object nobody tracks), \keyterm{Managed} (attached to the context and watched for changes), \keyterm{Detached} (was managed, but the context closed or the entity was evicted), and \keyterm{Removed} (marked for deletion on the next flush).
+
+\glabel{Why does it exist?} It buys you three things at once: \emph{identity} (fetching the same ID twice in one transaction returns the very same Java object, not two copies), a \emph{first-level cache} (the second fetch skips the database entirely), and \emph{automatic change tracking} so you never write an explicit \code{UPDATE}. That last property --- \keyterm{dirty checking} --- is the one beginners find magical and seniors find obvious.
+
+\glabel{How does it work internally?} When an entity becomes managed, Hibernate takes a \keyterm{snapshot} of its field values. At flush time (on commit, before a query that needs current data, or on an explicit \code{flush()}) it compares each managed entity against its snapshot; any field that differs becomes an \code{UPDATE}. No snapshot difference means no SQL. This is why mutating a managed entity needs no \code{save()} call at all.
+
+\begin{wbfigure}{Fig 3.3 — Entity states. Only \emph{Managed} entities are dirty-checked; a Detached entity's changes are silently ignored until you merge it back.}
+\wbscale{\begin{tikzpicture}[node distance=10mm and 16mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=24mm] (t) {\textbf{Transient} \\ \scriptsize new, untracked};
+  \node[wbboxgood, right=of t, text width=26mm] (m) {\textbf{Managed} \\ \scriptsize dirty-checked};
+  \node[wbbox, right=of m, text width=24mm] (d) {\textbf{Detached} \\ \scriptsize not tracked};
+  \node[wbboxwarn, below=of m, text width=24mm] (r) {\textbf{Removed} \\ \scriptsize deleted on flush};
+  \draw[wbarrow] (t)--(m) node[wbcap, midway, above]{persist()};
+  \draw[wbarrow] (m)--(d) node[wbcap, midway, above]{close / evict};
+  \draw[wbarrow] (m)--(r) node[wbcap, midway, right]{remove()};
+  \draw[wbarrowg] (d) to[out=120,in=60] node[wbcap, midway, above]{merge()} (m);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[PricingService.java]
+@Transactional
+public void raisePrice(Long id, BigDecimal delta) {
+  Product p = productRepository.findById(id).orElseThrow();
+  p.setPrice(p.getPrice().add(delta));
+  // No save() call. p is MANAGED; on commit, dirty checking
+  // notices price changed and emits exactly one UPDATE.
+}
+\end{javabox}
+
+\glabel{When should I use it?} Whenever you mutate data: load inside a transaction, change fields, let the flush write it. Trust dirty checking --- fighting it with manual \code{save()} calls just adds noise (and occasionally a redundant \code{UPDATE}).
+
+\glabel{When should I \emph{not}?} Do not rely on it once the transaction ends. A \keyterm{detached} entity is a dead object as far as the ORM is concerned: setters do nothing, and touching an un-fetched lazy association throws. This is the root of the infamous \code{LazyInitializationException} --- covered next.
+
+\begin{behind}
+The persistence context is a \code{Map} keyed by entity type + primary key. That is the whole "first-level cache": ask for \code{Product 42} twice in one transaction and the second call is a map lookup, not a \code{SELECT}. It also means two different queries that return the same row hand you the \emph{same} object --- changes are never split across duplicate copies.
+\end{behind}
+
+\begin{misconception}
+\code{save()} on a Spring Data repository does not mean "write now." For a \emph{managed} entity it is often a no-op --- the write already happens via dirty checking at flush. \code{save()} earns its keep for \emph{new} (transient) entities and for re-attaching a \emph{detached} one via \code{merge}. Calling it in a loop over managed entities writes nothing extra and misleads the next reader.
+\end{misconception}
+
+\wbsub{3.2\quad Lazy vs. Eager Loading, and the N+1 Problem}
+
+\glabel{What is it?} \code{FetchType.LAZY} defers loading an association until you actually touch it; \code{FetchType.EAGER} loads it immediately alongside the parent. The defaults trip everyone up: \code{@OneToMany} and \code{@ManyToMany} are \code{LAZY} by default, but \code{@ManyToOne} and \code{@OneToOne} are \code{EAGER} by default.
+
+\glabel{Why does it exist?} You rarely need every association on every read. Lazy loading lets you pull just the parent for a summary view and only pay for children when a detail view needs them. The cost of that flexibility is the \keyterm{N+1 problem}: fetch \code{N} parents with one query, then lazily touch a collection on each inside a loop, and you have silently issued \code{1 + N} queries.
+
+\begin{wbfigure}{Fig 3.4 — The N+1 problem: one query for the list, then one more per row. Ten orders become eleven round-trips; a thousand become a thousand and one.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=70mm, align=left, text width=64mm}]
+  \node[stg] (q0) {\textbf{Query 1} \hfill \scriptsize select * from orders};
+  \node[stg, wbboxwarn, below=of q0] (q1) {\textbf{Query 2} \hfill \scriptsize items for order \#1};
+  \node[stg, wbboxwarn, below=of q1] (q2) {\textbf{Query 3} \hfill \scriptsize items for order \#2};
+  \node[stg, wbboxwarn, below=of q2] (q3) {\textbf{\dots} \hfill \scriptsize one SELECT per order};
+  \node[stg, wbboxwarn, below=of q3] (qn) {\textbf{Query N+1} \hfill \scriptsize items for order \#N};
+  \foreach \a/\b in {q0/q1,q1/q2,q2/q3,q3/qn}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=5mm of q0, text width=24mm, anchor=west] {the "1"};
+  \node[wbcap, right=5mm of q2, text width=24mm, anchor=west] {the "N" --- fired lazily inside your loop};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[N+1 in the wild --- and two fixes]
+// N+1 in the wild
+List<Order> orders = orderRepository.findAll();        // 1 query
+orders.forEach(o -> log.info("{}", o.getItems().size())); // N queries!
+
+// Fix #1: JOIN FETCH (JPQL) -- pull parents + children in one query
+@Query("SELECT o FROM Order o JOIN FETCH o.items WHERE o.status = :s")
+List<Order> findWithItems(@Param("s") OrderStatus status);
+
+// Fix #2: Entity Graph -- declarative, reuses the derived query name
+@EntityGraph(attributePaths = {"items"})
+List<Order> findByStatus(OrderStatus status);
+\end{javabox}
+
+\glabel{How do I catch it?} Turn on SQL logging in dev and \emph{count queries}. If a request that returns a list of ten prints eleven statements, you have found an N+1.
+
+\begin{yamlbox}[application-dev.yml — make Hibernate's SQL visible]
+spring:
+  jpa:
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+logging:
+  level:
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE   # shows the bound "?" params
+\end{yamlbox}
+
+\begin{perfnote}
+\code{JOIN FETCH} on a \code{@OneToMany} multiplies rows: N orders $\times$ M items each returns N$\times$M rows, and Hibernate de-duplicates the parents in memory. That is fine for a handful of children but a disaster for large collections --- and you cannot combine it with pagination safely (Hibernate warns \emph{"firstResult/maxResults specified with collection fetch; applying in memory"} and paginates \emph{after} loading everything). For paginated lists, fetch IDs first, then the batch --- or use a DTO projection.
+\end{perfnote}
+
+\begin{whyexists}[why "just use EAGER everywhere" is wrong]
+Making the association \code{EAGER} does not remove the N+1 --- it hides it and makes it worse. Every query touching that entity now drags the association along whether the use case needs it or not, and an \code{EAGER} association \emph{cannot} be selectively fetch-joined per query. Keep everything \code{LAZY} by default and fetch explicitly, per use case, with \code{JOIN FETCH}, \code{@EntityGraph}, or a projection.
+\end{whyexists}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{34mm} L{20mm} X@{}}
+\wbtablehead{Association} & \wbtablehead{Default} & \wbtablehead{Recommended}\\\midrule
+\code{@ManyToOne} & EAGER & override to \code{LAZY}\\
+\code{@OneToOne} & EAGER & override to \code{LAZY}\\
+\code{@OneToMany} & LAZY & keep LAZY, fetch per query\\
+\code{@ManyToMany} & LAZY & keep LAZY, prefer a join entity\\
+\end{tabularx}
+\end{center}
+
+\wbsub{3.3\quad Cascade Types \& orphanRemoval}
+
+\glabel{What is it?} A \keyterm{cascade} propagates an \code{EntityManager} operation from a parent to its associations. The types are \code{PERSIST}, \code{MERGE}, \code{REMOVE}, \code{REFRESH}, \code{DETACH}, and \code{ALL} (all of them). Separately, \code{orphanRemoval = true} deletes a child the moment it is removed from the parent's collection --- even with no \code{REMOVE} cascade.
+
+\glabel{Why does it exist?} It encodes \keyterm{ownership}. An \code{OrderItem} has no life outside its \code{Order}: persist the order, its items should persist; delete the order, its items should vanish. Cascade lets you express "this child's lifecycle belongs to this parent" in one place instead of remembering to save and delete children by hand.
+
+\glabel{How does it work internally?} When you \code{persist} / \code{remove} a parent, Hibernate walks each association marked with the matching cascade and applies the same operation, respecting \code{orphanRemoval} for collection element removals at flush. Ownership is directional --- and that direction is exactly where the danger lives.
+
+\begin{wbfigure}{Fig 3.5 — Cascade follows ownership. Order OWNS its items (cascade ALL + orphanRemoval); it only REFERENCES the shared Product --- never cascade REMOVE there.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 20mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=26mm] (o) {\textbf{Order} \\ \scriptsize the aggregate root};
+  \node[wbboxgood, right=of o, text width=28mm] (i) {\textbf{OrderItem} \\ \scriptsize owned child};
+  \node[wbboxdb, below=of i, text width=28mm] (p) {\textbf{Product} \\ \scriptsize shared reference data};
+  \draw[wbarrow] (o)--(i) node[wbcap, midway, above, text width=30mm]{cascade ALL + orphanRemoval};
+  \draw[wbarrow] (i)--(p) node[wbcap, midway, right, text width=22mm]{reference only};
+  \draw[wbarrowg, dashed] (o) to[out=-40,in=180] node[wbcap, midway, below, text width=30mm]{NEVER cascade REMOVE} (p.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[Order.java — owns its items]
+@Entity
+@Table(name = "orders")
+public class Order {
+  @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+
+  @Enumerated(EnumType.STRING)
+  private OrderStatus status;
+
+  // Order OWNS its items: cascade all + orphanRemoval.
+  @OneToMany(mappedBy = "order",
+             cascade = CascadeType.ALL,
+             orphanRemoval = true)
+  private List<OrderItem> items = new ArrayList<>();
+}
+\end{javabox}
+
+\glabel{When should I \emph{not}?} Never cascade \code{REMOVE} (or \code{ALL}, which includes it) onto \keyterm{shared reference data}. A \code{Product} is referenced by many order items across many customers; deleting an order must not delete the catalogue entry other orders still point to. That is a data-loss incident waiting for a Friday deploy.
+
+\begin{secwarn}[the shared-entity delete trap]
+\code{cascade = CascadeType.ALL} on \code{OrderItem $\rightarrow$ Product} means "delete this order item, delete the product too." One returned order can wipe a product that a thousand other orders reference, cascading into foreign-key errors or --- worse, if constraints are lax --- silent data loss. Cascade \emph{down} an ownership tree (\code{Order $\rightarrow$ OrderItem}); never cascade \emph{across} to shared references (\code{OrderItem $\rightarrow$ Product}).
+\end{secwarn}
+
+\begin{dbinsight}
+\code{orphanRemoval = true} and \code{CascadeType.REMOVE} are not the same thing. \code{REMOVE} fires when you \code{remove()} the \emph{parent}. \code{orphanRemoval} fires when a child is \emph{disassociated} --- \code{order.getItems().remove(item)} --- and issues a \code{DELETE} for that child on flush, because an owned child with no parent is meaningless. Use \code{orphanRemoval} for true parent-owned collections; it is what makes "remove a line item from the cart" actually delete the row.
+\end{dbinsight}
+
+\wbsub{3.4\quad Optimistic vs. Pessimistic Locking}
+
+\glabel{What is it?} Two strategies for the same danger: two transactions reading the same row, both writing, and one silently overwriting the other (a \keyterm{lost update}). \keyterm{Optimistic locking} assumes conflicts are rare and detects them after the fact via a \code{@Version} column. \keyterm{Pessimistic locking} assumes conflicts are likely and prevents them up front by locking the row in the database.
+
+\glabel{How does optimistic work internally?} Add a \code{@Version} field. Every \code{UPDATE} becomes \code{... WHERE id = ? AND version = ?} and bumps the version. If another transaction already incremented it, the \code{WHERE} matches zero rows, Hibernate sees \emph{"0 rows affected"} and throws \code{OptimisticLockException}. No database lock is ever held --- but the loser must retry.
+
+\begin{wbfigure}{Fig 3.6 — Optimistic locking. Both read version 5; the second commit finds version already moved to 6 and fails instead of silently overwriting.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=72mm, align=left, text width=66mm}]
+  \node[stg] (a) {\textbf{Tx A reads} Product \hfill \scriptsize stock 10, version 5};
+  \node[stg, below=of a] (b) {\textbf{Tx B reads} same Product \hfill \scriptsize stock 10, version 5};
+  \node[stg, wbboxgood, below=of b] (c) {\textbf{Tx A commits} \hfill \scriptsize UPDATE ... WHERE version=5 $\rightarrow$ version 6};
+  \node[stg, wbboxwarn, below=of c] (d) {\textbf{Tx B commits} \hfill \scriptsize WHERE version=5 matches 0 rows};
+  \node[stg, wbboxwarn, below=of d] (e) {\textbf{OptimisticLockException} \hfill \scriptsize $\rightarrow$ retry the whole transaction};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e}{\draw[wbarrow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[Product.java + a retrying decrement]
+@Entity @Table(name = "products")
+public class Product {
+  @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+  private Long id;
+  private int stock;
+
+  @Version                 // optimistic lock guard
+  private long version;
+}
+
+// In the service: retry on conflict, do not hold a DB lock.
+@Retryable(retryFor = OptimisticLockingFailureException.class,
+           maxAttempts = 3, backoff = @Backoff(delay = 50))
+@Transactional
+public void decrementStock(Long productId, int qty) {
+  Product p = productRepository.findById(productId).orElseThrow();
+  if (p.getStock() < qty) throw new InsufficientStockException();
+  p.setStock(p.getStock() - qty);   // version auto-bumped on commit
+}
+\end{javabox}
+
+\glabel{How does pessimistic work?} You ask the database to lock the row on read --- \code{SELECT ... FOR UPDATE} --- via \code{@Lock(LockModeType.PESSIMISTIC\_WRITE)}. Other transactions block until you commit. No conflict can occur because no one else can read-to-write concurrently, at the cost of throughput and the risk of deadlock.
+
+\begin{javabox}[ProductRepository.java — pessimistic variant]
+public interface ProductRepository extends JpaRepository<Product, Long> {
+
+  @Lock(LockModeType.PESSIMISTIC_WRITE)
+  @Query("SELECT p FROM Product p WHERE p.id = :id")
+  Optional<Product> findByIdForUpdate(@Param("id") Long id);
+}
+\end{javabox}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{26mm} X X@{}}
+\wbtablehead{Aspect} & \wbtablehead{Optimistic (\code{@Version})} & \wbtablehead{Pessimistic (\code{FOR UPDATE})}\\\midrule
+Assumes & conflicts are rare & conflicts are likely\\
+DB lock held & none & row lock until commit\\
+On conflict & throws, you retry & others block, then proceed\\
+Throughput & high & lower (serialised)\\
+Best for & most updates, web forms & hot rows, inventory decrement\\
+\end{tabularx}
+\end{center}
+
+\begin{seniornote}
+Default to optimistic; reach for pessimistic only on a proven hot row. Optimistic locking scales because it holds no locks --- but it is a \emph{contract}: the caller must handle \code{OptimisticLockException} with a retry, or the user just sees a 500. Wrapping the whole transaction in \code{@Retryable} (not just the failing line) is the piece juniors forget, because on conflict you must re-read the fresh row before re-applying the change.
+\end{seniornote}
+
+\wbsub{3.5\quad JPQL, Criteria API \& Entity Graphs}
+
+\glabel{What is it?} Three ways to say what to fetch. \keyterm{JPQL} looks like SQL but operates on \emph{entities and fields}, not tables and columns, so it is portable across databases. The \keyterm{Criteria API} builds queries programmatically with compile-time type safety --- ideal for dynamic filters. \keyterm{Entity Graphs} declare, per query, exactly which associations to fetch eagerly --- the modern, explicit alternative to entity-level \code{EAGER}.
+
+\glabel{When each?} Fixed queries $\rightarrow$ JPQL (readable, portable). A search endpoint with six optional parameters $\rightarrow$ Criteria (string-concatenating JPQL is fragile and injection-prone). Controlling fetch depth without rewriting the query $\rightarrow$ \code{@EntityGraph}.
+
+\begin{javabox}[OrderRepository.java — entity graph + DTO projection]
+public interface OrderRepository extends JpaRepository<Order, Long> {
+
+  // Fetch order + items + each item's product in ONE query.
+  @EntityGraph(attributePaths = {"items", "items.product"})
+  List<Order> findByCustomerEmail(String email);
+
+  // DTO projection: read-only, no entities hydrated, no lazy risk.
+  @Query("""
+      SELECT new com.shopflow.dto.OrderSummary(
+               o.id, o.status, COUNT(i))
+      FROM Order o JOIN o.items i
+      WHERE o.customerEmail = :email
+      GROUP BY o.id, o.status
+      """)
+  List<OrderSummary> listSummaries(@Param("email") String email);
+}
+\end{javabox}
+
+\glabel{Why prefer DTO projections for lists?} A read-only list endpoint does not need managed entities, dirty checking, or lazy proxies --- it needs a few columns. A \keyterm{projection} (a \code{record} or interface) selects exactly those columns in one query, skips the persistence-context bookkeeping, and --- decisively --- cannot throw \code{LazyInitializationException} because there is no lazy association to trip over.
+
+\begin{interview}
+\emph{"JOIN FETCH vs \code{@EntityGraph}?"} Same goal --- fetch associations in one query --- but different mechanism. \code{JOIN FETCH} is written \emph{into} the JPQL, so it is explicit but couples fetch to that one query string. \code{@EntityGraph} is declarative metadata layered \emph{onto} a derived or named query, so the same finder can be reused with different graphs. Say that both defeat N+1; the difference is where the "what to fetch" decision lives.
+\end{interview}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Default every association to \code{LAZY}; fetch explicitly per query with \code{JOIN FETCH} or \code{@EntityGraph}.
+  \item Return DTO projections from read-only list endpoints, never hydrated entity graphs.
+  \item Add \code{@Version} to any entity multiple users can update concurrently.
+  \item Keep \code{show-sql} on in dev and \emph{count queries} --- catch N+1 before code review does.
+  \item Cascade down ownership (\code{Order $\rightarrow$ OrderItem}); reference shared data (\code{$\rightarrow$ Product}) without cascade.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Returning entities straight from a controller and leaking \code{LazyInitializationException} once the session closes.
+  \item Cascading \code{REMOVE} onto shared reference entities and silently deleting rows others depend on.
+  \item Not noticing the same query firing N extra times in the log.
+  \item Reaching for pessimistic locking everywhere "to be safe," tanking throughput.
+  \item Calling \code{save()} in a loop over already-managed entities, expecting it to do something.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two of today's diagrams carry most of the intuition. Redraw them \emph{from memory} --- reproducing them is what turns "I recognise that" into "I can reason with that."
+
+\begin{writespace}[Redraw: the four entity states and the transitions (persist, remove, close/evict, merge)]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the N+1 problem as 1 + N queries, then annotate where JOIN FETCH / @EntityGraph collapse it to 1]
+\reflectionlines[6]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab — Map \& Query the Order Graph}
+
+\textbf{Goal of this lab:} map the ShopFlow schema (Day 2) to a JPA entity graph, then \emph{prove} with SQL logs that you reduced an N+1 to a single query. You will watch the query count, not guess at it.
+
+\resetlab
+\labstep{Map the three entities with correct fetch defaults}
+Create \code{Order}, \code{OrderItem}, and \code{Product}. Make every \code{@ManyToOne} explicitly \code{FetchType.LAZY} --- override the EAGER default. Keep \code{@OneToMany} lazy.
+\labwhy{The EAGER default on \code{@ManyToOne} is where hidden fetches are born; overriding it is the single highest-leverage line in the file.}
+
+\labstep{Encode ownership with cascade rules}
+On \code{Order.items}, set \code{cascade = CascadeType.ALL} and \code{orphanRemoval = true}. On \code{OrderItem.product}, set \emph{no} cascade --- it only references the shared catalogue.
+\labwhy{You are encoding the aggregate boundary: the order owns its items, but the product is shared data no order may delete.}
+
+\labstep{Turn on SQL logging and reproduce the N+1}
+Enable \code{show-sql} and \code{org.hibernate.SQL: DEBUG}. Load all orders and loop over \code{getItems()}. Count the statements in the log.
+\labwhy{You cannot fix what you cannot see; watching \code{1 + N} statements scroll past is the whole lesson made concrete.}
+
+\labstep{Collapse it with an entity graph}
+Add \code{findByCustomerEmail} with \code{@EntityGraph(attributePaths = \{"items", "items.product"\})}. Re-run and confirm the log now shows exactly one \code{SELECT} with joins.
+\labwhy{This proves the fix at the layer that matters --- the SQL --- not just in a passing test.}
+
+\labstep{Add \code{@Version} to Product and force a conflict}
+Add a \code{@Version} field. From two threads, read the same product, decrement stock in each, commit. Catch the \code{OptimisticLockException} on the loser.
+\labwhy{Seeing the second commit fail --- rather than silently overwrite --- is the difference between understanding locking and reciting it.}
+
+\labstep{Return a DTO projection for the list endpoint}
+Write \code{OrderSummary(Long id, OrderStatus status, long itemCount)} and a JPQL \code{SELECT new ...} query. Return the DTO from the service.
+\labwhy{A read-only list needs columns, not managed entities --- and a projection can never throw \code{LazyInitializationException}.}
+
+\labstep{Prove exactly one query}
+With the DTO endpoint and SQL logging on, hit the endpoint and assert the log shows a single statement.
+\labwhy{"One query for the list-my-orders endpoint" is the measurable definition of done --- and the exact bar Day 4's API layer will build on.}
+
+\begin{prodtip}
+Do not eyeball query counts by hand forever. In tests, wire a datasource proxy (e.g. \code{datasource-proxy} or \code{QuickPerf}) and \emph{assert} \code{max queries = 1}. An N+1 that a human counts today silently returns the day someone adds a new lazy association --- a test that fails on query count catches the regression in CI, not in production.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Write a sentence or two for each --- the goal is to make your reasoning explicit, not to find the "right" keyword.
+
+\begin{thinkbox}
+Dirty checking means you never call \code{update}. What does the persistence context have to keep in memory for that to work, and what is the cost when a transaction loads ten thousand entities it only reads? Would you still leave them all managed?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+\code{EAGER} loading and \code{JOIN FETCH} both fetch the association up front. Why does one of them still let you fix an N+1 per query while the other locks you into always fetching? Predict what happens if you fetch-join two separate collections in one JPQL query.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Optimistic locking throws \emph{after} the work is done; pessimistic locking blocks \emph{before} it starts. For an inventory decrement under a flash-sale spike, which failure mode is cheaper --- retrying a rejected transaction, or serialising every buyer behind a row lock? What does your answer depend on?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The list endpoint that fires 500 queries}
+\textbf{Symptom.} \code{GET /orders} is fast in tests with 3 rows but times out in staging with 500. APM shows hundreds of near-identical \code{SELECT} statements per request.
+
+\smallskip\textbf{Evidence.}
+\begin{sqlbox}[hibernate SQL log — abridged]
+select o.id, o.status from orders o;              -- the "1"
+select i.* from order_items i where i.order_id=1; -- the "N"...
+select i.* from order_items i where i.order_id=2;
+select i.* from order_items i where i.order_id=3;
+-- ... 497 more
+\end{sqlbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} One parent query, then one child query per order --- textbook \code{1 + N}.
+  \item \textbf{Hypothesise.} The controller serialises \code{order.getItems()} for each order, triggering a lazy load per row.
+  \item \textbf{Verify.} Count log statements for a 10-order page: 11 confirms it; 1 would be the fix.
+  \item \textbf{Fix.} Add \code{@EntityGraph(attributePaths = \{"items"\})} to the finder, or return a DTO projection that aggregates in one query.
+  \item \textbf{Prevent.} Add a test asserting the endpoint issues \code{$\leq$ 1} query via a datasource proxy.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{LazyInitializationException after the response starts}
+\textbf{Symptom.} A controller returns an \code{Order} entity; Jackson serialises it and blows up with \code{could not initialize proxy --- no Session}.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderController.java]
+@GetMapping("/orders/{id}")
+public Order get(@PathVariable Long id) {          // returns ENTITY
+  return orderRepository.findById(id).orElseThrow();
+}   // transaction (and Session) closed here; items still LAZY
+\end{javabox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The exception fires during JSON serialisation, \emph{after} the service method returned.
+  \item \textbf{Hypothesise.} The transaction closed, the entity detached, and Jackson touched the lazy \code{items} --- with no session to load it.
+  \item \textbf{Verify.} The stack trace runs through \code{getItems()} inside the Jackson converter, not inside your service.
+  \item \textbf{Fix.} Map to a DTO \emph{inside} the transaction and return that --- never serialise a managed entity across the layer boundary.
+  \item \textbf{Prevent.} Ban entities from controller signatures; disable \code{open-in-view} so the leak fails loudly in dev, not silently in prod.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Watch dirty checking issue an \code{UPDATE} you never asked for.\\
+\textbf{Context.} A \code{@Transactional} method that loads a \code{Product} and changes its price.\\
+\textbf{Requirements.} Do \emph{not} call \code{save()}; enable \code{show-sql}; observe the \code{UPDATE} at commit.\\
+\textbf{Hints.} Load by id, mutate a field, return; the write happens on flush.\\
+\textbf{Expected outcome.} Exactly one \code{UPDATE} in the log, with no explicit save.\\
+\textbf{Common pitfalls.} Mutating the entity \emph{outside} the transaction --- it is detached, so nothing is written.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Reproduce an N+1 and prove the fix from the log.\\
+\textbf{Context.} \code{Order} with a lazy \code{@OneToMany} to \code{OrderItem}.\\
+\textbf{Requirements.} Load all orders, touch \code{getItems()} in a loop, count queries; then add \code{@EntityGraph} and re-count.\\
+\textbf{Hints.} With \code{format\_sql} on, the statements are easy to tally.\\
+\textbf{Expected outcome.} \code{1 + N} before, exactly \code{1} after.\\
+\textbf{Common pitfalls.} "Fixing" it by making the association \code{EAGER} --- the N+1 just moves, it does not vanish.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Make optimistic locking safe under concurrency, with retry.\\
+\textbf{Context.} \code{Product.stock} decremented by concurrent checkouts; \code{@Version} present.\\
+\textbf{Requirements.} From two threads, decrement the same product; catch \code{OptimisticLockException} on the loser and retry with \code{@Retryable}, re-reading the row.\\
+\textbf{Hints.} The retry must wrap the \emph{whole} transaction and re-fetch fresh state each attempt.\\
+\textbf{Expected outcome.} Both decrements succeed after a retry; stock is correct; no lost update.\\
+\textbf{Common pitfalls.} Retrying with the stale entity from the failed attempt, re-applying a decrement onto an old version and looping forever.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as reflexes, not trivia.
+
+\begin{seniornote}
+The first thing a senior does with a slow endpoint is not open a profiler --- it is turn on SQL logging and count queries. Ninety percent of "the ORM is slow" turns out to be "the ORM did exactly what I told it to, N times." The framework is rarely the bottleneck; the fetch plan is.
+\end{seniornote}
+
+\begin{perfnote}
+\code{spring.jpa.open-in-view} is \code{true} by default and it is a trap. It keeps the persistence context open for the whole request so lazy loads "just work" in the view layer --- which means N+1s hide until production and database connections are held far longer than needed. Set it to \code{false}, force fetching to be explicit, and let leaks fail loudly in development.
+\end{perfnote}
+
+\begin{dbinsight}
+Batch your writes. Inserting a thousand order items one \code{INSERT} at a time is a thousand round-trips; set \code{hibernate.jdbc.batch\_size} (e.g. 50) and Hibernate groups them into batched statements. This does not change your code --- it changes the SQL Hibernate emits under the same dirty-checking model.
+\end{dbinsight}
+
+\begin{interview}
+Expect: \emph{"Why can returning an entity from a controller throw \code{LazyInitializationException}?"} The answer that lands: the transaction (and Hibernate Session) ends when the service method returns, the entity detaches, and the serializer then touches a lazy association with no session to load it. The fix is not "make it EAGER" --- it is "map to a DTO inside the transaction."
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — ShopFlow}
+
+ShopFlow already has a base module (Day 1) and a SQL schema with a migration (Day 2). Today you map that schema to JPA and prove your fetch plan in the logs.
+
+\begin{buildalong}[Day 03 — the persistence layer]
+\begin{wbitem}
+  \item Map the Day 2 schema to the \code{Order} $\rightarrow$ \code{OrderItem} $\rightarrow$ \code{Product} entity graph, every \code{@ManyToOne} explicitly \code{LAZY}.
+  \item Encode ownership: \code{Order.items} uses \code{cascade = ALL} + \code{orphanRemoval = true}; \code{OrderItem.product} carries \emph{no} cascade --- the shared catalogue is never deleted by an order.
+  \item Add \code{@Version} to \code{Product} for optimistic locking on \code{stock}, with a \code{@Retryable} decrement in the service.
+  \item Add \code{OrderRepository.findByCustomerEmail} using \code{@EntityGraph(attributePaths = \{"items", "items.product"\})}.
+  \item Add an \code{OrderSummary} DTO projection (JPQL \code{SELECT new ...}) for the "list my orders" endpoint.
+  \item Turn on \code{show-sql}, set \code{open-in-view: false}, and capture the log for the list endpoint.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} the entity graph maps the Day 2 schema, a concurrent stock decrement raises and recovers from \code{OptimisticLockException}, and the "list my orders" endpoint provably issues \emph{exactly one} SQL query --- verified in the Hibernate log. This persistence layer is what Day 4's REST API will expose.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The persistence context is a per-transaction unit of work: identity, first-level cache, and dirty checking.
+  \item Only \emph{managed} entities are dirty-checked; a detached entity's changes are silently ignored.
+  \item N+1 is \code{1 + N} queries from lazily touching a collection per row --- fix with \code{JOIN FETCH}, \code{@EntityGraph}, or a DTO.
+  \item Cascade \emph{down} ownership (\code{Order $\rightarrow$ OrderItem}); never cascade \code{REMOVE} across to shared data (\code{$\rightarrow$ Product}).
+  \item Optimistic locking (\code{@Version}) scales but needs retry; pessimistic (\code{FOR UPDATE}) serialises hot rows.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{@ManyToOne}/\code{@OneToOne} default to \code{EAGER} --- override them to \code{LAZY} deliberately.
+  \item Never return a managed entity from a controller; map to a DTO inside the transaction.
+  \item \code{open-in-view: false} makes hidden fetches fail loudly in dev instead of leaking into prod.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item EAGER "fix" for N+1 $\rightarrow$ hides it and forbids per-query control. \quad$\bullet$\quad Cascade REMOVE to \code{Product} $\rightarrow$ data loss.
+  \item Entity out of the controller $\rightarrow$ \code{LazyInitializationException}. \quad$\bullet$\quad Pessimistic-everywhere $\rightarrow$ throughput collapse.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Entity states}{Transient $\rightarrow$ Managed (persist) $\rightarrow$ Detached (close/evict) / Removed (remove); merge re-attaches.}
+\cheatitem{Dirty checking}{managed entity + field change $\rightarrow$ UPDATE at flush; no \code{save()} needed.}
+\cheatitem{Fetch defaults}{@OneToMany/@ManyToMany LAZY; @ManyToOne/@OneToOne EAGER --- override to LAZY.}
+\cheatitem{N+1 fix}{\code{JOIN FETCH} (in the JPQL) or \code{@EntityGraph} (on the finder) or DTO projection.}
+\cheatitem{Cascade rule}{cascade down ownership; \code{orphanRemoval} deletes disassociated children; never cascade REMOVE to shared data.}
+\cheatitem{Locking}{optimistic = \code{@Version} + retry, no lock; pessimistic = \code{FOR UPDATE}, row lock, serialised.}
+\cheatitem{No leaks}{DTO out of controllers; \code{open-in-view: false}; count queries in dev.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the persistence context, and how does dirty checking work?}
+\iq{What causes the N+1 problem, and how do you fix it?}
+\iq{What is the difference between \code{JOIN FETCH} and \code{@EntityGraph}?}
+\iq{Optimistic vs pessimistic locking --- when would you use each?}
+\iq{How does \code{orphanRemoval = true} differ from \code{CascadeType.REMOVE}?}
+\iq{Why can returning an entity from a REST controller cause a \code{LazyInitializationException}?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Jakarta Persistence} spec --- "Entity Operations" and the \code{EntityManager} lifecycle.
+  \item \emph{Hibernate ORM User Guide} --- "Fetching," "Locking," and "Batching."
+  \item Vlad Mihalcea, \emph{High-Performance Java Persistence} --- the definitive treatment of N+1, fetch plans, and locking.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 4).} You now have entities and DTO projections that fetch exactly what they should. Tomorrow you expose them as a real REST API --- resource-oriented URLs, correct HTTP status codes (including \code{409 Conflict} for the optimistic-lock failures you just learned to raise), validation, pagination, and an OpenAPI contract the frontend can consume without asking you a single question.
+\end{keyidea}

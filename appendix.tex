@@ -1,0 +1,177 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ APPENDICES ============================
+\newcommand{\appheading}[3]{%
+  % #1 letter  #2 title  #3 subtitle
+  \clearpage\phantomsection
+  \addcontentsline{toc}{chapter}{\texorpdfstring{\textbf{Appendix #1}\, — #2}{Appendix #1 — #2}}%
+  \markboth{Appendix #1 \ \textbullet\ \ #2}{}%
+  \begin{tcolorbox}[enhanced, breakable=false, colback=cBrand, colframe=cBrandDeep,
+      boxrule=0pt, arc=2.2mm, left=6mm,right=6mm,top=5mm,bottom=5.5mm,
+      overlay={\node[anchor=north east, font=\sffamily\bfseries, text=white!12,
+         scale=4.6] at ([xshift=-3mm,yshift=2mm]frame.north east) {#1};}]
+    {\sffamily\bfseries\footnotesize\textcolor{cAccent}{\MakeUppercase{Appendix #1}}}\\[1.6mm]
+    {\sffamily\bfseries\huge\textcolor{white}{#2}}\\[2.2mm]
+    {\sffamily\normalsize\textcolor{white!88}{#3}}
+  \end{tcolorbox}\par\vspace{3mm}%
+}
+\newcommand{\qa}[2]{%
+  \par\addvspace{2.2mm}%
+  \noindent{\sffamily\bfseries\color{cInterview}\faAngleRight\ #1}\par
+  \noindent#2\par}
+\newcommand{\gterm}[2]{\par\addvspace{1.4mm}\noindent{\sffamily\bfseries\color{cBrandDeep}#1}\ \textemdash\ #2\par}
+
+% ---------------------------------------------------------------- APPENDIX A
+\appheading{A}{Backend Engineer Interview Cheat Sheet}{The judgment behind the terms --- review this before every interview}
+
+Junior and mid-level interviews test \emph{judgment} as much as syntax recall: the ability to explain
+\emph{why} a decision was made, not just recite the term. Every answer below states the mechanism, not
+only the label. Read a question, answer it out loud from memory, then check yourself.
+
+\wbsub{Spring}
+\qa{BeanFactory vs ApplicationContext?}{\code{ApplicationContext} extends \code{BeanFactory} with event publishing, AOP integration, i18n, and eager singleton instantiation by default.}
+\qa{What are the Spring bean scopes?}{\code{singleton} (default, one per context), \code{prototype} (new instance per request), and \code{request} / \code{session} / \code{application} --- the last three only in web contexts.}
+\qa{Constructor vs field injection?}{Constructor injection is preferred: explicit required dependencies, immutability via \code{final} fields, and testability without reflection.}
+\qa{What triggers auto-configuration?}{Conditional annotations (\code{@ConditionalOnClass}, \code{@ConditionalOnMissingBean}, \code{@ConditionalOnProperty}) evaluated against the classpath and existing beans.}
+
+\wbsub{SQL \& Databases}
+\qa{Clustered vs non-clustered index?}{A clustered index determines the physical row order on disk (one per table, usually the primary key); non-clustered indexes are separate structures pointing back to the row.}
+\qa{What is a covering index?}{An index that contains every column a query needs, letting the database answer entirely from the index without touching the table (an index-only scan).}
+\qa{How do you find a slow query in production?}{Enable slow-query logging, run \code{EXPLAIN ANALYZE}, check for sequential scans, missing indexes, or stale statistics; compare estimated vs actual row counts.}
+
+\wbsub{Hibernate / JPA}
+\qa{What is dirty checking?}{Hibernate compares a managed entity's current state to its loaded snapshot at flush time and generates \code{UPDATE} statements automatically for changed fields.}
+\qa{How do you fix N+1?}{\code{JOIN FETCH}, \code{@EntityGraph}, or a DTO projection query --- never blanket \code{EAGER} fetching.}
+\qa{What does \code{@Version} do?}{Enables optimistic locking: Hibernate includes the version in the \code{UPDATE}'s \code{WHERE} clause and throws if no row matched (someone else updated first).}
+
+\wbsub{REST API}
+\qa{PUT vs PATCH?}{\code{PUT} replaces the full resource and is idempotent; \code{PATCH} applies a partial update and may or may not be idempotent depending on the patch semantics.}
+\qa{How do you version an API safely?}{URI versioning (\code{/v1}, \code{/v2}) for breaking changes only; additive changes (new optional fields) do not require a new version.}
+\qa{401 vs 403?}{401 Unauthorized --- no or invalid credentials, we do not know who you are. 403 Forbidden --- known identity, insufficient permission.}
+
+\wbsub{Security}
+\qa{How does JWT prevent tampering?}{The token is cryptographically signed (HMAC or RSA); the server verifies the signature on every request, rejecting any token whose payload was altered.}
+\qa{CORS vs CSRF?}{CORS controls which browser origins may call your API via JavaScript. CSRF exploits ambient credentials (cookies) sent automatically by the browser --- largely irrelevant for header-based JWT auth.}
+
+\wbsub{System Design Basics}
+\qa{How would you scale a read-heavy API?}{Add a cache (Redis) in front of the database, add read replicas, and consider CDN caching for static/public data before scaling the database vertically.}
+\qa{How would you design a rate limiter?}{Token bucket or sliding-window counter stored in Redis, keyed by client ID/IP, checked before the request is processed; return 429 when exceeded.}
+\qa{Vertical vs horizontal scaling?}{Vertical: bigger machine --- simple, but has a ceiling and a single point of failure. Horizontal: more machines behind a load balancer --- requires statelessness (hence JWT over server sessions).}
+
+\wbsub{Concurrency}
+\qa{Race condition --- give a backend example.}{Two requests read the same product stock (both see 1 available) and both decrement, resulting in $-1$ stock. Fixed with optimistic locking or a DB-level atomic decrement with a check constraint.}
+\qa{Deadlock --- how does it happen?}{Two transactions each hold a lock the other needs, both waiting indefinitely. Prevented by consistent lock ordering and keeping transactions short.}
+
+\wbsub{Docker}
+\qa{Image vs container?}{An image is a read-only template (layers + metadata); a container is a running (or stopped) instance of that image with its own writable layer.}
+\qa{Why multi-stage builds?}{Keep build-time tools (JDK, Maven cache) out of the final runtime image --- a smaller, more secure image shipped to production.}
+
+\wbsub{Git}
+\qa{Merge vs rebase?}{Merge preserves full history with a merge commit; rebase rewrites commits onto a new base for a linear history --- never rebase shared/public branches.}
+\qa{How do you undo a pushed commit safely?}{\code{git revert} creates a new commit undoing the change, safe for shared history; \code{git reset} rewrites history and should stay local/unpushed.}
+
+\wbsub{Production Troubleshooting}
+\qa{The app is returning 500s intermittently --- what is your process?}{Check dashboards for error-rate / latency spikes correlated with a deploy or traffic change; check logs by correlation ID for the failing requests; check downstream dependency health (DB, cache, external APIs); check resource saturation (CPU, memory, connection pool).}
+\qa{Connection pool exhausted --- likely causes?}{Long-running transactions holding connections, a slow downstream query, a leak from not closing resources, or a pool simply undersized for current traffic.}
+\qa{How do you safely roll back a bad deploy?}{Redeploy the last known-good image tag (never rebuild from source under pressure) --- exactly why CI/CD promotes immutable, tagged artifacts.}
+
+\begin{seniornote}
+The candidates who get offers are not the ones who recite the most terms --- they are the ones who can
+say ``I chose X because Y, and its weakness is Z, which I would address by W.'' Trade-off fluency reads
+as seniority. Practise answering every question above with a \emph{because}.
+\end{seniornote}
+
+% ---------------------------------------------------------------- APPENDIX B
+\appheading{B}{The ShopFlow Build-Along Master Tracker}{One backend, fourteen increments --- tick each as you finish it}
+
+Use this as your single source of truth for the capstone. Each day contributes one increment; by Day 14
+every box should be ticked and \code{docker compose up} should bring the whole system to life.
+
+\wbsub{Phase 1 --- Foundations \& Data (Days 1--3)}
+\begin{checklist}
+  \item \textbf{Day 1:} Base module --- layered packages, constructor injection, typed \code{@ConfigurationProperties}, dev/prod profiles, bean-timing \code{BeanPostProcessor}, \code{GET /api/v1/ping}.
+  \item \textbf{Day 2:} Schema for \code{users}, \code{roles}, \code{products}, \code{orders}, \code{order\_items} with PK/FK/UNIQUE/CHECK constraints, FK indexes, a composite index for ``list orders by user + status'', and a repeatable migration.
+  \item \textbf{Day 3:} JPA entities for the Order/OrderItem/Product graph, LAZY defaults, owned-child cascade, \code{@Version} on \code{Product.stock}, and a one-query \code{@EntityGraph} + DTO projection listing.
+\end{checklist}
+
+\wbsub{Phase 2 --- API, Security \& Quality (Days 4--6)}
+\begin{checklist}
+  \item \textbf{Day 4:} Order API (\code{POST}/\code{GET}/\code{GET \{id\}}) with DTOs, validation, centralized error shape, pagination envelope, and OpenAPI docs.
+  \item \textbf{Day 5:} JWT login + refresh, BCrypt storage, custom JWT filter, stateless \code{SecurityFilterChain}, role-based access (CUSTOMER vs ADMIN), locked-down CORS.
+  \item \textbf{Day 6:} Mockito unit tests for every business rule, a Testcontainers repository test proving no N+1, and MockMvc tests covering success, validation, not-found, and auth failures.
+\end{checklist}
+
+\wbsub{Phase 3 --- Architecture \& Delivery (Days 7--8)}
+\begin{checklist}
+  \item \textbf{Day 7:} Refactor order placement --- extract a validator, publish \code{OrderPlacedEvent}, move email into an async listener decoupled from the transaction; thin controllers, interface-typed services.
+  \item \textbf{Day 8:} Multi-stage Dockerfile (non-root), \code{.dockerignore}, and a \code{docker-compose.yml} bringing up app + Postgres + Redis via env vars and named volumes.
+\end{checklist}
+
+\wbsub{Phase 4 --- Scale, Resilience \& Ship (Days 9--14)}
+\begin{checklist}
+  \item \textbf{Day 9:} Redis-backed \code{@Cacheable} product-catalog reads with a TTL, \code{@CacheEvict} on writes, and a cache-hit-ratio log line.
+  \item \textbf{Day 10:} \code{OrderPlacedEvent} published to RabbitMQ, an idempotent consumer that emails, retries with backoff, and a Dead Letter Queue after 3 attempts.
+  \item \textbf{Day 11:} A dedicated bounded thread pool for async work, Actuator health/metrics/prometheus endpoints, and a custom ``orders per minute'' Micrometer counter.
+  \item \textbf{Day 12:} A GitHub Actions pipeline that tests every PR, then builds, tags by commit SHA, and pushes the image on merge to main --- secrets from the CI store.
+  \item \textbf{Day 13:} Resilience4j circuit breaker + retry on the payment call, separate liveness/readiness probes, a public-endpoint rate limiter, and a Grafana dashboard.
+  \item \textbf{Day 14:} Full assembly against the completion checklist below.
+\end{checklist}
+
+\begin{buildalong}[Final completion checklist]
+\begin{checklist}
+  \item All 14 days' concepts are represented somewhere in this codebase.
+  \item \code{docker compose up} brings up the full stack (app + db + redis + mq) with one command.
+  \item Tests are green and run in CI on every push.
+  \item OpenAPI docs are accurate and complete.
+  \item The README explains architecture \emph{decisions}, not just how to run it.
+\end{checklist}
+\end{buildalong}
+
+% ---------------------------------------------------------------- APPENDIX C
+\appheading{C}{Glossary of Key Terms}{The vocabulary of a backend engineer, in plain language}
+
+\begin{multicols}{2}
+\small
+\gterm{IoC / DI}{Inversion of Control: a container, not your code, creates and wires objects. Dependency Injection is how it hands collaborators in.}
+\gterm{BeanPostProcessor}{A hook that runs around every bean's initialization --- where proxies are attached.}
+\gterm{Proxy (CGLIB/JDK)}{A wrapper around your bean that adds behaviour (transactions, caching, async) for external calls.}
+\gterm{Auto-configuration}{Conditional beans created based on what is on the classpath, unless you defined your own.}
+\gterm{DispatcherServlet}{Spring MVC's front controller that routes every request to a handler method.}
+\gterm{Filter vs Interceptor}{Filters run outside Spring on the raw servlet request; interceptors run inside dispatch, around the handler.}
+\gterm{Persistence Context}{Hibernate's per-transaction first-level cache that tracks managed entities and dirty-checks them.}
+\gterm{N+1 problem}{One query for parents plus one per parent for children; fixed with \code{JOIN FETCH} or \code{@EntityGraph}.}
+\gterm{Optimistic locking}{Detect concurrent updates via a \code{@Version} column; cheap, needs retry logic.}
+\gterm{Pessimistic locking}{Lock the row at the database (\code{SELECT ... FOR UPDATE}); safe under contention, lower concurrency.}
+\gterm{DTO}{Data Transfer Object --- the intentional shape of your API, decoupled from JPA entities.}
+\gterm{Idempotency}{The same request applied twice has the same effect as once --- essential for retries and \code{PUT}/\code{DELETE}.}
+\gterm{BCrypt}{A salted, adaptive password hash; deliberately slow to resist brute force.}
+\gterm{JWT}{A signed, self-contained token proving identity without a server-side session lookup.}
+\gterm{CORS}{A browser rule for which origins may call your API from JavaScript.}
+\gterm{CSRF}{An attack abusing ambient cookies; largely irrelevant for header-based JWT auth.}
+\gterm{RBAC}{Role-Based Access Control --- coarse roles bundling fine-grained permissions.}
+\gterm{Test pyramid}{Many fast unit tests, fewer integration tests, a handful of E2E tests.}
+\gterm{Testcontainers}{Ephemeral real databases in Docker for integration tests --- no H2 dialect surprises.}
+\gterm{MockMvc}{Tests the web layer (status, JSON, validation) without starting a server.}
+\gterm{SOLID}{Five design principles for maintainable, changeable object-oriented code.}
+\gterm{Hexagonal}{Ports-and-adapters architecture isolating domain logic from frameworks.}
+\gterm{Multi-stage build}{A Dockerfile that builds in one stage and ships only the lean runtime in the next.}
+\gterm{Cache-aside}{The application checks the cache, falls back to the DB on a miss, and populates the cache.}
+\gterm{TTL}{Time-to-live: how long a cache entry stays valid before expiring.}
+\gterm{DLQ}{Dead Letter Queue --- where messages go after exhausting retries, so failures are visible.}
+\gterm{At-least-once}{A delivery guarantee where messages may arrive more than once; consumers must be idempotent.}
+\gterm{Circuit breaker}{Stops calling a failing dependency (fails fast) to let it recover and avoid thread exhaustion.}
+\gterm{Rate limiter}{Caps requests per client per window; returns 429 when exceeded.}
+\gterm{Liveness vs readiness}{Liveness: is the process alive (else restart)? Readiness: can it serve traffic right now?}
+\gterm{Prometheus / Micrometer}{Micrometer is the metrics facade; Prometheus scrapes and stores the time series.}
+\gterm{G1 GC}{The default JVM garbage collector since JDK 9, tuned for low pause times.}
+\gterm{Thread pool}{A bounded set of reusable worker threads; size by CPU- vs I/O-bound workload.}
+\gterm{CompletableFuture}{Composes asynchronous work; always attach an \code{exceptionally} handler.}
+\gterm{Keyset pagination}{Cursor-based paging (\code{WHERE id > :last}) that stays fast at any depth.}
+\gterm{Isolation levels}{READ UNCOMMITTED $\rightarrow$ SERIALIZABLE: more correctness, less concurrency.}
+\end{multicols}
+
+\vspace{4mm}
+\begin{center}\small\itshape\color{cInk!65}
+You reached the end of the workbook. If every checklist in Appendix~B is ticked and every term above is
+one you can explain out loud --- you are ready. Go build.
+\end{center}

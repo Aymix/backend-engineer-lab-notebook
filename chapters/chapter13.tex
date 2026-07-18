@@ -1,0 +1,677 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 13 ============================
+\daychapter{13}{Operations}{Production Readiness}{Observability \& resilience --- what "production-ready" actually means}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Instrument a service across the three pillars --- structured logs with correlation IDs, Micrometer metrics, and traces --- and say what each one answers at 3am.
+  \item Separate \emph{liveness} from \emph{readiness} and wire readiness into the Compose healthcheck, so a briefly-degraded dependency never triggers a needless restart.
+  \item Wrap an external call with a Resilience4j circuit breaker, retry and fallback --- and explain every state transition and the correct composition order.
+  \item Rate-limit public endpoints with a token bucket in Redis, returning \code{429} with a \code{Retry-After} header, and reason about \emph{which} key you throttle on.
+  \item Stand up Prometheus + Grafana and build a RED dashboard --- request rate, error rate, p95 latency --- that a human actually watches.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Twelve days in, ShopFlow \emph{runs}. It compiles, the tests are green, CI ships an image (Day 12), and it emits a handful of metrics (Day 11). None of that means it is \keyterm{production-ready}. Production-ready is a different, harder claim: when a downstream payment provider goes dark at 02:40, does ShopFlow fail one feature gracefully --- or does it exhaust its thread pool and take the whole checkout flow down with it? When a user says "it's slow," can you answer with a number instead of a shrug? This day is the difference between "it works on my machine" and "it survives contact with reality."
+
+\glabel{Why backend engineers need it.} Every outage you will ever be paged for is, underneath, one of a small number of stories: a dependency got slow and the failure propagated; a deploy went out and nobody could see the error rate climb; a health check lied and traffic kept hitting a broken instance; one abusive client saturated a shared resource. The tools in this chapter --- observability, circuit breakers, health probes, rate limits --- exist precisely to turn each of those stories into a controlled, visible, recoverable event instead of a 4-hour incident.
+
+\begin{keyidea}
+"Production-ready" is not a feeling, it is a checklist of \keyterm{failure behaviour}. A ready service answers four questions on demand: \emph{Can I see what it is doing?} (observability), \emph{does it degrade instead of collapse when a dependency fails?} (resilience), \emph{does the platform know when to restart vs. divert it?} (health probes), and \emph{can one bad actor starve everyone else?} (rate limiting). Today you make ShopFlow answer all four.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} These concerns wrap \emph{around} the code you already wrote. Actuator and Micrometer sit beside your beans and expose their internal state; Resilience4j attaches proxies (the same AOP mechanism from Day 1) around your outbound calls; a servlet filter in front of your controllers enforces rate limits; and the orchestrator (Day 8's Compose, or Kubernetes later) polls your health endpoints from the outside. Nothing here changes your business logic --- it hardens the shell around it.
+
+\glabel{How it connects to previous chapters.} Day 1's proxies are how \code{@CircuitBreaker} intercepts a method. Day 5's filter chain is where the rate limiter lives. Day 8's Compose file gains a \code{healthcheck} block. Day 9's Redis becomes the shared token store for distributed rate limiting. Day 11's Micrometer registry is the source Prometheus scrapes. Day 12's pipeline is what promotes the hardened image. Today ties the whole roadmap into an operable system.
+
+\glabel{Real company examples.} The circuit breaker entered the mainstream through Netflix's Hystrix, born from real cascading failures in their streaming backend; Resilience4j is its lightweight, functional successor. Prometheus came out of SoundCloud and is now the CNCF standard that Google, GitLab and thousands of others run. The liveness/readiness split is baked into Kubernetes because Google learned, at scale, that "the process is alive" and "the process can serve traffic" are genuinely different questions.
+
+\begin{wbfigure}{Fig 13.0 --- Today you build the operational shell around ShopFlow; each face answers one production question.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, minimum width=34mm, text width=30mm] (core) {\textbf{ShopFlow}\\\scriptsize hardened for prod\\(this chapter)};
+  \node[wbbox, above left=of core, text width=27mm] (obs) {\textbf{Observability}\\\scriptsize logs · metrics · traces};
+  \node[wbbox, above right=of core, text width=27mm] (res) {\textbf{Resilience}\\\scriptsize retry · breaker · limiter};
+  \node[wbbox, below left=of core, text width=27mm] (health) {\textbf{Health probes}\\\scriptsize liveness · readiness};
+  \node[wbbox, below right=of core, text width=27mm] (dash) {\textbf{Dashboards}\\\scriptsize Prometheus · Grafana};
+  \draw[wbarrowg] (obs)--(core); \draw[wbarrowg] (res)--(core);
+  \draw[wbarrowg] (health)--(core); \draw[wbarrowg] (dash)--(core);
+\end{tikzpicture}}
+\end{wbfigure}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture. The top half is \emph{seeing} (observability); the bottom half is \emph{surviving} (resilience). Both feed the single verdict at the bottom: is this thing production-ready?
+
+\begin{wbfigure}{Fig 13.1 --- The Day 13 concept map: observability lets you see failure, resilience lets you survive it, health probes let the platform react.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 6mm, every node/.style={font=\sffamily\footnotesize}]
+  % observability row
+  \node[wbbox, text width=22mm] (logs) {Logs\\\scriptsize correlation IDs};
+  \node[wbbox, right=of logs, text width=22mm] (metrics) {Metrics\\\scriptsize rate · error · p95};
+  \node[wbbox, right=of metrics, text width=22mm] (traces) {Traces\\\scriptsize span per hop};
+  \node[wbboxaccent, right=of traces, text width=24mm] (dash) {Prometheus\\+ Grafana};
+  \draw[wbarrowg] (logs)--(metrics); \draw[wbarrowg] (metrics)--(traces);
+  \draw[wbarrow] (traces)--(dash);
+  % resilience row
+  \node[wbbox, below=10mm of logs, text width=22mm] (retry) {Retry\\\scriptsize transient faults};
+  \node[wbbox, right=of retry, text width=22mm] (cb) {Circuit\\Breaker};
+  \node[wbbox, right=of cb, text width=22mm] (rl) {Rate\\Limiter};
+  \node[wbbox, right=of rl, text width=24mm] (fb) {Fallback\\\scriptsize graceful degrade};
+  \draw[wbarrowg] (retry)--(cb); \draw[wbarrowg] (cb)--(rl); \draw[wbarrowg] (rl)--(fb);
+  % probes + verdict
+  \node[wbboxghost, below=9mm of cb, text width=30mm] (probes) {Liveness \& Readiness probes};
+  \node[wbboxgood, right=8mm of probes, text width=26mm] (ready) {\textbf{Production\\ready?}};
+  \draw[wbarrow] (dash) to[out=-90,in=90] (ready.north);
+  \draw[wbarrowg] (fb) to[out=-90,in=0] (ready.east);
+  \draw[wbarrowg] (probes)--(ready);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Observability} $\rightarrow$ \keyterm{Logs} $\rightarrow$ \keyterm{Metrics} $\rightarrow$ \keyterm{Traces} $\rightarrow$ \keyterm{Liveness} $\rightarrow$ \keyterm{Readiness} $\rightarrow$ \keyterm{Circuit Breaker} $\rightarrow$ \keyterm{Rate Limiter} $\rightarrow$ \keyterm{Dashboard}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Three Pillars of Observability}
+
+\glabel{What is it?} \keyterm{Observability} is the property that you can understand a system's internal state purely from the signals it emits --- without shipping a new build to add a \code{println}. The three complementary signals are \keyterm{logs} (discrete, timestamped events), \keyterm{metrics} (numeric time series), and \keyterm{traces} (the causal path of one request across services).
+
+\glabel{Why does it exist?} "Monitoring" answers questions you knew to ask in advance (CPU $>$ 90\%). "Observability" is for the questions you did \emph{not} anticipate: \emph{why are exactly the checkout requests from one region timing out only since 14:05?} You cannot pre-build a dashboard for every such question, so you emit rich, structured, correlated signals and slice them after the fact.
+
+\glabel{How does it work internally?} Each pillar has a different shape and cost, and they are meant to be used \emph{together}, not as substitutes.
+
+\begin{wbfigure}{Fig 13.2 --- Three pillars, three shapes. Logs tell the story of one request; metrics aggregate millions; traces stitch a request across services.}
+\wbscale{\begin{tikzpicture}[node distance=7mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=30mm] (logs) {\textbf{Logs}\\\scriptsize what happened, in words\\high detail · high volume\\``why did THIS request fail?''};
+  \node[wbbox, right=9mm of logs, text width=30mm] (met) {\textbf{Metrics}\\\scriptsize numbers over time\\cheap · aggregatable\\``is the fleet healthy NOW?''};
+  \node[wbbox, right=9mm of met, text width=30mm] (tr) {\textbf{Traces}\\\scriptsize one request, all hops\\shows WHERE time went\\``which service is slow?''};
+  \node[wbboxgood, below=8mm of met, text width=34mm] (obs) {\textbf{Observability}\\\scriptsize correlate by trace / request ID};
+  \draw[wbarrowg] (logs)--(obs); \draw[wbarrowg] (met)--(obs); \draw[wbarrowg] (tr)--(obs);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{The glue: a correlation ID.} The single most valuable habit is tagging every log line of one request with the same identifier, so you can reconstruct that request's whole story with one query. In Spring Boot 3 this is built on \keyterm{Micrometer Tracing}: a filter puts a \code{traceId} into the SLF4J \code{MDC} (Mapped Diagnostic Context), and your log pattern prints it. If you also accept an inbound \code{X-Correlation-Id} you can follow a request all the way from the mobile client.
+
+\begin{javabox}[CorrelationIdFilter.java]
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+public class CorrelationIdFilter extends OncePerRequestFilter {
+
+  static final String HEADER = "X-Correlation-Id";
+
+  @Override
+  protected void doFilterInternal(HttpServletRequest req,
+      HttpServletResponse res, FilterChain chain)
+      throws ServletException, IOException {
+    String cid = req.getHeader(HEADER);
+    if (cid == null || cid.isBlank()) {
+      cid = UUID.randomUUID().toString();
+    }
+    MDC.put("correlationId", cid);       // now every log line carries it
+    try {
+      res.setHeader(HEADER, cid);        // echo back so the caller can log it too
+      chain.doFilter(req, res);
+    } finally {
+      MDC.remove("correlationId");       // MUST clean up: threads are pooled + reused
+    }
+  }
+}
+\end{javabox}
+
+\begin{propsbox}[application.yml --- log pattern includes the ID]
+logging.pattern.level=%5p [${spring.application.name},%X{correlationId}]
+\end{propsbox}
+
+\begin{behind}
+The \code{MDC} is a \code{ThreadLocal} map. That is why the \code{finally} block is not optional: Tomcat hands the same worker thread to the next request, and a leftover \code{correlationId} would silently mislabel someone else's logs. The same trap bites you the moment you hop threads with \code{@Async} (Day 11) or reactive code --- the \code{MDC} does not follow the work unless you propagate it.
+\end{behind}
+
+\begin{prodtip}
+Log \emph{structured} JSON in production, not human-prose lines. With \code{logstash-logback-encoder} each event becomes a JSON object with \code{correlationId}, \code{level} and any key/value context as first-class fields --- so your log platform can filter \code{correlationId="abc"} instead of grepping substrings. Humans read logs during a demo; machines read them during an incident.
+\end{prodtip}
+
+\wbsub{3.2\quad Metrics that Matter --- Micrometer, Prometheus \& the RED Method}
+
+\glabel{What is it?} A \keyterm{metric} is a named numeric time series with labels, e.g. \code{http\_server\_requests} tagged by \code{uri}, \code{method}, \code{status}. Micrometer (Day 11) is the vendor-neutral facade that records them; \keyterm{Prometheus} is a server that \emph{scrapes} (pulls) the \code{/actuator/prometheus} endpoint every 15s and stores the samples; \keyterm{Grafana} queries Prometheus and draws the graphs.
+
+\glabel{Why does it exist?} You cannot log every request's latency and then eyeball millions of lines. Metrics pre-aggregate: a \keyterm{histogram} of request durations lets you compute a p95 across the whole fleet in one cheap query. Metrics are how you alert on \emph{symptoms} rather than causes.
+
+\begin{wbfigure}{Fig 13.3 --- The standard open-source monitoring stack. Prometheus pulls; it is not pushed to. Grafana never touches your app directly.}
+\wbscale{\begin{tikzpicture}[node distance=10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=30mm] (app) {\textbf{Spring Boot}\\\scriptsize /actuator/prometheus\\Micrometer registry};
+  \node[wbboxaccent, right=of app, text width=30mm] (prom) {\textbf{Prometheus}\\\scriptsize scrapes every 15s\\stores time series};
+  \node[wbboxgood, right=of prom, text width=30mm] (graf) {\textbf{Grafana}\\\scriptsize dashboards\\+ alert rules};
+  \draw[wbarrow] (prom) to[out=180,in=0] node[wbcap, above]{pull} (app);
+  \draw[wbarrow] (prom)--(graf);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{The RED method.} For any request-driven service, three metrics tell you almost everything: \keyterm{R}ate (requests/second), \keyterm{E}rrors (fraction failing), \keyterm{D}uration (latency distribution, watched at p95/p99, never the mean). Everything else is diagnosis; these three are the vital signs. Micrometer already exposes them from the \code{http\_server\_requests} timer --- you just need the queries.
+
+\begin{yamlbox}[prometheus.yml --- scrape config]
+scrape_configs:
+  - job_name: 'shopflow'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['shopflow:8080']   # service name on the Compose network
+\end{yamlbox}
+
+\begin{propsbox}[PromQL for the three RED panels]
+# request rate (req/s), summed across all endpoints
+sum(rate(http_server_requests_seconds_count[1m]))
+
+# error rate: fraction of responses that are 5xx
+sum(rate(http_server_requests_seconds_count{status=~"5.."}[1m]))
+  / sum(rate(http_server_requests_seconds_count[1m]))
+
+# p95 latency from the histogram buckets
+histogram_quantile(0.95,
+  sum(rate(http_server_requests_seconds_bucket[5m])) by (le))
+\end{propsbox}
+
+\glabel{When should I use it?} Always, for anything you operate. The RED trio is the minimum viable dashboard; add saturation (pool usage, queue depth) as you learn where your service hurts.
+
+\glabel{When should I \emph{not}?} Do not turn every string into a metric label. Labels with unbounded values --- a user ID, an order ID, a raw URL with path params --- explode \keyterm{cardinality}: Prometheus stores one time series \emph{per unique label combination}, and millions of them will OOM the server.
+
+\begin{perfnote}
+Micrometer templates URIs for you: \code{/orders/42} and \code{/orders/99} both record as \code{/orders/\{id\}}, one series. The moment you add your own tag like \code{.tag("orderId", id)}, you have re-created the cardinality bomb by hand. Rule of thumb: a label's value set should be small and bounded (status codes, endpoints, regions) --- never user-generated.
+\end{perfnote}
+
+\begin{misconception}
+"p95 latency is roughly the average plus a bit." No. Averages hide the tail --- a service can have a 40ms mean and a 3-second p99 because 1\% of requests hit a cold cache or a lock. Users feel the tail, and one slow dependency shows up in p99 long before it moves the mean. Alert on percentiles, and read them from a histogram, not by averaging pre-computed averages (which is mathematically meaningless).
+\end{misconception}
+
+\wbsub{3.3\quad Health Checks --- Liveness vs Readiness}
+
+\glabel{What is it?} Two \emph{different} yes/no questions the orchestrator asks your process. \keyterm{Liveness}: "is this process fundamentally broken --- should I kill and restart it?" \keyterm{Readiness}: "can this instance serve traffic \emph{right now} --- should it be in the load-balancer rotation?"
+
+\glabel{Why does it exist?} Conflating them causes outages. Suppose the database is briefly unreachable. If your one health check fails and the orchestrator treats it as liveness, it \emph{restarts} every instance --- a restart storm that does nothing to bring the database back and drops all in-flight work. The correct behaviour is: stay alive (readiness fails, so you are pulled from the load balancer), and rejoin automatically when the dependency recovers. Same signal, opposite reactions.
+
+\begin{wbfigure}{Fig 13.4 --- Same instance, two probes, two reactions. A degraded dependency should fail readiness only, never liveness.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=30mm] (orch) {\textbf{Orchestrator}\\\scriptsize polls both probes};
+  \node[wbbox, below left=9mm and 4mm of orch, text width=32mm] (live) {\textbf{/health/liveness}\\\scriptsize is the JVM wedged?\\deadlock · OOM loop};
+  \node[wbbox, below right=9mm and 4mm of orch, text width=32mm] (ready) {\textbf{/health/readiness}\\\scriptsize can it serve now?\\db · redis · pool checked};
+  \node[wbboxwarn, below=7mm of live, text width=32mm] (kill) {fail $\rightarrow$ \textbf{RESTART} the pod};
+  \node[wbboxaccent, below=7mm of ready, text width=32mm] (divert) {fail $\rightarrow$ \textbf{DIVERT} traffic\\(keep process alive)};
+  \draw[wbarrowg] (orch)--(live); \draw[wbarrowg] (orch)--(ready);
+  \draw[wbarrow] (live)--(kill); \draw[wbarrow] (ready)--(divert);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} Spring Boot Actuator ships \code{LivenessStateHealthIndicator} and \code{ReadinessStateHealthIndicator} out of the box, exposed at \code{/actuator/health/liveness} and \code{/actuator/health/readiness} once you enable probes. Readiness automatically flips to \code{OUT\_OF\_SERVICE} during graceful shutdown, so the load balancer stops sending new requests \emph{before} the app stops accepting them. You compose additional indicators into the readiness group via config.
+
+\begin{yamlbox}[application.yml --- probes and groups]
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db,redis
+  health:
+    circuitbreakers:
+      enabled: true      # surface breaker state as a health contributor
+\end{yamlbox}
+
+\glabel{Wire it into Compose (Day 8).} The healthcheck must hit \emph{readiness}, and \code{start\_period} must be generous --- a JVM can take 20--40s to warm up, and you do not want it declared unhealthy during boot.
+
+\begin{yamlbox}[docker-compose.yml --- healthcheck excerpt]
+  shopflow:
+    image: shopflow:latest
+    healthcheck:
+      test: ["CMD", "curl", "-f",
+             "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 40s     # grace window while the JVM warms up
+\end{yamlbox}
+
+\begin{misconception}
+"Liveness should also check the database." Almost never. If liveness checks the DB, then a DB blip restarts every replica simultaneously --- turning a recoverable dependency hiccup into a self-inflicted outage. Liveness should check only things a \emph{restart could fix} (a wedged thread, an unrecoverable state). Dependency health belongs in readiness.
+\end{misconception}
+
+\begin{prodtip}
+Set liveness to be nearly un-failable and cheap; make readiness honest but bounded. A readiness check that itself blocks for 30s on a dead database is as bad as no check --- always give dependency health indicators a short timeout, or they become the outage.
+\end{prodtip}
+
+\wbsub{3.4\quad The Circuit Breaker State Machine}
+
+\glabel{What is it?} A \keyterm{circuit breaker} is a proxy that watches the failure rate of calls to one dependency and, once failures cross a threshold, \emph{stops calling it} --- returning immediately (fail fast) instead of waiting on timeouts. It is a three-state machine borrowed from electrical engineering: trip the breaker before the wiring melts.
+
+\glabel{Why does it exist?} The enemy is the \keyterm{cascading failure}. A payment provider slows from 50ms to 30s. Every checkout thread now blocks for 30s waiting. Your fixed-size thread pool fills with threads parked on a dead dependency; new requests --- even ones that do not touch payment --- queue and time out. One slow dependency has taken down the entire service. The breaker cuts that feedback loop: after enough failures it opens, checkout returns a fast fallback, threads stay free, and the rest of ShopFlow keeps serving.
+
+\begin{wbfigure}{Fig 13.5 --- The circuit breaker state machine. CLOSED lets calls through; OPEN fails fast; HALF-OPEN sends trial calls to test recovery.}
+\wbscale{\begin{tikzpicture}[node distance=11mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxgood, text width=44mm] (closed) {\textbf{CLOSED}\\\scriptsize calls flow normally; breaker counts failures in a sliding window};
+  \node[wbboxwarn, below=of closed, text width=44mm] (open) {\textbf{OPEN}\\\scriptsize calls fail fast (CallNotPermitted); dependency gets room to recover};
+  \node[wbboxaccent, below=of open, text width=44mm] (half) {\textbf{HALF-OPEN}\\\scriptsize a few trial calls probe whether the dependency is healthy again};
+  \draw[wbarrow] (closed)--node[wbcap,right,text width=30mm]{failure rate $>$ threshold} (open);
+  \draw[wbarrow] (open)--node[wbcap,right,text width=30mm]{wait-duration elapses} (half);
+  \draw[wbarrow] (half.west) to[out=180,in=180] node[wbcap,left,text width=22mm]{trials succeed} (closed.west);
+  \draw[wbarrow] (half.east) to[out=0,in=0] node[wbcap,right,text width=22mm]{a trial fails} (open.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} Resilience4j records outcomes in a \keyterm{sliding window} --- either the last N calls (\code{COUNT\_BASED}) or all calls in the last N seconds (\code{TIME\_BASED}). When the failure rate over a full window exceeds \code{failure-rate-threshold}, it transitions \code{CLOSED} $\rightarrow$ \code{OPEN} and starts a timer. While \code{OPEN}, every call is rejected instantly with \code{CallNotPermittedException} --- no thread touches the dependency. After \code{wait-duration-in-open-state}, it moves to \code{HALF-OPEN} and permits a small number of trial calls. If they succeed, it closes; if any fails, it opens again and the timer restarts.
+
+\begin{yamlbox}[application.yml --- circuit breaker instance]
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10      # don't judge on 1 sample
+        failure-rate-threshold: 50        # open at 50% failures
+        slow-call-duration-threshold: 2s  # a slow call counts as a failure
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+\end{yamlbox}
+
+\begin{behind}
+\code{minimum-number-of-calls} is the detail beginners miss. Without it, the very first call failing is a 100\% failure rate and the breaker trips on a single fluke. It tells Resilience4j: "collect at least this many samples before you are allowed to compute a rate and open." A breaker that trips on one request is worse than no breaker --- it manufactures outages.
+\end{behind}
+
+\begin{interview}
+Expect: \emph{"Walk me through the circuit breaker states."} A strong answer names all three and the \emph{transitions with their triggers}: CLOSED opens on failure-rate-over-window; OPEN moves to HALF-OPEN after a wait; HALF-OPEN closes on successful trials or re-opens on a single failing trial. Then add the \emph{why}: OPEN exists to give the dependency breathing room and to keep your threads free.
+\end{interview}
+
+\wbsub{3.5\quad Retry, Fallback \& Composition Order}
+
+\glabel{What is it?} \keyterm{Retry} re-invokes a failing call a few times with backoff, for \keyterm{transient} faults (a dropped connection, a one-off timeout). A \keyterm{fallback} is the graceful answer when everything has failed --- here, marking a payment \code{deferred} so the order survives and a worker can settle it later. Together with the breaker they form a small stack of decorators around one method.
+
+\begin{javabox}[PaymentGateway.java]
+@Service
+public class PaymentGateway {
+
+  private static final Logger log =
+      LoggerFactory.getLogger(PaymentGateway.class);
+  private final PaymentClient client;
+
+  public PaymentGateway(PaymentClient client) {
+    this.client = client;
+  }
+
+  // Retry is OUTER, circuit breaker is INNER (see composition note).
+  // Fallback lives on the outermost annotation only.
+  @Retry(name = "paymentService", fallbackMethod = "deferPayment")
+  @CircuitBreaker(name = "paymentService")
+  public PaymentResult charge(ChargeRequest req) {
+    return client.charge(req);   // remote HTTP call; may time out
+  }
+
+  // Fallback signature = same args + the Throwable that caused it.
+  private PaymentResult deferPayment(ChargeRequest req, Throwable ex) {
+    log.warn("payment deferred order={} cause={}",
+             req.orderId(), ex.toString());
+    return PaymentResult.deferred(req.orderId());
+  }
+}
+\end{javabox}
+
+\glabel{How does it work internally? Order matters.} Each annotation is a proxy layer, and Resilience4j nests them in a fixed default order (outermost first): \code{Retry} $\rightarrow$ \code{CircuitBreaker} $\rightarrow$ \code{RateLimiter} $\rightarrow$ \code{TimeLimiter} $\rightarrow$ \code{Bulkhead}. Read outside-in: a retry re-drives the \emph{whole} inner stack, so each attempt is recorded by the breaker; the breaker, being inside retry, can open mid-retry and make the remaining attempts fail fast.
+
+\begin{wbfigure}{Fig 13.6 --- The Resilience4j decorator stack (default order). A call falls through each layer; the breaker and limiter can short-circuit it before the remote call.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=70mm, minimum height=8mm, align=left, text width=64mm}]
+  \node[stg, wbboxghost] (in) {\textbf{Incoming call} \hfill \scriptsize charge(req)};
+  \node[stg, below=of in] (retry) {\textbf{Retry} \hfill \scriptsize re-invokes on transient fault (outermost)};
+  \node[stg, below=of retry, wbboxwarn] (cb) {\textbf{CircuitBreaker} \hfill \scriptsize fails fast when OPEN};
+  \node[stg, below=of cb, wbboxaccent] (rl) {\textbf{RateLimiter} \hfill \scriptsize throttles call volume};
+  \node[stg, below=of rl] (tl) {\textbf{TimeLimiter / Bulkhead} \hfill \scriptsize caps time \& concurrency};
+  \node[stg, below=of tl, wbboxgood] (remote) {\textbf{client.charge()} \hfill \scriptsize the real remote payment API};
+  \foreach \a/\b in {in/retry,retry/cb,cb/rl,rl/tl,tl/remote}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use retry?} Only for \emph{idempotent} operations and \emph{transient} faults. A payment \code{charge} is a dangerous thing to retry blindly --- retrying a request that actually succeeded but whose \emph{response} was lost can double-charge a customer. Constrain retry to network-level exceptions, and make the operation idempotent with an idempotency key.
+
+\begin{yamlbox}[application.yml --- retry, scoped to transient faults]
+resilience4j:
+  retry:
+    instances:
+      paymentService:
+        max-attempts: 3
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        retry-exceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+\end{yamlbox}
+
+\begin{misconception}
+"Put \code{fallbackMethod} on every annotation." Do not. If the \emph{inner} \code{@CircuitBreaker} also had a fallback, it would swallow the exception and return a normal value --- so the outer \code{@Retry} would see \emph{success} and never retry. Declare the fallback on the \emph{outermost} decorator only; the inner ones should propagate exceptions upward so the layers above can act on them.
+\end{misconception}
+
+\begin{seniornote}
+The most dangerous line in a resilience config is a naive retry. Three services each retrying three times is a $3\times3\times3$ amplification: a small downstream blip becomes a 27$\times$ traffic spike that keeps the dependency down --- a \keyterm{retry storm}. That is exactly why retry sits \emph{inside} nothing that prevents it: the circuit breaker is your safety valve. Retry + breaker together; retry alone is a loaded gun. Add jitter to backoff so a thousand clients do not retry in lockstep.
+\end{seniornote}
+
+\wbsub{3.6\quad Rate Limiting --- Protecting Yourself and Others}
+
+\glabel{What is it?} A \keyterm{rate limiter} caps how many requests a caller may make in a window, rejecting the excess with HTTP \code{429 Too Many Requests} and a \code{Retry-After} header. It protects \emph{you} from being overwhelmed and protects your \emph{downstreams} from being hammered through you.
+
+\glabel{Why does it exist for internal services too?} Because "trusted" callers cause the worst incidents: a buggy retry loop in a sister service, a batch job that fires 100k requests at once, a mis-configured client polling every 10ms. Without a limit, one internal caller starves every other tenant of a shared pool. Rate limiting is fairness enforcement, not just abuse defence.
+
+\glabel{How does it work internally?} Two dominant algorithms. A \keyterm{token bucket} holds up to \emph{capacity} tokens and refills at a steady rate; each request spends one token; an empty bucket means \code{429}. It permits short bursts (spare tokens) while bounding the long-run average --- usually what you want. A \keyterm{sliding window} counts requests over the trailing N seconds precisely, at higher storage cost. A naive \keyterm{fixed window} (counter reset each second) is simplest but allows a double burst across the boundary.
+
+\begin{wbfigure}{Fig 13.7 --- A token-bucket limiter in Redis. Every instance shares one bucket, so the limit holds across the whole fleet.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=26mm] (req) {\textbf{Request}\\\scriptsize on public endpoint};
+  \node[wbboxdb, right=of req, text width=34mm] (redis) {\textbf{Redis bucket}\\\scriptsize atomic Lua: refill\\then try-consume 1 token};
+  \node[wbboxgood, above right=6mm and 12mm of redis, text width=24mm] (ok) {token left\\$\rightarrow$ \textbf{200} pass};
+  \node[wbboxwarn, below right=6mm and 12mm of redis, text width=24mm] (no) {empty\\$\rightarrow$ \textbf{429} + Retry-After};
+  \draw[wbarrow] (req)--(redis);
+  \draw[wbarrow] (redis)--(ok); \draw[wbarrow] (redis)--(no);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Why Redis, not in-process?} Resilience4j's own \code{RateLimiter} is per-JVM. With three ShopFlow replicas behind a load balancer, an in-process limit of 100/s becomes 300/s in aggregate --- and the number drifts every time you autoscale. A \emph{distributed} limiter keeps the counter in Redis (Day 9), so all replicas share one bucket. The consume-and-check must be \emph{atomic}, which is why it runs as a single Lua script server-side --- no read-modify-write race between instances.
+
+\begin{javabox}[RateLimitFilter.java]
+@Component
+@Order(10)   // after correlation-id, before controllers
+public class RateLimitFilter extends OncePerRequestFilter {
+
+  private final TokenBucketService buckets;
+
+  public RateLimitFilter(TokenBucketService buckets) {
+    this.buckets = buckets;
+  }
+
+  @Override
+  protected void doFilterInternal(HttpServletRequest req,
+      HttpServletResponse res, FilterChain chain)
+      throws ServletException, IOException {
+
+    String key = "rl:" + clientKey(req);       // e.g. API key or client IP
+    if (!buckets.tryConsume(key)) {            // atomic Redis Lua call
+      res.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());  // 429
+      res.setHeader("Retry-After", "1");
+      res.setContentType("application/json");
+      res.getWriter().write("{\"error\":\"rate_limited\"}");
+      return;                                  // do NOT continue the chain
+    }
+    chain.doFilter(req, res);
+  }
+}
+\end{javabox}
+
+\begin{secwarn}[choose the throttle key carefully]
+The key you rate-limit on \emph{is} the policy. Limit by client IP and one NAT gateway (a whole office, a mobile carrier) shares one bucket --- you punish thousands for one user. Limit by user ID and unauthenticated traffic is unprotected. Limit by API key for partners, per-user for authenticated endpoints, and per-IP only as a coarse backstop. And never trust a client-supplied \code{X-Forwarded-For} without a trusted proxy in front, or attackers simply spoof a fresh identity per request.
+\end{secwarn}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Separate liveness and readiness; readiness includes dependencies, liveness does not.
+  \item Wrap every external call (payment, third-party API) with a circuit breaker; add retry only where the call is idempotent.
+  \item Alert on \emph{symptoms} --- error rate, p95 latency, saturation --- not raw counters nobody reads.
+  \item Tag every request's logs with a correlation ID so one incident's full story is one query.
+  \item Keep the fallback on the outermost decorator; keep metric label cardinality bounded.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item No breaker on an external call --- one flaky dependency exhausts the thread pool and takes the whole service down.
+  \item Treating "the process is up" as the only health signal, ignoring degraded dependencies.
+  \item Retrying non-idempotent operations (double charges) or retrying without a breaker (retry storms).
+  \item Logging without structure or correlation IDs, so incident debugging is grep archaeology.
+  \item No alerting at all --- learning about the outage from a customer instead of a dashboard.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two of today's diagrams carry most of the load. Reproduce them from memory --- the act of redrawing is what converts "I recognise that" into "I can explain that on a whiteboard."
+
+\begin{writespace}[Redraw: the circuit breaker state machine --- 3 states, 4 transitions, each labelled with its trigger]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: one probe, two reactions --- how liveness and readiness diverge when the database is briefly down]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Harden the Payment Path}
+
+\textbf{Goal of this lab:} take ShopFlow's existing payment call and make it survive a dead provider --- observably, resiliently, and without taking the rest of the app down. You will \emph{see} the breaker trip in a metric, then watch it recover.
+
+\resetlab
+\labstep{Add the dependencies and a correlation-ID filter}
+Add \code{resilience4j-spring-boot3}, \code{spring-boot-starter-actuator}, and \code{micrometer-registry-prometheus}. Register the \code{CorrelationIdFilter} from 3.1 and add \code{correlationId} to your log pattern.
+\labwhy{Before you change behaviour you must be able to \emph{see} behaviour --- every later step is verified by reading a log line or a metric, not by hoping.}
+
+\labstep{Wrap \code{charge()} with a circuit breaker + retry + fallback}
+Annotate \code{PaymentGateway.charge} exactly as in 3.5: \code{@Retry} outer, \code{@CircuitBreaker} inner, \code{fallbackMethod} on the retry only, returning \code{PaymentResult.deferred(...)}.
+\labwhy{This is the single highest-value change of the day: one flaky dependency can no longer cascade into a full outage.}
+
+\labstep{Configure the instances and scope the retry}
+Add the \code{paymentService} circuit-breaker and retry blocks from 3.4/3.5. Set \code{retry-exceptions} to network faults only and \code{ignore-exceptions} to \code{CallNotPermittedException}.
+\labwhy{An unscoped retry double-charges customers and amplifies outages; scoping it is what makes retry safe rather than dangerous.}
+
+\labstep{Split liveness and readiness, wire readiness into Compose}
+Enable probes, put \code{readinessState,db,redis} in the readiness group, and point the Compose \code{healthcheck} at \code{/actuator/health/readiness} with a 40s \code{start\_period}.
+\labwhy{Now a brief DB blip diverts traffic instead of triggering a restart storm --- the difference between a blip and an outage.}
+
+\labstep{Add a Redis token-bucket rate limiter returning 429}
+Register \code{RateLimitFilter}; back \code{tryConsume} with an atomic Redis Lua script keyed per API key or IP. Return \code{429} with \code{Retry-After} when the bucket is empty.
+\labwhy{This protects the shared payment provider from being hammered and enforces fairness across clients --- across all replicas, not just one JVM.}
+
+\labstep{Stand up Prometheus + Grafana and build the RED panels}
+Add Prometheus + Grafana services to Compose, scrape \code{/actuator/prometheus}, and build three panels using the PromQL from 3.2: request rate, error rate, p95 latency.
+\labwhy{A metric nobody graphs is invisible; a dashboard is where "the app feels slow" becomes "p95 doubled at 14:05 on the payment endpoint."}
+
+\labstep{Simulate the failure and watch the machine work}
+Point the payment client at a dead host (or a stub that sleeps 5s). Fire load; watch the breaker go \code{OPEN} in the \code{resilience4j\_circuitbreaker\_state} metric, checkout return deferred instantly, and the breaker close again once the stub recovers.
+\labwhy{Reading the state transition on your own dashboard is what turns Fig 13.5 from a picture into an instinct.}
+
+\begin{prodtip}
+Do not test resilience only with a config change. Actually kill the dependency --- \code{docker compose stop} the payment stub mid-load --- and confirm three things: checkout still responds fast, the error budget is spent on \emph{fallbacks} not timeouts, and no thread pool metric flatlines. Resilience you have not seen fail is resilience you do not have.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two --- the goal is to make your reasoning explicit.
+
+\begin{thinkbox}
+Your service calls a payment provider and a (non-critical) recommendations service. You have one thread pool for all outbound calls. Explain, step by step, how a slowdown in the \emph{recommendations} service could cause \emph{payments} to start failing --- and what isolation mechanism would stop it.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A teammate proposes a single \code{/health} endpoint that checks the database and returns 503 if it is down, used for both liveness and readiness. Describe the concrete production failure this invites, and rewrite the design in one or two sentences.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You add a retry (3 attempts) to a call, and during the next incident the outage lasts \emph{longer} than before you added it. Explain how a retry can make an outage worse, and what two settings you would add to make retry safe.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The circuit breaker that never opens}
+\textbf{Symptom.} The payment provider is clearly down --- every call times out --- yet the breaker stays \code{CLOSED} and threads keep piling up on the dead dependency.
+
+\smallskip\textbf{Evidence.}
+\begin{yamlbox}[application.yml --- the misconfigured instance]
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        sliding-window-size: 100
+        minimum-number-of-calls: 100
+        failure-rate-threshold: 50
+        # calls average ~4/min in this environment
+\end{yamlbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{resilience4j\_circuitbreaker\_state} shows \code{closed}; buffered-calls count creeps up slowly and never reaches 100.
+  \item \textbf{Hypothesise.} The window needs 100 calls before it will \emph{compute} a rate, but at 4 calls/min it takes 25 minutes to fill --- the breaker cannot trip in time.
+  \item \textbf{Verify.} Lower \code{minimum-number-of-calls} to 10 (or switch to \code{TIME\_BASED}); reproduce and watch the state flip to \code{open}.
+  \item \textbf{Fix.} Size the window to your real traffic rate: enough samples to avoid flukes, small enough to react within seconds.
+  \item \textbf{Prevent.} Add an alert on \code{circuitbreaker\_state == open} and load-test the breaker's reaction time, not just its config validity.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The restart storm}
+\textbf{Symptom.} At 02:40 the database has a 30-second network blip. Instead of recovering, every ShopFlow replica restarts, in-flight orders are lost, and the outage lasts 15 minutes.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The orchestrator event log shows liveness-probe failures on every pod, followed by kills and cold restarts stacked on top of the DB blip.
+  \item \textbf{Hypothesise.} The liveness probe checks the database, so a dependency blip is being treated as "the process is broken --- restart it."
+  \item \textbf{Verify.} Inspect the health group config; confirm \code{db} is in the \emph{liveness} group, not just readiness.
+  \item \textbf{Fix.} Move dependency checks (\code{db}, \code{redis}) into the \emph{readiness} group only; leave liveness as \code{livenessState}.
+  \item \textbf{Prevent.} Make it a review rule: liveness may only check things a restart could fix. Add a chaos test that pauses the DB and asserts pods divert, not restart.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} See a circuit breaker trip with your own eyes.\\
+\textbf{Context.} A trivial \code{GET /flaky} that calls a stub which throws 70\% of the time.\\
+\textbf{Requirements.} Annotate the call with \code{@CircuitBreaker(name="flaky")}; set \code{failure-rate-threshold: 50}, \code{minimum-number-of-calls: 10}.\\
+\textbf{Hints.} Hit the endpoint in a loop; scrape \code{/actuator/prometheus} and grep \code{circuitbreaker\_state}.\\
+\textbf{Expected outcome.} After ~10 calls the state flips to \code{open} and further calls return the fallback instantly.\\
+\textbf{Common pitfalls.} Omitting \code{minimum-number-of-calls}, so the first failure trips a 100\% rate and confuses the demo.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Prove your rate limiter holds \emph{across replicas}.\\
+\textbf{Context.} Two ShopFlow instances behind one load balancer, sharing Redis.\\
+\textbf{Requirements.} Implement the token bucket as an atomic Redis Lua script; limit to 100/s per client key; return \code{429} + \code{Retry-After}.\\
+\textbf{Hints.} Run both instances via Compose; drive load with a tool that reports the 429 ratio.\\
+\textbf{Expected outcome.} Aggregate accepted traffic stays near 100/s regardless of which instance serves each request.\\
+\textbf{Common pitfalls.} Doing a read-then-write in Java instead of one Lua call --- two instances race and the real limit drifts above 100/s.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Ship a RED dashboard and one meaningful alert.\\
+\textbf{Context.} You want to know about a payment degradation before a customer tells you.\\
+\textbf{Requirements.} Prometheus + Grafana in Compose; panels for request rate, 5xx error rate, and p95 latency; one alert rule: p95 on the payment endpoint $>$ 1s for 5 minutes.\\
+\textbf{Hints.} Use \code{histogram\_quantile} over the \code{\_bucket} series; filter by \code{uri} for the payment route.\\
+\textbf{Expected outcome.} Killing the payment stub visibly moves error rate and p95, and the alert fires after the sustained window.\\
+\textbf{Common pitfalls.} Alerting on a single scrape (flaps constantly) --- use a \code{for:} duration so a blip does not page you.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as instinct, not trivia.
+
+\begin{seniornote}
+The goal of resilience is not "never fail" --- it is "fail in a small, predictable, cheap way." A deferred payment that a background worker settles in 30 seconds is a good failure; a checkout page that hangs for 30 seconds and then 500s is a catastrophic one. Design your fallbacks around what the \emph{user} can tolerate, not around what is technically easiest to return.
+\end{seniornote}
+
+\begin{perfnote}
+Every resilience wrapper costs something. A circuit breaker maintains a sliding-window buffer per instance; a rate limiter does a network round-trip to Redis on every request; enabling histogram buckets multiplies the series each timer emits. On a hot path, measure the overhead --- and do not put a distributed rate limiter in front of an endpoint that serves a million req/s without checking that Redis can take the load.
+\end{perfnote}
+
+\begin{interview}
+Expect: \emph{"Why is rate limiting necessary even for internal services?"} The answer that lands: trust does not prevent bugs. A retry loop, a runaway batch job, or a mis-set poll interval in a sibling service can generate more damaging load than any external attacker --- and because it is "internal," nobody thought to bound it. Rate limiting is fairness and blast-radius control, not just abuse defence.
+\end{interview}
+
+\begin{prodtip}
+Build the production-readiness checklist \emph{into the pipeline}, not into a wiki nobody reads. Fail the Day 12 build if the actuator health endpoint is missing, if an external client has no breaker, or if a new endpoint has no rate limit. The cheapest time to catch an un-hardened service is before it ever ships.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+ShopFlow already ships through CI (Day 12) and emits metrics (Day 11). Today you make it \emph{operable}: it survives a dead dependency, tells the platform when to divert vs. restart, fends off abusive load, and shows its vital signs on a dashboard.
+
+\begin{buildalong}[Day 13 --- production hardening]
+\begin{wbitem}
+  \item Wrap the payment integration in \code{PaymentGateway.charge} with a Resilience4j \code{@CircuitBreaker} (inner) + \code{@Retry} (outer) + a \code{deferPayment} fallback; scope retry to transient faults only.
+  \item Configure the \code{paymentService} instances (window, threshold, wait-duration, backoff) in \code{application.yml}; surface breaker state as a health contributor.
+  \item Enable Actuator probes and split \emph{liveness} (\code{livenessState}) from \emph{readiness} (\code{readinessState,db,redis}); point the Compose \code{healthcheck} at \code{/actuator/health/readiness} with a 40s \code{start\_period}.
+  \item Add a distributed token-bucket rate limiter (Redis Lua, from Day 9) on the public endpoints via a \code{OncePerRequestFilter}, returning \code{429} with \code{Retry-After}.
+  \item Add a \code{CorrelationIdFilter} + structured logging so one request's full story is one query.
+  \item Stand up Prometheus + Grafana in Compose and build the RED dashboard: request rate, 5xx error rate, and p95 latency, with one alert on sustained payment-endpoint p95.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} stopping the payment stub mid-load leaves checkout responsive (returning deferred), the breaker visibly trips and recovers on the Grafana dashboard, a DB blip diverts traffic without restarting any container, and abusive load gets \code{429}s while everyone else keeps serving.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Observability = logs (one request's story) + metrics (the fleet's vital signs) + traces (where time went), glued by a correlation ID.
+  \item Liveness and readiness are different questions with opposite reactions: restart vs. divert. Dependencies belong in readiness only.
+  \item A circuit breaker (CLOSED $\rightarrow$ OPEN $\rightarrow$ HALF-OPEN) stops a slow dependency from exhausting your threads and cascading into a full outage.
+  \item Retry is for idempotent, transient faults --- and only ever behind a breaker, or it becomes a retry storm.
+  \item Rate limit on the right key, in Redis for a multi-replica fleet, returning \code{429} + \code{Retry-After}.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Fallback on the outermost decorator only; an inner fallback hides the exception and defeats retry.
+  \item Keep metric label cardinality bounded --- never tag by user or order ID.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item DB check in liveness $\rightarrow$ restart storm. \quad$\bullet$\quad No \code{minimum-number-of-calls} $\rightarrow$ breaker trips on a fluke.
+  \item In-process rate limit across replicas $\rightarrow$ the real limit is $N\times$ what you configured.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Three pillars}{logs = events, metrics = time series, traces = per-request path; correlate by trace/correlation ID.}
+\cheatitem{RED metrics}{Rate, Errors, Duration (p95/p99, from a histogram --- never the mean).}
+\cheatitem{Liveness vs readiness}{liveness $\rightarrow$ restart (only restart-fixable state); readiness $\rightarrow$ divert (includes dependencies).}
+\cheatitem{Breaker states}{CLOSED (counting) $\rightarrow$ OPEN (fail fast) $\rightarrow$ HALF-OPEN (trial) $\rightarrow$ CLOSED/OPEN.}
+\cheatitem{Composition order}{Retry(CircuitBreaker(RateLimiter(TimeLimiter(Bulkhead)))); fallback on the outermost only.}
+\cheatitem{Retry safety}{idempotent ops only, transient exceptions only, always behind a breaker, with jittered backoff.}
+\cheatitem{Rate limit}{token bucket in Redis (atomic Lua), keyed per client; excess $\rightarrow$ \code{429} + \code{Retry-After}.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the difference between liveness and readiness checks, and what does each failure trigger?}
+\iq{Explain the circuit breaker states and every transition between them.}
+\iq{Why is rate limiting necessary even for internal, trusted services?}
+\iq{What would you put on a production-readiness checklist before launch?}
+\iq{What are the three pillars of observability, and what question does each one answer?}
+\iq{Why is retrying a payment call dangerous, and how do you make retry safe?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Resilience4j Reference} --- CircuitBreaker, Retry, RateLimiter, and the aspect order section.
+  \item \emph{Spring Boot Reference} --- "Kubernetes Probes" and "Actuator / Metrics" (Micrometer + Prometheus).
+  \item Google SRE Book --- "Monitoring Distributed Systems" (the four golden signals) and "Handling Overload."
+  \item Michael Nygard, \emph{Release It!} --- the origin of the circuit breaker and bulkhead stability patterns.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 14).} ShopFlow now runs, ships, and survives. Tomorrow is the capstone: you assemble the fourteen days into one coherent, reviewable system --- and rehearse explaining every decision out loud, because being able to \emph{narrate} why the breaker sits where it does is what turns a working project into a job offer.
+\end{keyidea}

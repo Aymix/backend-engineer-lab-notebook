@@ -1,0 +1,577 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 07 ============================
+\daychapter{07}{Architecture}{Clean Architecture, SOLID \& Design Patterns}{Structure that survives change --- and the patterns Spring already uses}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Apply each SOLID principle as a concrete Spring decision --- a class boundary, an interface, a strategy --- not as an abstract slogan.
+  \item Diagnose a class by its \keyterm{coupling} and \keyterm{cohesion}, the two forces every SOLID rule is really optimising.
+  \item Choose between \keyterm{Layered} and \keyterm{Hexagonal} architecture on evidence, and explain what each one costs.
+  \item Name the design patterns Spring itself is built from, so you extend the framework along its grain instead of against it.
+  \item Refactor a tangled "God service" into focused collaborators using a validator, the Strategy pattern, and domain events.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} By now your ShopFlow app works: it persists, it authenticates, it has tests. But "works today" and "still works after six months of features" are different properties. This day is about the second one. It answers a question that has nothing to do with any single annotation: \emph{when a new requirement arrives, how much of the existing code do I have to open and risk breaking?} Good architecture is simply the discipline that keeps that number small.
+
+\glabel{Why backend engineers need it.} Every codebase decays toward a big ball of mud unless someone actively fights it. The fight is not glamorous --- it is a hundred small decisions about where a responsibility lives, what depends on what, and which interface stands between two things that change at different rates. Engineers who cannot make those decisions produce code that is correct on Tuesday and unmaintainable by the following quarter. This day gives you the vocabulary (SOLID, coupling, cohesion, ports) and the reflexes (extract, invert, decouple) to keep a system soft --- \emph{soft}ware, literally, meaning changeable.
+
+\glabel{Where it fits in a Spring Boot application.} Architecture is not a layer you add; it is the shape of the layers you already have. The \code{controller} $\rightarrow$ \code{service} $\rightarrow$ \code{repository} split you scaffolded on Day 1 is an architectural choice. Today you make that choice deliberate: you decide what each layer is allowed to know, which direction dependencies point, and where to insert an interface so that a change on one side does not ripple to the other.
+
+\glabel{How it connects to previous chapters.} You have been practising these patterns without naming them. Day 1's \keyterm{Dependency Injection} is the \keyterm{Dependency Inversion} principle in action; its proxies are the \keyterm{Proxy} pattern. Day 2--3's \code{Repository} interfaces are the textbook Repository pattern and your first real dependency-inversion boundary. Day 4 told you to keep controllers thin --- that is the Single Responsibility Principle. Day 5's security filter chain is a \keyterm{Decorator}/chain. Day 6's tests only became easy because your classes depend on interfaces you can mock. Today those scattered instincts become one coherent framework.
+
+\begin{keyidea}
+Architecture is the art of \keyterm{managing dependencies so that change stays local}. Two questions decide almost everything: \emph{who depends on whom} (point dependencies at stable abstractions, never at volatile details) and \emph{what changes together} (put those things in one class, and only those). SOLID, layering, and patterns are all tactics for those two questions.
+\end{keyidea}
+
+\begin{wbfigure}{Fig 7.0 — Architecture is not a new box; it governs how the boxes you already have depend on each other, and it is what makes every later day cheap to add.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, minimum width=34mm, text width=30mm] (arch) {\textbf{Architecture}\\\scriptsize dependency rules\\(this chapter)};
+  \node[wbbox, above left=of arch, text width=24mm] (web) {Controllers\\\scriptsize Day 4, 5};
+  \node[wbbox, above right=of arch, text width=24mm] (svc) {Services\\\scriptsize business logic};
+  \node[wbbox, below left=of arch, text width=24mm] (repo) {Repositories\\\scriptsize Day 2, 3};
+  \node[wbbox, below right=of arch, text width=24mm] (test) {Tests\\\scriptsize Day 6};
+  \draw[wbarrowg] (arch)--(web); \draw[wbarrowg] (arch)--(svc);
+  \draw[wbarrowg] (arch)--(repo); \draw[wbarrowg] (arch)--(test);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Real company examples.} Uber documented its \keyterm{Domain-Oriented Microservice Architecture} (DOMA) after its service count exploded, precisely to re-impose layering and clear boundaries. Netflix leans on ports-and-adapters thinking to keep domain logic independent of the AWS services underneath it. Banks adopt Hexagonal architecture so a decade of regulatory rules can outlive three generations of persistence technology. And Spring itself is a masterclass in the Gang-of-Four patterns --- once you can see them, you stop fighting the framework.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture. The centre is the goal --- change that stays local. Everything around it is a tactic that serves that goal.
+
+\begin{wbfigure}{Fig 7.1 — The Day 7 concept map: SOLID and patterns are tactics; coupling and cohesion are the forces; layering is the overall shape.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=30mm] (core) {\textbf{Change stays local}\\\scriptsize the goal of all architecture};
+  \node[wbbox, above=of core, text width=30mm] (solid) {\textbf{SOLID}\\\scriptsize 5 design principles};
+  \node[wbbox, left=of core, text width=26mm] (cc) {\textbf{Coupling \&\\Cohesion}\\\scriptsize the underlying forces};
+  \node[wbbox, right=of core, text width=26mm] (layers) {\textbf{Layered vs\\Hexagonal}\\\scriptsize the shape};
+  \node[wbboxdb, below=of core, text width=32mm] (patterns) {\textbf{GoF Patterns}\\\scriptsize Strategy · Observer · Proxy\\Factory · Template · Decorator};
+  \draw[wbarrowg] (solid)--(core); \draw[wbarrowg] (cc)--(core);
+  \draw[wbarrowg] (layers)--(core); \draw[wbarrowg] (patterns)--(core);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Coupling} $\rightarrow$ \keyterm{Cohesion} $\rightarrow$ \keyterm{SOLID} $\rightarrow$ \keyterm{Dependency Inversion} $\rightarrow$ \keyterm{Port} $\rightarrow$ \keyterm{Adapter} $\rightarrow$ \keyterm{Strategy} $\rightarrow$ \keyterm{Domain Event}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad SOLID, translated into Spring reality}
+
+\glabel{What is it?} \keyterm{SOLID} is five principles for arranging classes so a system stays changeable. They are usually taught as abstractions; in a Spring codebase each one is a concrete, physical decision --- a class you split, an interface you introduce, an \code{if/else} you delete.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{34mm} X@{}}
+\wbtablehead{Principle} & \wbtablehead{What it means in a Spring codebase}\\\midrule
+\keyterm{S}ingle Responsibility & A class has one reason to change. \code{OrderService} places orders --- it does not also format emails, compute tax tables, and talk to Stripe. Those are separate reasons to change, so separate classes.\\
+\keyterm{O}pen/Closed & Add a new payment provider by writing a new \code{PaymentStrategy} implementation, not by editing an \code{if (provider == ...)} chain that already works.\\
+\keyterm{L}iskov Substitution & Every \code{PaymentStrategy} must be usable through the interface without surprising the caller --- no implementation that throws on a method the contract promises.\\
+\keyterm{I}nterface Segregation & Prefer several small role interfaces over one fat one. A read-only client should not depend on \code{save()} and \code{delete()} it never calls.\\
+\keyterm{D}ependency Inversion & Services depend on repository \emph{interfaces}, not on \code{JdbcTemplate} or Hibernate directly. This \emph{is} what DI has been doing for you since Day 1.\\
+\end{tabularx}\end{center}
+
+\glabel{Why does it exist?} Each letter targets a specific pain. SRP fights the "I touched the tax code and broke email" class of bug. Open/Closed fights the merge-conflict-magnet file everyone edits. DIP fights the "we can't test this without a real database" trap. They are not aesthetics; they are defences against known failure modes.
+
+\glabel{How does it work internally --- the one that matters most?} Dependency Inversion is the keystone, so make it concrete. A naive design has the high-level policy (the service) depend on a low-level detail (the database). DIP inverts the arrow: both depend on an interface the \emph{service} owns. The database becomes a plug-in.
+
+\begin{wbfigure}{Fig 7.2 — Dependency Inversion. The arrow of dependency points at the interface, not at the detail; the concrete JPA class is now a replaceable plug-in.}
+\wbscale{\begin{tikzpicture}[node distance=9mm and 16mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=30mm] (svc) {\textbf{OrderService}\\\scriptsize high-level policy};
+  \node[wbboxaccent, right=of svc, text width=30mm] (port) {\textbf{OrderRepository}\\\scriptsize interface (a "port")};
+  \node[wbboxdb, below=of port, text width=30mm] (impl) {\textbf{JpaOrderRepository}\\\scriptsize low-level detail};
+  \draw[wbarrow] (svc)-- node[wbcap, above]{depends on} (port);
+  \draw[wbarrow] (impl)-- node[wbcap, right]{implements} (port);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} SRP and DIP: essentially always --- they are the grain of a Spring app. Open/Closed and Strategy: the moment you write your \emph{second} branch of an \code{if/else} that selects behaviour by type. That second branch is the signal to reach for an interface.
+
+\glabel{When should I \emph{not}?} Do not invent an interface with exactly one implementation that will never have a second, purely to "follow DIP" --- that is ceremony. Do not split a class into three because a checklist said "one responsibility" when the three parts genuinely change together. SOLID is a set of trade-offs to reason about, not commandments to obey.
+
+\begin{misconception}
+"Single Responsibility means a class should do only one thing." It does not --- a class can have many methods. It means a class should have one \emph{reason to change}, i.e. one stakeholder or axis of change. \code{OrderService} can have \code{place}, \code{cancel}, and \code{refund}; they all change when order \emph{policy} changes. Email formatting changes when \emph{marketing} changes --- a different reason, a different class.
+\end{misconception}
+
+\begin{interview}
+Expect: \emph{"Explain SOLID with a Spring example for each letter."} The answer that lands names a physical thing, not a definition: "\emph{O} --- I add a \code{PaymentStrategy} bean instead of editing a switch; \emph{D} --- my service is constructor-injected with a \code{PaymentRepository} interface, so a test passes a fake." Concrete beats abstract every time.
+\end{interview}
+
+\wbsub{3.2\quad Coupling \& Cohesion --- the forces SOLID is really tuning}
+
+\glabel{What is it?} \keyterm{Coupling} measures how much one module depends on the internals of another --- change one, must you change the other? \keyterm{Cohesion} measures how strongly the parts inside one module belong together. The eternal goal, older than SOLID by decades, is \emph{low coupling, high cohesion}.
+
+\glabel{Why does it exist?} SOLID, patterns, and layering are all instruments; coupling and cohesion are the two dials they turn. If you can only remember one thing from this chapter, remember the two dials: whenever you propose a refactor, ask "does this lower coupling or raise cohesion?" If it does neither, it is probably just moving code around.
+
+\glabel{How does it work internally?} Coupling has flavours, from loose to tight: depending on an \emph{interface} (loosest --- you only know a contract), on a \emph{concrete class}, on its \emph{internal fields}, or on a shared mutable \emph{global} (tightest). Every step tighter means a change is more likely to force a change elsewhere. Cohesion is the mirror image: a class where every method touches the same fields is highly cohesive; a class split across unrelated field-groups is a candidate to split into two.
+
+\begin{seniornote}
+When a senior reviews a pull request, they are not really reading logic first --- they are reading \emph{dependencies}. "Why does the controller import a JPA type? Why does this domain object know about HTTP status codes?" A misplaced import is a coupling smell you can catch in seconds, long before you understand the algorithm.
+\end{seniornote}
+
+\wbsub{3.3\quad Layered vs Hexagonal Architecture}
+
+\glabel{What is it?} These are two shapes for a whole application. \keyterm{Layered} architecture stacks \code{Controller} $\rightarrow$ \code{Service} $\rightarrow$ \code{Repository}, each layer depending only on the one below. \keyterm{Hexagonal} (also called \keyterm{Ports \& Adapters}) puts a framework-ignorant \emph{domain core} in the middle; everything external --- REST, the database, a message queue --- is an \emph{adapter} that plugs into a \emph{port} (an interface the core owns).
+
+\begin{wbfigure}{Fig 7.3 — Layered stacks dependencies downward; Hexagonal points every external dependency inward at a framework-free core.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  % Layered column
+  \node[wbbox, text width=26mm] (c) {\textbf{Controller}};
+  \node[wbbox, below=of c, text width=26mm] (s) {\textbf{Service}};
+  \node[wbbox, below=of s, text width=26mm] (r) {\textbf{Repository}};
+  \draw[wbarrow] (c)--(s); \draw[wbarrow] (s)--(r);
+  \node[wbcap, below=3mm of r, text width=30mm] {Layered:\\each layer knows only the one below};
+  % Hexagonal cluster
+  \node[wbboxaccent, right=34mm of s, text width=24mm] (core) {\textbf{Domain Core}\\\scriptsize no Spring, no JPA};
+  \node[wbbox, above=8mm of core, text width=22mm] (rest) {REST Adapter};
+  \node[wbboxdb, below=8mm of core, text width=22mm] (db) {DB Adapter};
+  \node[wbbox, left=8mm of core, text width=14mm] (mq) {MQ};
+  \node[wbbox, right=8mm of core, text width=14mm] (cli) {CLI};
+  \draw[wbarrow] (rest)--(core); \draw[wbarrow] (db)--(core);
+  \draw[wbarrow] (mq)--(core); \draw[wbarrow] (cli)--(core);
+  \node[wbcap, below=10mm of core, text width=30mm] {Hexagonal:\\adapters point in at ports};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} In Layered, dependencies flow one way (down) and the \code{Service} still imports Spring and, indirectly, persistence types --- pragmatic and totally fine for most apps. In Hexagonal, the dependency rule is stricter: \emph{nothing points outward from the core}. The domain defines an \code{OrderRepository} port; the JPA adapter implements it. You could delete Spring Data and rewrite the adapter without the domain noticing. That isolation is the entire value proposition --- and its entire cost, because it demands more interfaces, mapping between domain and persistence models, and discipline.
+
+\glabel{When should I use each?} Default to Layered. It matches Spring's grain, every engineer already understands it, and for a CRUD-shaped service it is exactly right. Reach for Hexagonal when the \emph{domain logic is genuinely complex and long-lived} --- rich rules that must outlast today's frameworks, or a core you want to test with zero Spring context. Insurance pricing, trading, logistics routing: yes. A product-catalogue CRUD: no.
+
+\glabel{When should I \emph{not}?} Applying Hexagonal or full DDD to a simple CRUD app is the most common over-engineering mistake juniors make after they read one influential blog post. Three interfaces and two mapper classes to save a row to a table is indirection with no payoff --- and every future reader pays the tax of tracing through it.
+
+\begin{prodtip}
+You do not have to choose globally. A single ShopFlow deployment can keep 90\% of its modules Layered and make \emph{only} the pricing/promotions engine Hexagonal, because that is the one place with rules worth protecting. Architecture is per-module judgement, not a religion applied uniformly.
+\end{prodtip}
+
+\begin{whyexists}
+Hexagonal exists because the original sin of layered apps was letting the database define the domain. Teams modelled their business as tables, and a schema migration became a domain rewrite. Ports \& Adapters flips ownership: the domain defines what it needs, and persistence conforms to it. You pay for that inversion in boilerplate; you buy freedom from framework churn.
+\end{whyexists}
+
+\wbsub{3.4\quad The Design Patterns Spring Already Uses}
+
+\glabel{What is it?} Spring is not just \emph{compatible} with the Gang-of-Four patterns --- it is \emph{built} from them. Learning to recognise them turns the framework from a bag of annotations into a coherent design you can extend idiomatically.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{30mm} X@{}}
+\wbtablehead{Pattern} & \wbtablehead{Where Spring uses it}\\\midrule
+\keyterm{Proxy} & AOP --- \code{@Transactional}, \code{@Async}, \code{@Cacheable} all work by wrapping your bean in a proxy (Day 1).\\
+\keyterm{Factory} & \code{BeanFactory} and \code{ApplicationContext} manufacture and hand you fully wired objects.\\
+\keyterm{Singleton} & The default bean scope --- one shared instance per context.\\
+\keyterm{Template Method} & \code{JdbcTemplate}, \code{RestTemplate}, \code{RabbitTemplate} --- the framework runs the boilerplate, you supply the varying part in a callback.\\
+\keyterm{Strategy} & Swap a \code{PasswordEncoder}, a \code{HttpMessageConverter}, an \code{AuthenticationProvider} --- interchangeable algorithms behind one interface.\\
+\keyterm{Observer} & \code{ApplicationEventPublisher} plus \code{@EventListener} --- publish an event, decoupled listeners react.\\
+\keyterm{Decorator / Chain} & The \code{Filter} chain and \code{HandlerInterceptor} chain (Day 5) wrap each other, adding behaviour layer by layer.\\
+\end{tabularx}\end{center}
+
+\begin{behind}
+When you write \code{JdbcTemplate.query(sql, rowMapper)}, you are supplying the "variable part" of a Template Method: Spring owns connection handling, statement lifecycle, and exception translation (the invariant boilerplate), and calls back into your \code{RowMapper} for the one thing only you know --- how to turn a row into an object. Every \code{*Template} class in Spring is this same deal.
+\end{behind}
+
+\glabel{Why does it matter?} Because it tells you \emph{how} to extend Spring. Need custom auth? Do not fork the filter chain --- add a Strategy (an \code{AuthenticationProvider}). Need a side effect after an order? Do not thread a call through five layers --- publish an Observer event. Recognising the pattern points you at the intended extension point.
+
+\wbsub{3.5\quad Refactoring the God Service (Strategy + Domain Events)}
+
+\glabel{What is it?} The single most common real-world refactor: a 300-line method that validates, applies business rules, orchestrates persistence, \emph{and} sends an email --- all inline. It works, and it is a nightmare. Here is the "before", compressed:
+
+\begin{javabox}[OrderService.java --- the God method (before)]
+@Service
+public class OrderService {
+  public Order placeOrder(OrderRequest req) {
+    // 1. validation (40 lines of if-throw)
+    if (req.items().isEmpty()) throw new BadRequest("empty");
+    if (req.total() <= 0)      throw new BadRequest("total");
+    // ... 30 more lines ...
+    // 2. payment (a growing if/else by provider)
+    if (req.provider().equals("stripe")) { /* ... */ }
+    else if (req.provider().equals("paypal")) { /* ... */ }
+    // 3. persistence
+    Order order = repository.save(toEntity(req));
+    // 4. side effect: send email INLINE, inside the tx
+    emailClient.sendConfirmation(order);   // slow + can fail
+    return order;
+  }
+}
+\end{javabox}
+
+\glabel{Why is it a problem?} Four reasons to change live in one method (SRP violated). The payment \code{if/else} grows every time a provider is added (Open/Closed violated). And the email call sits \emph{inside the transaction}: if the SMTP server hiccups, the whole order rolls back --- a mail outage becomes an ordering outage. That last one is not a style issue; it is a production incident waiting to happen.
+
+\glabel{How do we fix it?} Three moves. \textbf{(1)} Extract validation into an \code{OrderValidator}. \textbf{(2)} Replace the payment \code{if/else} with the Strategy pattern. \textbf{(3)} Replace the inline email with a \emph{domain event} that an asynchronous listener handles \emph{after} the transaction commits.
+
+\begin{javabox}[OrderValidator.java --- one responsibility]
+@Component
+public class OrderValidator {
+  public void validate(OrderRequest req) {
+    if (req.items().isEmpty())
+      throw new InvalidOrderException("Order has no items");
+    if (req.total() <= 0)
+      throw new InvalidOrderException("Total must be positive");
+    // all validation rules, in one cohesive place
+  }
+}
+\end{javabox}
+
+For payment, define one interface and let each provider be its own bean. Spring can inject \emph{all} implementations as a \code{Map} keyed by bean name --- no \code{if/else}, and a new provider is a new file:
+
+\begin{javabox}[PaymentStrategy.java --- Open/Closed via Strategy]
+public interface PaymentStrategy {
+  PaymentResult charge(Order order);
+}
+
+@Component("stripe")
+class StripePayment implements PaymentStrategy {
+  public PaymentResult charge(Order order) { /* ... */ }
+}
+
+@Component("paypal")
+class PaypalPayment implements PaymentStrategy {
+  public PaymentResult charge(Order order) { /* ... */ }
+}
+\end{javabox}
+
+\begin{javabox}[PaymentService.java --- resolve strategy by name]
+@Service
+public class PaymentService {
+  private final Map<String, PaymentStrategy> strategies;
+  // Spring injects EVERY PaymentStrategy bean, keyed by name
+  public PaymentService(Map<String, PaymentStrategy> strategies) {
+    this.strategies = strategies;
+  }
+  public PaymentResult pay(String provider, Order order) {
+    PaymentStrategy s = strategies.get(provider);
+    if (s == null) throw new UnknownProviderException(provider);
+    return s.charge(order);
+  }
+}
+\end{javabox}
+
+\begin{behind}
+Injecting \code{Map<String, PaymentStrategy>} is a Spring superpower most juniors have never seen: the container finds \emph{every} bean implementing the interface and gives you a map from bean name to instance. Adding a third provider is now genuinely zero edits to existing code --- the definition of Open/Closed. This is the Strategy pattern and the Factory pattern shaking hands.
+\end{behind}
+
+\glabel{The event, and why it must fire after commit.} The naive fix publishes an event and lets a listener send the email --- but a plain \code{@EventListener} runs \emph{synchronously, inside the caller's transaction}. If it throws, it still rolls back the order. Worse, if you send the email and the transaction \emph{then} rolls back for another reason, you have emailed a customer about an order that does not exist. The correct tool is \code{@TransactionalEventListener} bound to the \code{AFTER\_COMMIT} phase, made non-blocking with \code{@Async}.
+
+\begin{javabox}[Order placement --- publish, don't call]
+@Service
+public class OrderService {
+  private final OrderValidator validator;
+  private final PaymentService payments;
+  private final OrderRepository repository;
+  private final ApplicationEventPublisher events;
+  // constructor injection omitted for brevity
+
+  @Transactional
+  public Order placeOrder(OrderRequest req) {
+    validator.validate(req);
+    payments.pay(req.provider(), toEntity(req));
+    Order order = repository.save(toEntity(req));
+    events.publishEvent(new OrderPlacedEvent(order.getId()));
+    return order;   // email is NOT sent here
+  }
+}
+\end{javabox}
+
+\begin{javabox}[OrderNotificationListener.java --- after commit, off-thread]
+@Component
+public class OrderNotificationListener {
+  private final EmailClient email;
+
+  @Async
+  @TransactionalEventListener(phase = AFTER_COMMIT)
+  public void onOrderPlaced(OrderPlacedEvent e) {
+    email.sendConfirmation(e.orderId());
+    // runs only if the tx committed; a mail failure
+    // no longer rolls back the order
+  }
+}
+\end{javabox}
+
+\begin{wbfigure}{Fig 7.4 — After the refactor: the transaction commits the order, then --- and only then --- an async listener sends the email on a separate thread.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=70mm, minimum height=7.6mm, align=left, text width=64mm}]
+  \node[stage] (v) {1 · \textbf{OrderValidator} --- reject bad input};
+  \node[stage, below=of v] (p) {2 · \textbf{PaymentService} --- Strategy by provider};
+  \node[stage, below=of p] (s) {3 · \textbf{repository.save()} --- inside the transaction};
+  \node[stage, wbboxaccent, below=of s] (e) {4 · \textbf{publishEvent(OrderPlacedEvent)}};
+  \node[stage, wbboxgood, below=of e] (c) {5 · \textbf{COMMIT} --- transaction succeeds};
+  \node[stage, wbboxghost, below=of c] (a) {6 · \textbf{@Async @TransactionalEventListener} --- send email off-thread, after commit};
+  \foreach \x/\y in {v/p,p/s,s/e,e/c,c/a}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=5mm of c, text width=22mm, anchor=west] {tx boundary ends here};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{perfnote}
+The email now runs on a separate thread \emph{after} the response has effectively been decided, so the customer's request no longer waits on SMTP. But "async" is not free: you need a real thread pool (configure \code{@EnableAsync} with a bounded \code{ThreadPoolTaskExecutor}, not the default unbounded one) and an \code{AsyncUncaughtExceptionHandler}, because an exception on an async void method vanishes silently otherwise.
+\end{perfnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Depend on interfaces at service boundaries --- even with one implementation --- so mocking (Day 6) and swapping stay trivial.
+  \item Replace type-selecting \code{if/else} chains with the Strategy pattern the moment a second branch appears.
+  \item Use domain events (\code{ApplicationEventPublisher}) to decouple side effects from the main transaction.
+  \item Keep controllers thin: translate HTTP to a service call, map the result back, nothing more.
+  \item Default to Layered; justify Hexagonal with real, named domain complexity.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Applying Hexagonal/DDD ceremony to a simple CRUD app --- indirection with no payoff.
+  \item Letting business logic leak into controllers, or worse, into JPA entities.
+  \item Copy-pasting the "God service" shape because that is what the codebase already does.
+  \item Sending email (or any slow/failable side effect) synchronously inside the order transaction.
+  \item Treating SOLID as dogma rather than trade-offs to reason about case by case.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two diagrams carry this chapter. Redraw them from memory --- reproducing a diagram is what moves it from "recognised" to "owned."
+
+\begin{writespace}[Redraw: Layered (Controller $\rightarrow$ Service $\rightarrow$ Repository) beside Hexagonal (adapters pointing into a core)]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the refactored order flow --- validate, pay, save, publish, COMMIT, then async email after commit]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab — Break the God Service Apart}
+
+\textbf{Goal of this lab:} take a deliberately tangled \code{placeOrder} method and refactor it into focused collaborators, ending with an order flow whose side effects are decoupled from its transaction. This is exactly the ShopFlow increment you will finalise in Part 10.
+
+\resetlab
+\labstep{Reproduce the smell}
+Write (or open) an \code{OrderService.placeOrder} that does validation, a payment \code{if/else}, a \code{save}, and an inline \code{emailClient.send} in one method. Do not fix it yet --- name the four responsibilities out loud first.
+\labwhy{You cannot refactor what you cannot see; explicitly labelling the four reasons-to-change is the diagnosis that drives every following step.}
+
+\labstep{Extract the validator}
+Move all validation into an \code{OrderValidator} \code{@Component} with a single \code{validate(OrderRequest)} method that throws a domain exception. Inject it into the service.
+\labwhy{This is Single Responsibility made physical --- validation now changes independently of order orchestration, and becomes unit-testable in isolation.}
+
+\labstep{Introduce the PaymentStrategy interface}
+Define \code{PaymentStrategy} with a \code{charge(order)} method and implement two beans, \code{@Component("stripe")} and \code{@Component("paypal")}. Delete the \code{if/else}.
+\labwhy{You are converting an Open/Closed violation into an extension point --- the third provider will be a new file, not an edit to a working one.}
+
+\labstep{Resolve the strategy by a Map injection}
+Inject \code{Map<String, PaymentStrategy>} into a \code{PaymentService} and look up the provider by key. Handle the unknown-provider case explicitly.
+\labwhy{Letting Spring hand you every implementation keyed by bean name is the idiomatic Factory+Strategy combination --- no registry to maintain by hand.}
+
+\labstep{Publish a domain event instead of calling email}
+Create an \code{OrderPlacedEvent(orderId)} record. In \code{placeOrder}, replace the email call with \code{events.publishEvent(...)}. The service no longer knows email exists.
+\labwhy{This is the Observer pattern: it inverts the dependency so the order flow depends on nothing downstream, and new reactions (analytics, inventory) attach without touching it.}
+
+\labstep{Consume the event after commit, asynchronously}
+Add a listener annotated \code{@Async} and \code{@TransactionalEventListener(phase = AFTER\_COMMIT)}. Enable \code{@EnableAsync} with a bounded executor.
+\labwhy{After-commit guarantees you never email about an order that rolled back; async guarantees a slow mail server never slows --- or fails --- the customer's request.}
+
+\labstep{Prove the decoupling}
+Force \code{emailClient.send} to throw. Confirm the order still commits and the endpoint still returns 200 --- only a log line records the failed email.
+\labwhy{The whole point of the refactor is that a side-effect failure is now contained; a test that proves it is what stops a future engineer from re-coupling them.}
+
+\begin{prodtip}
+Do not delete the God method until the new path is green under test. Refactor \emph{behind} the existing tests from Day 6: they are your safety net proving behaviour is unchanged. A refactor without tests is just a rewrite with extra confidence and no evidence.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quizzes. Write a sentence or two --- the value is in making your reasoning explicit.
+
+\begin{thinkbox}
+"One responsibility" is famously slippery. For your \code{OrderService}, list the distinct \emph{reasons it might change} (a pricing rule, a new provider, a schema tweak, a new notification channel). Which of those belong in the service, and which are really separate stakeholders wearing a trench coat?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Hexagonal architecture buys you independence from frameworks at the cost of mapping code and extra interfaces. For ShopFlow's order module specifically, is that trade worth it today? What concrete future event would flip your answer from "no" to "yes"?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Events decouple the publisher from its listeners --- but they also make the flow harder to follow, because "what happens after an order is placed?" is no longer answerable by reading one method. When does that loss of traceability outweigh the decoupling, and how would you mitigate it (naming, docs, tracing)?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{A mail outage is taking down order placement}
+\textbf{Symptom.} Every time the SMTP provider has a slow spell, \code{POST /orders} starts returning 500 and orders fail to save --- even though payment succeeded.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderService.java]
+@Transactional
+public Order placeOrder(OrderRequest req) {
+  Order order = repository.save(toEntity(req));
+  emailClient.sendConfirmation(order);  // throws on SMTP timeout
+  return order;
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The 500s correlate exactly with mail-server latency; the stack trace ends in \code{emailClient.sendConfirmation}.
+  \item \textbf{Hypothesise.} The email runs inside the transaction, so its exception propagates and rolls the \code{save} back --- a side effect is coupled to the core.
+  \item \textbf{Verify.} Temporarily wrap the email in a try/catch that logs and swallows; the 500s stop, confirming email was the cause.
+  \item \textbf{Fix.} Publish an \code{OrderPlacedEvent} and move the email into an \code{@Async @TransactionalEventListener(AFTER\_COMMIT)} listener so it runs after commit, off-thread.
+  \item \textbf{Prevent.} Add a test that makes \code{emailClient} throw and asserts the order still commits and the endpoint returns 200.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Spring refuses to start: expected one PaymentStrategy, found two}
+\textbf{Symptom.} After adding a second payment provider, the app fails at startup with \code{NoUniqueBeanDefinitionException: expected single matching bean but found 2: stripe, paypal}.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[PaymentService.java]
+@Service
+public class PaymentService {
+  // injecting the interface directly -- but there are now TWO beans
+  private final PaymentStrategy strategy;
+  public PaymentService(PaymentStrategy strategy) {
+    this.strategy = strategy;
+  }
+}
+\end{javabox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Startup fails immediately (fail-fast), naming both candidate beans --- \code{stripe} and \code{paypal}.
+  \item \textbf{Hypothesise.} You asked for a single \code{PaymentStrategy}, but two implementations satisfy the type, so the container cannot choose.
+  \item \textbf{Verify.} Temporarily delete one implementation; the app starts --- proving ambiguity, not a missing bean, is the issue.
+  \item \textbf{Fix.} Inject \code{Map<String, PaymentStrategy>} (all of them, keyed by name) and select by provider at call time --- the intended Strategy design.
+  \item \textbf{Prevent.} Treat "more than one implementation of an interface" as a design decision: choose Map injection, a \code{@Qualifier}, or a \code{@Primary}, on purpose.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Extract a cohesive validator from a fat method.\\
+\textbf{Context.} A \code{registerUser} method mixes 30 lines of field validation with the actual save.\\
+\textbf{Requirements.} Move all validation into a \code{UserValidator} \code{@Component}; the service calls \code{validator.validate(req)} then saves.\\
+\textbf{Hints.} The validator should have no dependency on the repository --- it only inspects the request.\\
+\textbf{Expected outcome.} The service method shrinks to a few lines; the validator is unit-testable with plain \code{new}.\\
+\textbf{Common pitfalls.} Injecting the repository into the validator "just in case" --- that recouples them and defeats the split.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~40 min}
+\textbf{Goal.} Implement the Strategy pattern for two payment providers behind one interface.\\
+\textbf{Context.} Callers currently branch on a \code{provider} string with an \code{if/else}.\\
+\textbf{Requirements.} Define \code{PaymentStrategy}; implement \code{stripe} and \code{paypal} beans; resolve via \code{Map<String, PaymentStrategy>}; add a third provider with \emph{zero} edits to existing classes.\\
+\textbf{Hints.} The bean name (\code{@Component("stripe")}) becomes the map key.\\
+\textbf{Expected outcome.} Adding \code{"applepay"} is one new file; the \code{if/else} is gone.\\
+\textbf{Common pitfalls.} Injecting a single \code{PaymentStrategy} and hitting \code{NoUniqueBeanDefinitionException} --- inject the \code{Map} instead.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~60 min}
+\textbf{Goal.} Fully decouple order confirmation email from the order transaction.\\
+\textbf{Context.} Email currently runs inline and occasionally rolls orders back.\\
+\textbf{Requirements.} Publish \code{OrderPlacedEvent}; handle it in an \code{@Async @TransactionalEventListener(AFTER\_COMMIT)}; configure \code{@EnableAsync} with a bounded \code{ThreadPoolTaskExecutor} and an \code{AsyncUncaughtExceptionHandler}.\\
+\textbf{Hints.} Verify ordering by logging the commit and the email on different threads.\\
+\textbf{Expected outcome.} A thrown email exception leaves the order committed and the response at 200; the failure appears only in logs.\\
+\textbf{Common pitfalls.} Using a plain \code{@EventListener} (runs in-transaction) or the default async executor (unbounded --- a mail backlog can exhaust threads).
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as reasoning, not trivia.
+
+\begin{seniornote}
+The best architecture is the one your team can still change quickly a year from now --- not the one with the most patterns. Seniors optimise for the \emph{next} engineer's ability to make a change safely, which usually means fewer, clearer boundaries rather than more. "Could a new hire find where to add a feature in five minutes?" is a better architecture metric than any diagram.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{"What is the difference between coupling and cohesion?"} A crisp answer: "Coupling is \emph{between} modules --- how much a change here forces a change there; you want it low. Cohesion is \emph{within} a module --- how much its parts belong together; you want it high. SOLID is mostly a toolkit for pushing both dials in the right direction."
+\end{interview}
+
+\begin{perfnote}
+Domain events decouple, but at scale they can hide cost: fifteen listeners on \code{OrderPlacedEvent}, each doing a database write, turns one logical action into sixteen. When a flow feels slow, count the listeners --- observability tools that don't show event fan-out will hide it from you. Decoupling is a design win, not a free lunch.
+\end{perfnote}
+
+\begin{prodtip}
+When you inherit a God service, do not rewrite it --- \emph{strangle} it. Add tests that pin current behaviour, then extract one collaborator at a time, keeping the suite green after each step. A big-bang rewrite of a critical path is how teams ship a month of regressions; incremental extraction is how they ship none.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — ShopFlow}
+
+ShopFlow is persistent (Days 2--3), exposed over REST (Day 4), secured (Day 5), and tested (Day 6). But its \code{placeOrder} flow has quietly grown into a God service: it validates, selects a payment provider with an \code{if/else}, saves, and sends a confirmation email --- all in one transactional method, so a mail outage can roll back real orders. Today you make it clean.
+
+\begin{buildalong}[Day 7 — refactor order placement toward clean layering]
+\begin{wbitem}
+  \item Extract all order validation into a dedicated \code{OrderValidator} \code{@Component}; the service calls it first and nothing else validates.
+  \item Replace the payment \code{if/else} with a \code{PaymentStrategy} interface and per-provider beans, resolved through a \code{Map<String, PaymentStrategy>} injection (Open/Closed by construction).
+  \item Keep the controller thin and depending only on the service interface --- no business logic, no JPA types above the service line.
+  \item Publish an \code{OrderPlacedEvent} via \code{ApplicationEventPublisher} on successful placement; the service must not know that email exists.
+  \item Move "send confirmation email" into an \code{@Async @TransactionalEventListener(phase = AFTER\_COMMIT)} listener, backed by a bounded executor and an uncaught-exception handler.
+  \item Add a test that forces the email to fail and asserts the order still commits and the endpoint returns 200.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{placeOrder} reads as five clear steps (validate $\rightarrow$ pay $\rightarrow$ save $\rightarrow$ publish $\rightarrow$ return), a new payment provider needs zero edits to existing classes, and a simulated mail-server failure no longer rolls back an order. ShopFlow is now structured to survive the next seven days of features.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Architecture is dependency management: point dependencies at stable abstractions, and put things that change together in one place.
+  \item SOLID is five tactics for low coupling and high cohesion --- concrete class splits and interfaces, not slogans.
+  \item Layered is the right default; Hexagonal earns its boilerplate only when domain complexity justifies protecting the core.
+  \item Spring is built from GoF patterns; recognising them shows you the intended extension points.
+  \item Strategy replaces type-switching \code{if/else}; domain events decouple side effects from the transaction that triggers them.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{Map<String, PaymentStrategy>} injection gives you every implementation keyed by bean name --- Strategy without a hand-written registry.
+  \item \code{@TransactionalEventListener(AFTER\_COMMIT)} + \code{@Async} is the safe way to run a side effect only after a successful commit, off the request thread.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Inline email inside a transaction $\rightarrow$ a mail outage becomes an ordering outage.
+  \item Hexagonal on a CRUD app $\rightarrow$ indirection with no payoff. \quad$\bullet$\quad Fat interface $\rightarrow$ forced dummy methods.
+  \item Injecting a single bean where two implementations exist $\rightarrow$ \code{NoUniqueBeanDefinitionException} at startup.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{SRP}{One reason to change per class --- separate stakeholders, separate classes.}
+\cheatitem{Open/Closed}{Extend by adding a Strategy bean, not by editing a working \code{if/else}.}
+\cheatitem{Dependency Inversion}{Depend on an interface the high-level module owns; the detail implements it.}
+\cheatitem{Coupling / Cohesion}{Low between modules, high within --- the two dials SOLID tunes.}
+\cheatitem{Layered vs Hexagonal}{Layered by default; Hexagonal only for complex, long-lived domains.}
+\cheatitem{Patterns in Spring}{Proxy · Factory · Singleton · Template Method · Strategy · Observer · Decorator.}
+\cheatitem{Events}{\code{publishEvent} + \code{@TransactionalEventListener(AFTER\_COMMIT)} + \code{@Async} = decoupled side effect.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Explain SOLID with a Spring Boot example for each letter.}
+\iq{When would you choose Hexagonal architecture over a simple layered approach?}
+\iq{Name three design patterns Spring itself uses internally, and where.}
+\iq{How would you refactor a service method that has grown to 300 lines?}
+\iq{What is the difference between coupling and cohesion?}
+\iq{Why should a confirmation email be sent after commit rather than inside the transaction?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item Robert C. Martin, \emph{Clean Architecture} --- the dependency rule and SOLID in depth.
+  \item Alistair Cockburn, \emph{Hexagonal Architecture} (the original "Ports \& Adapters" article).
+  \item \emph{Spring Framework Reference} --- "Application Events" and the \code{@TransactionalEventListener} docs.
+  \item Uber Engineering, \emph{Domain-Oriented Microservice Architecture} --- layering at real scale.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 8).} Your ShopFlow app is now cleanly structured and self-contained --- exactly the property that makes it portable. Tomorrow you package it into a Docker image and stand up its dependencies with Compose, turning "runs on my machine" into "runs identically anywhere," the foundation for the CI/CD and deployment days that follow.
+\end{keyidea}

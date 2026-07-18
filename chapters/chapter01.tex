@@ -1,0 +1,440 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 01 ============================
+\daychapter{01}{Foundations}{Spring Boot Internals}%
+{How the framework actually works behind the annotations}{8--9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what the IoC container actually \emph{does} at runtime — not just what \code{@Autowired} looks like.
+  \item Trace the full bean lifecycle from classpath scan to destruction, and say \emph{where} proxies are attached.
+  \item Explain how auto-configuration decides what to wire up, and how to override it deliberately.
+  \item Follow a single HTTP request through the Spring MVC stack, filter by filter.
+  \item Structure configuration the way real teams do: typed properties and per-environment profiles.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} You already know how to sprinkle \code{@Service} and \code{@Autowired} until the app boots. This day answers the question that separates a junior from a mid-level engineer: \emph{what is the framework actually doing between \code{main()} and your first HTTP response?} When something breaks at startup — a bean won't inject, a transaction silently doesn't roll back, an auto-configuration you didn't ask for changes behaviour — you cannot debug what you cannot picture.
+
+\glabel{Why backend engineers need it.} Spring Boot is the JVM's default backend framework. Every production incident you will ever debug — a connection pool exhausted at 3am, a \code{@Cacheable} that never caches, a slow startup — is ultimately a story about beans, proxies, the request pipeline, or configuration. The mental model you build today is the substrate for all thirteen days that follow.
+
+\begin{keyidea}
+Spring Boot is not magic; it is \keyterm{aggressive convention plus reflection plus proxies}. Once you can name the three moving parts — the \keyterm{IoC container} that builds objects, the \keyterm{proxies} that wrap them, and the \keyterm{servlet pipeline} that routes requests to them — the framework stops being a black box and becomes a tool you drive.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} Everything else in this workbook lives \emph{inside} the container you learn about today. The persistence layer (Days 2--3) is a set of beans. Security (Day 5) is a chain of filters registered before your controllers. Caching (Day 9), async (Day 11) and resilience (Day 13) are all delivered by proxies — the exact mechanism you will study in Part 3.
+
+\begin{wbfigure}{Fig 1.0 — Today you learn the container in the centre; every later day plugs a component into it.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm]
+  \node[wbboxaccent, minimum width=30mm] (core) {IoC Container\\\scriptsize (this chapter)};
+  \node[wbbox, above left=of core] (web) {Web / MVC\\\scriptsize Day 4, 5};
+  \node[wbbox, above right=of core] (data) {Data / JPA\\\scriptsize Day 2, 3};
+  \node[wbbox, below left=of core] (infra) {Cache · MQ\\\scriptsize Day 9, 10};
+  \node[wbbox, below right=of core] (ops) {Async · Resilience\\\scriptsize Day 11, 13};
+  \draw[wbarrowg] (web)--(core); \draw[wbarrowg] (data)--(core);
+  \draw[wbarrowg] (infra)--(core); \draw[wbarrowg] (ops)--(core);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Real company examples.} Netflix built its early microservice platform (Eureka, Ribbon, Hystrix) on Spring; those ideas became Spring Cloud. Uber, Alibaba and thousands of banks run Spring Boot services at scale precisely because the container model makes wiring, testing and swapping components uniform across hundreds of teams.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Before the details, hold the whole territory in one picture. Read it left-to-right (startup) and top-to-bottom (a live request).
+
+\begin{wbfigure}{Fig 1.1 — The Day 1 concept map: startup builds the container; a request flows through the pipeline into your beans.}
+\wbscale{\begin{tikzpicture}[node distance=5.5mm and 7mm, every node/.style={font=\sffamily\footnotesize}]
+  % startup row
+  \node[wbbox] (scan) {Classpath\\Scan};
+  \node[wbbox, right=of scan] (defs) {Bean\\Definitions};
+  \node[wbbox, right=of defs] (auto) {Auto-\\Configuration};
+  \node[wbboxaccent, right=of auto] (life) {Bean\\Lifecycle};
+  \node[wbboxgood, right=of life] (ready) {Context\\Ready};
+  \draw[wbarrow] (scan)--(defs); \draw[wbarrow] (defs)--(auto);
+  \draw[wbarrow] (auto)--(life); \draw[wbarrow] (life)--(ready);
+  % proxies note
+  \node[wbboxghost, below=9mm of life, text width=30mm] (proxy) {Proxies wrap beans\\\scriptsize @Transactional · @Async · @Cacheable};
+  \draw[wbarrowg] (life)--(proxy);
+  % request row
+  \node[wbboxghost, below=8mm of scan] (client) {HTTP\\Request};
+  \node[wbbox, right=of client] (filter) {Filter\\Chain};
+  \node[wbbox, right=of filter] (disp) {Dispatcher\\Servlet};
+  \draw[wbarrow] (client)--(filter); \draw[wbarrow] (filter)--(disp);
+  \draw[wbarrow] (disp) to[out=0,in=180] (proxy);
+  \node[wbboxgood, right=6.5mm of proxy] (bean) {Your\\Controller};
+  \draw[wbarrow] (proxy)--(bean);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{IoC} $\rightarrow$ \keyterm{ApplicationContext} $\rightarrow$ \keyterm{BeanDefinition} $\rightarrow$ \keyterm{Bean} $\rightarrow$ \keyterm{BeanPostProcessor} $\rightarrow$ \keyterm{Proxy} $\rightarrow$ \keyterm{DispatcherServlet} $\rightarrow$ \keyterm{Controller}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Dependency Injection \& the IoC Container}
+
+\glabel{What is it?} \keyterm{Dependency Injection} (DI) means a class never constructs its own collaborators — they are handed to it. \keyterm{Inversion of Control} (IoC) is the broader principle: your code stops controlling object creation and wiring, and a container does it instead. Spring's \code{ApplicationContext} \emph{is} that container.
+
+\glabel{Why does it exist?} Hand-wiring object graphs is repetitive, couples classes to concrete implementations, and makes testing painful — you cannot substitute a fake collaborator if the class news it up internally. DI turns wiring into a declarative concern the framework resolves once, centrally.
+
+\glabel{How does it work internally?} At startup the context builds an in-memory registry (the \code{BeanFactory}) where every managed object is first described by a \keyterm{BeanDefinition}: its class, scope, constructor arguments, dependencies and lifecycle callbacks. Crucially, \emph{definitions are collected before any object is instantiated} — Spring resolves the dependency graph and a safe creation order first.
+
+\begin{wbfigure}{Fig 1.2 — Before your first bean exists: definitions are gathered, the graph is resolved, then objects are created.}
+\wbscale{\begin{tikzpicture}[node distance=8mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=26mm] (a) {\textbf{Classpath Scan}\\\scriptsize @Component @Service\\@Repository @Configuration};
+  \node[wbbox, right=of a, text width=26mm] (b) {\textbf{BeanFactory}\\\scriptsize registry of\\BeanDefinitions\\resolves graph \& order};
+  \node[wbboxaccent, right=of b, text width=26mm] (c) {\textbf{Instantiation}\\\scriptsize constructor call\\property injection\\BeanPostProcessors};
+  \node[wbboxgood, right=of c, text width=22mm] (d) {\textbf{Ready}\\\scriptsize singleton cache\\populated};
+  \draw[wbarrow] (a)--(b); \draw[wbarrow] (b)--(c); \draw[wbarrow] (c)--(d);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} Always, for collaborators between your own components (services, repositories, clients). This is the grain of the framework.
+
+\glabel{When should I \emph{not}?} Do not inject value objects, DTOs or entities — those are data you \code{new} yourself. Do not turn every helper into a bean; a stateless private method does not need to be a managed component.
+
+\begin{prodtip}
+Prefer \keyterm{constructor injection} over field \code{@Autowired}. It makes required dependencies explicit, lets fields be \code{final} (immutable), and — decisively — lets you construct the class in a unit test with plain \code{new}, no reflection or Spring context required. Every testing chapter later depends on this habit.
+\end{prodtip}
+
+\begin{misconception}
+\code{@Autowired} is not "search the whole app for something that fits at call time." Resolution happens \emph{once}, at context startup, against the pre-built definition graph. If it is ambiguous or missing, the application fails fast at boot — which is exactly what you want.
+\end{misconception}
+
+\wbsub{3.2\quad The Bean Lifecycle (the part most engineers cannot explain)}
+
+\glabel{What is it?} For every singleton, Spring runs a fixed, ordered sequence from raw object to ready bean, and a symmetric teardown on shutdown.
+
+\glabel{How does it work internally?} The sequence: \textbf{instantiate} $\rightarrow$ \textbf{populate properties} (DI) $\rightarrow$ call \keyterm{Aware} interfaces (\code{BeanNameAware}, \code{ApplicationContextAware}) $\rightarrow$ \code{postProcessBeforeInitialization} $\rightarrow$ \code{@PostConstruct} / \code{afterPropertiesSet()} $\rightarrow$ \code{postProcessAfterInitialization} \emph{(this is where proxies for \code{@Transactional}, \code{@Async}, AOP are wrapped around your bean)} $\rightarrow$ bean is ready and cached $\rightarrow$ on shutdown, \code{@PreDestroy} / \code{destroy()}.
+
+\begin{wbfigure}{Fig 1.3 — The bean lifecycle. The object your controller calls is often a proxy created at the highlighted step, not your raw class.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=64mm, minimum height=7.4mm}]
+  \node[stage] (s1) {1 · Instantiate (constructor)};
+  \node[stage, below=of s1] (s2) {2 · Populate properties — dependency injection};
+  \node[stage, below=of s2] (s3) {3 · Aware callbacks (BeanNameAware, \dots)};
+  \node[stage, below=of s3] (s4) {4 · postProcessBeforeInitialization};
+  \node[stage, below=of s4] (s5) {5 · @PostConstruct / afterPropertiesSet()};
+  \node[stage, wbboxaccent, below=of s5] (s6) {6 · postProcessAfterInitialization \;— PROXY wrap};
+  \node[stage, wbboxgood, below=of s6] (s7) {7 · Bean ready \& cached  \quad\quad (shutdown $\rightarrow$ @PreDestroy)};
+  \foreach \a/\b in {s1/s2,s2/s3,s3/s4,s4/s5,s5/s6,s6/s7}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=6mm of s6, text width=28mm, anchor=west] {CGLIB / JDK dynamic proxy created here};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+The object registered in the context is frequently \emph{not} the raw class you wrote — it is a CGLIB subclass or JDK dynamic proxy wrapping it. The proxy intercepts \emph{external} calls to add behaviour (open a transaction, check a cache, hop to another thread) before delegating to your real method.
+\end{behind}
+
+\begin{secwarn}[the self-invocation trap]
+Because proxies only intercept calls arriving \emph{from outside} the bean, a method calling \emph{another method on \code{this}} bypasses the proxy entirely. That is precisely why calling a \code{@Transactional} method from another method in the same class \emph{silently} skips the transaction — the advice never runs. The same breaks \code{@Async} and \code{@Cacheable}. Fix: move the annotated method to a separate bean, or inject a self-reference proxy.
+\end{secwarn}
+
+\wbsub{3.3\quad Component Scanning vs. Auto-Configuration}
+
+\glabel{What is it?} Two different mechanisms that both create beans, constantly confused. \keyterm{Component scanning} walks your own packages from \code{@SpringBootApplication} downward, registering anything annotated \code{@Component} (and \code{@Service}/\code{@Repository}/\code{@Controller}). \keyterm{Auto-configuration} lives in \code{spring-boot-autoconfigure} and reacts to what is on the classpath.
+
+\glabel{How does it work internally?} Auto-configuration classes are guarded by conditional annotations: \code{@ConditionalOnClass} (is this type on the classpath?), \code{@ConditionalOnMissingBean} (did you not already define your own?), \code{@ConditionalOnProperty}. So: "if a \code{DataSource} type is present and you have not declared one, create a \code{DataSource} from \code{application.yml}." This is why adding \code{spring-boot-starter-data-redis} can silently activate new beans — auto-config reacts to the classpath, not only to what you explicitly asked for.
+
+\begin{seniornote}
+When a bean appears (or refuses to appear) that you did not define, a senior does not guess. They run the app with \code{--debug} and read the \keyterm{Auto-configuration Report}: a printed list of every positive and negative condition match. "Fighting the framework" is almost always "not having read which condition fired."
+\end{seniornote}
+
+\wbsub{3.4\quad Configuration Properties \& Profiles}
+
+\glabel{What is it?} \code{@ConfigurationProperties} binds a group of related settings to a typed object; \keyterm{profiles} let the same jar behave differently per environment.
+
+\begin{javabox}[MailProperties.java]
+@ConfigurationProperties(prefix = "app.mail")
+@Validated
+public record MailProperties(
+    @NotBlank String host,
+    @Min(1) int port,
+    boolean tlsEnabled) {}
+\end{javabox}
+
+\begin{yamlbox}[application-prod.yml]
+app:
+  mail:
+    host: smtp.prod.internal
+    port: 587
+    tls-enabled: true
+spring:
+  profiles:
+    active: prod   # in real prod, set via env var, never hardcoded
+\end{yamlbox}
+
+\glabel{Why prefer it over \code{@Value}?} Typed properties are validatable (\code{@Validated} fails startup on bad config — a good thing), testable in isolation, and discoverable in one class instead of scattered across the codebase as string keys.
+
+\wbsub{3.5\quad How a Request Actually Travels Through Spring MVC}
+
+\begin{wbfigure}{Fig 1.4 — Request lifecycle. Filters run \emph{before} Spring MVC knows about the request; interceptors run \emph{inside} it, around the controller.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 14mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=46mm, minimum height=8mm, align=left, text width=40mm}]
+  \node[stg, wbboxghost] (client) {\textbf{Client} \hfill \scriptsize sends HTTP request};
+  \node[stg, wbboxwarn, below=of client] (filter) {\textbf{Filter Chain} \hfill \scriptsize security · CORS · logging};
+  \node[stg, below=of filter] (disp) {\textbf{DispatcherServlet} \hfill \scriptsize front controller};
+  \node[stg, below=of disp] (map) {\textbf{HandlerMapping} \hfill \scriptsize finds @Controller};
+  \node[stg, wbboxgood, below=of map] (ctrl) {\textbf{Controller} \hfill \scriptsize $\rightarrow$ Service $\rightarrow$ Repository};
+  \node[stg, wbboxaccent, below=of ctrl] (conv) {\textbf{HttpMessageConverter} \hfill \scriptsize Jackson $\rightarrow$ JSON};
+  \foreach \a/\b in {client/filter,filter/disp,disp/map,map/ctrl,ctrl/conv}{\draw[wbarrow] (\a)--(\b);}
+  % side annotations
+  \node[wbcap, right=8mm of filter, text width=30mm, anchor=west] {outside Spring context — raw servlet request};
+  \node[wbcap, right=8mm of map, text width=30mm, anchor=west] {interceptors run here, around the handler};
+  \draw[wbarrow, dashed] (conv.east) to[out=0,in=0] node[wbcap, right=1mm, midway]{response} (client.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{The distinction interviewers probe.} \keyterm{Filters} are Servlet-spec, run outside the Spring context, and see the raw \code{HttpServletRequest} — used for security and CORS. \keyterm{Interceptors} are Spring-specific, run inside dispatch, and can see the resolved handler method. \code{HandlerMapping} chooses the controller; an \code{HttpMessageConverter} (Jackson by default) serialises the return value into the response body.
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Constructor injection only; never field \code{@Autowired}. Explicit, immutable, testable.
+  \item Keep configuration in typed \code{@ConfigurationProperties} classes, not scattered \code{@Value}.
+  \item One \code{@SpringBootApplication} per module; keep component-scan scope tight in large monorepos.
+  \item Never put logic that depends on \emph{other} beans being fully initialised inside \code{@PostConstruct} — use \code{ApplicationRunner} instead.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Calling a \code{@Transactional} method from inside the same class and being surprised nothing rolls back.
+  \item Field injection everywhere, making unit construction impossible without reflection.
+  \item Not realising beans are singletons by default, causing shared-mutable-state bugs.
+  \item Fighting auto-configuration instead of reading which condition activated it (\code{--debug}).
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have already met four diagrams; redraw two of them \emph{from memory} in the space below — the act of reproducing them is what moves them from "recognised" to "known."
+
+\begin{writespace}[Redraw: the bean lifecycle (7 steps) and where the proxy is attached]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: a request from Filter Chain to JSON response]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab — Scaffold the Container You Can See}
+
+\textbf{Goal of this lab:} build a tiny Spring Boot module whose startup is fully observable, so the abstract lifecycle becomes something you literally watch in the console. This becomes the seed of the ShopFlow capstone.
+
+\resetlab
+\labstep{Create the project with layered packages}
+Generate a Spring Boot 3 / Java 21 project (\code{start.spring.io}) with \emph{Web} and \emph{Validation}. Create packages \code{controller}, \code{service}, \code{repository}, \code{config}, \code{dto}.
+\labwhy{A predictable package layout is the cheapest architecture decision you will ever make — every later day drops files into these folders.}
+
+\labstep{Write one constructor-injected service}
+Add a trivial \code{GreetingService} and a \code{GreetingController} that depends on it \emph{via its constructor}. No \code{@Autowired} field anywhere.
+\labwhy{You are hard-wiring the good habit from Part 3 into muscle memory before the codebase grows.}
+
+\labstep{Add a typed \code{@ConfigurationProperties} class}
+Bind \code{app.greeting.prefix} and \code{app.greeting.maxLength} into a validated record. Annotate the app with \code{@ConfigurationPropertiesScan}.
+\labwhy{Type-safe config that fails fast on bad input is a production reflex; prove it by starting with an invalid value and watching startup refuse.}
+
+\labstep{Register a \code{BeanPostProcessor} that logs every bean}
+Implement \code{postProcessBeforeInitialization} to record \code{System.nanoTime()} and \code{postProcessAfterInitialization} to log \code{beanName} + elapsed millis.
+\labwhy{This turns Fig 1.3 into observable reality — you will \emph{see} the order and spot which beans are slow to initialise.}
+
+\labstep{Add \code{dev} and \code{prod} profiles}
+Create \code{application-dev.yml} and \code{application-prod.yml} with a different greeting prefix; switch with \code{--spring.profiles.active=prod}.
+\labwhy{"Same jar, different environment" is the principle Docker (Day 8) and CI/CD (Day 12) are built on.}
+
+\labstep{Run with \code{--debug} and read the report}
+Find three auto-configurations that activated and name the condition that fired each.
+\labwhy{You are practising the senior reflex: understand \emph{why} a bean exists, don't just accept it.}
+
+\begin{prodtip}
+Do not paste a finished \code{BeanPostProcessor} from the internet. Type it, run it, and \emph{read your own log output}. The learning is in seeing \code{jwtAuthFilter} initialise after \code{dataSource} — an ordering you will care about on Day 5.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+These are reflection prompts, not quiz questions. Write a sentence or two — the goal is to make your reasoning explicit.
+
+\begin{thinkbox}
+Why do you think Spring makes beans \emph{singleton} by default rather than creating a new instance per injection point? What class of bug does that default invite, and why is it still the right default?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+If proxies are what make \code{@Transactional} work, predict what happens to a \code{private} \code{@Transactional} method. Why can a proxy not intercept it?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Auto-configuration reacts to the classpath. What is the risk of that convenience in a large project with many starters, and how would you \emph{prove} which beans a new dependency introduced?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The rollback that never happens}
+\textbf{Symptom.} \code{placeOrder()} throws halfway through, but the half-written row is still in the database after the request fails.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderService.java]
+@Service
+public class OrderService {
+  public void placeOrder(OrderRequest req) {   // no annotation here
+    validate(req);
+    persistOrder(req);            // internal call
+  }
+  @Transactional
+  void persistOrder(OrderRequest req) { /* two writes, second may throw */ }
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The transaction advice never appears in the SQL log (no \code{BEGIN}).
+  \item \textbf{Hypothesise.} \code{persistOrder} is called on \code{this}, so the proxy is bypassed and \code{@Transactional} does nothing.
+  \item \textbf{Verify.} Move \code{@Transactional} to the public \code{placeOrder} instead, restart, watch for \code{BEGIN}/\code{ROLLBACK} in the log.
+  \item \textbf{Fix.} Annotate the outer entry point, \emph{or} extract \code{persistOrder} into its own bean called through the proxy.
+  \item \textbf{Prevent.} Add a test that forces the second write to fail and asserts the row count is unchanged.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{A bean you never wrote is answering your requests}
+\textbf{Symptom.} After adding a starter, an endpoint behaves differently and a \code{DataSource} exists that you did not declare.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Restart with \code{--debug}; open the \emph{Positive matches} section of the auto-configuration report.
+  \item \textbf{Hypothesise.} A \code{@ConditionalOnMissingBean} auto-config created the \code{DataSource} because you never defined one.
+  \item \textbf{Verify.} Search the report for \code{DataSourceAutoConfiguration} and read the matched condition.
+  \item \textbf{Fix.} Either accept it, or declare your own \code{@Bean} to win by \code{@ConditionalOnMissingBean} precedence.
+  \item \textbf{Prevent.} Treat every new starter as "what beans did this add?" — check the report, don't discover it in production.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Prove the singleton default with your own eyes.\\
+\textbf{Context.} Two controllers both inject the same \code{CounterService}.\\
+\textbf{Requirements.} Increment a field from each controller; expose the value.\\
+\textbf{Hints.} Inject the same bean twice; log \code{System.identityHashCode(service)}.\\
+\textbf{Expected outcome.} Identical hash codes; a single shared counter.\\
+\textbf{Common pitfalls.} Adding \code{@Scope("prototype")} and then being confused when the count resets — that is the lesson, not a bug.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~40 min}
+\textbf{Goal.} Make \code{@ConfigurationProperties} validation fail the build at startup.\\
+\textbf{Context.} A \code{RateLimitProperties(int permitsPerSecond)} with \code{@Min(1)}.\\
+\textbf{Requirements.} Set the value to \code{0} in \code{application.yml}; add \code{@Validated}.\\
+\textbf{Hints.} The exception is a \code{BindValidationException} wrapped in a startup failure.\\
+\textbf{Expected outcome.} The context refuses to start, with a clear message naming the field.\\
+\textbf{Common pitfalls.} Forgetting \code{@Validated}, so the constraint is ignored and the app boots with bad config.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~60 min}
+\textbf{Goal.} Add startup timing observability, the way an ops-minded team would.\\
+\textbf{Context.} You want to know which beans dominate cold-start time (matters for autoscaling and CI).\\
+\textbf{Requirements.} Extend your \code{BeanPostProcessor} to accumulate per-bean init durations and print the slowest 10 on \code{ApplicationReadyEvent}.\\
+\textbf{Hints.} Store timings in a \code{Map}; sort descending in an \code{@EventListener(ApplicationReadyEvent.class)}.\\
+\textbf{Expected outcome.} A "Top 10 slowest beans" table in the log at boot.\\
+\textbf{Common pitfalls.} Doing the sort in \code{@PostConstruct} of some bean — it runs before the context is ready and the map is incomplete.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+A curated margin from engineers who have carried a pager. Read these as judgment, not trivia.
+
+\begin{seniornote}
+Startup order is a feature, not an accident. When you can predict the order in which beans initialise, you can reason about \emph{when} a resource (a pool, a cache, a Kafka consumer) becomes available — and therefore why a health check flickers red for the first two seconds after deploy.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{"Why does a \code{@Transactional} self-call not work?"} The answer that lands is not "because proxies" — it is "because the advice lives on a proxy that only wraps \emph{external} calls, and a \code{this.method()} call never touches the proxy." Say the mechanism.
+\end{interview}
+
+\begin{perfnote}
+Marking rarely-used beans \code{@Lazy} shortens cold start, but never make a \code{@Transactional} or \code{@Cacheable} bean lazy without thinking — the first call pays both the initialisation \emph{and} the proxy-creation cost, which can surprise a latency-sensitive path.
+\end{perfnote}
+
+\begin{prodtip}
+In production, \code{spring.profiles.active} is an \emph{environment variable}, injected by your platform (Day 8 Compose, Day 12 CI). Hardcoding it in \code{application.yml} defeats the entire "one artifact, many environments" model.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — ShopFlow}
+
+Across the next fourteen days you build \keyterm{ShopFlow}, a small but production-shaped order-management backend. Today you lay its foundation.
+
+\begin{buildalong}[Day 1 — the base module]
+\begin{wbitem}
+  \item Scaffold the Spring Boot 3 / Java 21 project with layered packages: \code{controller}, \code{service}, \code{repository}, \code{config}, \code{dto}.
+  \item Constructor injection everywhere — set the rule now, enforce it forever.
+  \item One typed \code{@ConfigurationProperties} class (e.g. \code{app.shopflow.*}) with validation.
+  \item \code{dev} and \code{prod} profiles that differ in at least one visible value.
+  \item A \code{BeanPostProcessor} that logs per-bean startup timing.
+  \item A single \code{GET /api/v1/ping} endpoint returning \code{200} — proof the pipeline is alive end-to-end.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} the app starts, \code{/ping} returns 200, and your startup log prints the bean-timing summary. This skeleton is the literal seed for Day 14.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The IoC container builds \emph{definitions} first, then objects, in a resolved order.
+  \item Your beans are often wrapped by proxies; that is how \code{@Transactional}/\code{@Async}/\code{@Cacheable} work.
+  \item Self-invocation bypasses the proxy — the single most common "why doesn't my annotation work?" bug.
+  \item Component scanning registers \emph{your} components; auto-configuration reacts to the \emph{classpath} via conditions.
+  \item Filters run outside Spring; interceptors run inside — different tools for different jobs.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{--debug} prints the auto-configuration report. Use it instead of guessing.
+  \item Typed \code{@ConfigurationProperties} + \code{@Validated} makes bad config a startup failure, not a 2am surprise.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Field injection $\rightarrow$ untestable classes. \quad$\bullet$\quad Self-call \code{@Transactional} $\rightarrow$ silent no-op.
+  \item Hardcoded active profile $\rightarrow$ broken promotion across environments.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{BeanFactory vs ApplicationContext}{Context = BeanFactory + events, AOP, i18n, eager singletons.}
+\cheatitem{Bean lifecycle}{instantiate $\rightarrow$ inject $\rightarrow$ aware $\rightarrow$ BPP-before $\rightarrow$ @PostConstruct $\rightarrow$ BPP-after (proxy) $\rightarrow$ ready $\rightarrow$ @PreDestroy.}
+\cheatitem{Proxy rule}{advice only intercepts external calls; \code{this.method()} skips it.}
+\cheatitem{Scan vs auto-config}{scan = your packages; auto-config = classpath conditions (\code{@ConditionalOnClass/MissingBean/Property}).}
+\cheatitem{Filter vs Interceptor}{filter = servlet, outside Spring, raw request; interceptor = Spring, inside dispatch, sees handler.}
+\cheatitem{Config}{constructor injection + \code{@ConfigurationProperties} + profiles via env var.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the difference between \code{BeanFactory} and \code{ApplicationContext}?}
+\iq{Walk me through the Spring bean lifecycle.}
+\iq{Why does calling a \code{@Transactional} method from within the same class not work?}
+\iq{How does Spring Boot decide which auto-configurations to apply?}
+\iq{What is the difference between a Filter and an Interceptor?}
+\iq{What are the bean scopes, and when would you use \code{prototype}?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Spring Framework Reference} — "The IoC Container" and "Web MVC" chapters.
+  \item \emph{Spring Boot Reference} — "Auto-configuration" and "Externalized Configuration."
+  \item Source dive: \code{AbstractApplicationContext.refresh()} — the method where the whole lifecycle happens.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 2).} Every bean you just wired eventually talks to a database. Tomorrow you drop below the ORM to raw SQL: joins, indexes, transactions and isolation — the layer where most real performance incidents are actually born.
+\end{keyidea}

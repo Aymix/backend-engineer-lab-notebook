@@ -1,0 +1,193 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ FRONT MATTER ============================
+\newcommand{\frontheading}[2]{%
+  \par\addvspace{7mm}%
+  \noindent\begin{tikzpicture}[baseline=(t.base)]
+    \node[fill=cBrand, text=white, rounded corners=1.3mm, font=\normalsize,
+          inner sep=0pt, minimum width=8mm, minimum height=8mm] (n) {#1};
+    \node[anchor=west, font=\sffamily\bfseries\LARGE, text=cInk] (t) at (n.east) [xshift=3mm] {#2};
+  \end{tikzpicture}\par\vspace{1mm}%
+  \noindent{\color{cBrand}\rule{\linewidth}{1pt}}\par\addvspace{2.5mm}%
+}
+
+% ---------------------------------------------------------------- COVER
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  \fill[cBrandDeep] (current page.south west) rectangle (current page.north east);
+  % soft geometric accents — indigo title band with amber rules top & bottom
+  \fill[cBrand] ([yshift=-4.2cm]current page.north west) rectangle ([yshift=-9.7cm]current page.north east);
+  \fill[cAccent] ([yshift=-4.2cm]current page.north west) rectangle ([yshift=-4.05cm]current page.north east);
+  \fill[cAccent] ([yshift=-9.85cm]current page.north west) rectangle ([yshift=-9.7cm]current page.north east);
+  % faint big glyph, tucked into the lower-right corner
+  \node[anchor=south east, text=white, opacity=0.04, font=\bfseries, scale=22]
+     at ([xshift=0.6cm,yshift=-0.4cm]current page.south east) {\{\ \}};
+  % eyebrow
+  \node[anchor=north west, text=cAccent, font=\sffamily\bfseries]
+     at ([xshift=2.2cm,yshift=-2.5cm]current page.north west)
+     {\Large BACKEND ENGINEERING\, \textbullet\, SPEEDRUN SERIES};
+  % title block (centered in the indigo band)
+  \node[anchor=north west, text=white, font=\sffamily\bfseries, align=left]
+     at ([xshift=2.2cm,yshift=-5.25cm]current page.north west)
+     {{\fontsize{39}{43}\selectfont The Backend Engineer's}\\[3mm]
+      {\fontsize{39}{43}\selectfont Lab Notebook}};
+  % subtitle — placed BELOW the band, on the dark field
+  \node[anchor=north west, text=white, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-10.7cm]current page.north west)
+     {\large A guided-practice companion to the};
+  \node[anchor=north west, text=cAccent, font=\sffamily\bfseries, align=left]
+     at ([xshift=2.2cm,yshift=-11.28cm]current page.north west)
+     {\large Java \& Spring Boot --- 14-Day Speedrun Roadmap};
+  % tagline
+  \node[anchor=north west, text=white!85, font=\sffamily, align=left, text width=15.6cm]
+     at ([xshift=2.2cm,yshift=-12.9cm]current page.north west)
+     {From \emph{reading} concepts to truly \emph{understanding} them --- then building, debugging,
+      securing, testing, containerizing, and shipping a production Spring Boot backend, one guided day at a time.};
+  % stat row
+  \node[anchor=north west, align=left] at ([xshift=2.2cm,yshift=-15.3cm]current page.north west)
+     {\begin{tikzpicture}[x=3.7cm, node distance=0pt]
+        \foreach \i/\v/\l in {0/14/DAYS, 1/42/GUIDED LABS, 2/110+/EXERCISES, 3/1/CAPSTONE}{
+          \node[anchor=west, text=cAccent, font=\sffamily\bfseries] at (\i,0.35) {\Huge \v};
+          \node[anchor=west, text=white!80, font=\sffamily\bfseries\footnotesize] at (\i,-0.35) {\l};
+        }
+      \end{tikzpicture}};
+  % notebook owner lines (workbook touch)
+  \node[anchor=north west, text=white!75, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-18.9cm]current page.north west)
+     {This notebook belongs to:\ \ \textcolor{white!35}{\rule{7cm}{0.4pt}}};
+  \node[anchor=north west, text=white!75, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-19.8cm]current page.north west)
+     {Started on:\ \ \textcolor{white!35}{\rule{3.6cm}{0.4pt}}\qquad Target finish:\ \ \textcolor{white!35}{\rule{3.6cm}{0.4pt}}};
+  % footer
+  \node[anchor=south west, text=white!55, font=\sffamily\footnotesize]
+     at ([xshift=2.2cm,yshift=1.4cm]current page.south west)
+     {Study the roadmap first \textbullet\ then learn with this workbook open beside you \textbullet\ write in the margins};
+\end{tikzpicture}
+\end{titlepage}
+
+% ---------------------------------------------------------------- HOW TO USE
+\frontheading{\faCompass}{How to Use This Workbook}
+
+This is not an exam book and not a second textbook. It is a \keyterm{lab manual} — a place to
+\emph{do the work} beside the roadmap. The roadmap tells you \emph{what} to learn; this workbook
+walks you through \emph{understanding} it, \emph{building} it, and \emph{reflecting} on it, so the
+knowledge sticks. Each chapter maps one-to-one to a day of the roadmap and always follows the same
+eleven-part rhythm, so you always know where you are.
+
+\wbsub{The daily study loop}
+\begin{wbfigure}{Fig 0.1 — Run this loop once per day. The learning is in the middle two steps, not the reading.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=30mm] (a) {\textbf{1 · Read}\\\scriptsize the roadmap day, first};
+  \node[wbboxaccent, right=of a, text width=30mm] (b) {\textbf{2 · Work the 11 parts}\\\scriptsize concepts, diagrams, callouts};
+  \node[wbboxgood, right=of b, text width=30mm] (c) {\textbf{3 · Build by hand}\\\scriptsize labs \& ShopFlow, no copy-paste};
+  \node[wbboxdb, below=8mm of c, text width=30mm] (d) {\textbf{4 · Reflect \& check}\\\scriptsize write-in spaces, checklist};
+  \node[wbboxghost, below=8mm of a, text width=30mm] (e) {\textbf{Next day}\\\scriptsize each chapter builds on the last};
+  \draw[wbarrow] (a)--(b); \draw[wbarrow] (b)--(c); \draw[wbarrow] (c)--(d);
+  \draw[wbarrow] (d) -| (e); \draw[wbarrow] (e)--(a);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\wbsub{The eleven parts of every chapter}
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}p{4mm}L{36mm}X@{}}
+\textbf{1} & \textbf{The Big Picture} & Why this exists, where it fits, how it connects to earlier days.\\[1.2mm]
+\textbf{2} & \textbf{Concept Map} & One picture of the whole territory and its vocabulary.\\[1.2mm]
+\textbf{3} & \textbf{Guided Learning} & Each idea taught progressively: what / why / how-internally / when / when-not / production / mistakes.\\[1.2mm]
+\textbf{4} & \textbf{Visualizations} & Redraw the key diagrams from memory to lock them in.\\[1.2mm]
+\textbf{5} & \textbf{Guided Coding Lab} & Build a feature step by step — the workbook guides, you write the code.\\[1.2mm]
+\textbf{6} & \textbf{Thinking Exercises} & Reflection prompts (not tests) that make your reasoning explicit.\\[1.2mm]
+\textbf{7} & \textbf{Debugging Practice} & A broken scenario worked as Observe → Hypothesise → Verify → Fix → Prevent.\\[1.2mm]
+\textbf{8} & \textbf{Mini-Labs} & Three graded labs: Beginner, Intermediate, Production-style.\\[1.2mm]
+\textbf{9} & \textbf{Engineering Notes} & Senior judgment: how experienced engineers actually think.\\[1.2mm]
+\textbf{10} & \textbf{Build-Along Project} & Extend \keyterm{ShopFlow}, one production backend built across all 14 days.\\[1.2mm]
+\textbf{11} & \textbf{Chapter Summary} & Takeaways, pitfalls, a one-page cheat sheet, and what comes next.\\
+\end{tabularx}
+\end{center}
+
+\begin{prodtip}
+The reflection spaces and "redraw from memory" boxes are meant to be \emph{written in} by hand. Print
+the pages you are working, or annotate the PDF. Reproducing a diagram yourself is what moves it from
+"I recognise that" to "I can explain that in an interview."
+\end{prodtip}
+
+\begin{secwarn}[on copy-paste]
+This workbook deliberately does \emph{not} hand you finished solutions. The labs guide you to build them
+yourself. If you paste code you did not type and reason through, you will feel productive and learn nothing.
+The struggle in Parts 5, 7 and 10 is the point.
+\end{secwarn}
+
+% ---------------------------------------------------------------- LEGEND
+\frontheading{\faInfoCircle}{Field Guide to the Margin Notes}
+
+Throughout the workbook, coloured callouts flag different \emph{kinds} of thinking. Learn to read them at a glance.
+
+\begin{seniornote}How experienced engineers reason about a decision — the judgment behind the code.\end{seniornote}
+\begin{prodtip}A concrete practice that holds up in real production systems.\end{prodtip}
+\begin{perfnote}A latency, memory, or throughput consideration worth measuring.\end{perfnote}
+\begin{secwarn}A security or correctness trap — read these twice.\end{secwarn}
+\begin{dbinsight}Something the database is doing underneath your ORM.\end{dbinsight}
+\begin{interview}A question you will likely be asked, and how to answer it well.\end{interview}
+\begin{misconception}A belief many beginners hold that is subtly wrong.\end{misconception}
+\begin{behind}What the framework or runtime is actually doing behind the scenes.\end{behind}
+
+\smallskip
+And the working blocks you will act on:
+
+\begin{minilab}{Beginner / Intermediate / Production}{graded practice}
+Self-contained labs with a Goal, Context, Requirements, Hints, Expected outcome, and Common pitfalls.
+\end{minilab}
+\begin{debuglab}{A broken app to diagnose}
+Symptom and evidence, then a guided Observe → Hypothesise → Verify → Fix → Prevent walkthrough.
+\end{debuglab}
+\begin{thinkbox}
+A reflection prompt with ruled space to write your answer by hand.
+\end{thinkbox}
+\begin{buildalong}[ShopFlow]
+The one production backend you extend a little further every single day.
+\end{buildalong}
+
+% ---------------------------------------------------------------- THE ARC
+\frontheading{\faMapSigns}{The 14-Day Arc at a Glance}
+
+Each day earns its place and feeds the next. Read down the "ShopFlow milestone" column to see one real
+backend take shape from an empty project to a production-ready service.
+
+\begin{center}\footnotesize
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}C{7mm}L{34mm}X@{}}
+\rowcolor{cBrand}\textcolor{white}{\textbf{Day}} & \textcolor{white}{\textbf{Topic}} & \textcolor{white}{\textbf{ShopFlow milestone you build}}\\
+1 & Spring Boot Internals & Base module: layered packages, typed config, profiles, \code{/ping}.\\
+2 & Database Mastery & Schema + constraints + composite index + migration.\\
+3 & JPA \& Hibernate & Order/OrderItem/Product entities, locking, one-query listing.\\
+4 & REST API Design & Order API with DTOs, validation, errors, pagination, OpenAPI.\\
+5 & Spring Security & JWT login/refresh, BCrypt, roles, locked-down CORS.\\
+6 & Testing & Unit + Testcontainers + MockMvc coverage, incl. auth failures.\\
+7 & Clean Architecture & Refactor: validator, domain event, async email listener.\\
+8 & Docker & Multi-stage image + Compose (app + Postgres + Redis).\\
+9 & Redis \& Caching & Cached catalog reads, evict-on-write, TTL.\\
+10 & Messaging (MQ) & OrderPlaced to RabbitMQ, retries, dead letter queue.\\
+11 & JVM \& Concurrency & Bounded thread pool, Actuator, custom metrics.\\
+12 & CI/CD & GitHub Actions: test, build, tag by SHA, push image.\\
+13 & Production Readiness & Circuit breaker, rate limiting, liveness/readiness, Grafana.\\
+14 & Capstone & Assemble, verify, and present the whole ShopFlow backend.\\
+\end{tabularx}
+\end{center}
+
+\begin{keyidea}
+\textbf{ShopFlow} is deliberately a \emph{small} domain — roughly two entities of real complexity — carrying
+a \emph{large} amount of engineering weight. That is exactly the shape of a strong take-home assignment or a
+well-scoped first project at a new job. Depth over breadth, every day.
+\end{keyidea}
+
+\clearpage
+% ---------------------------------------------------------------- TOC
+\frontheading{\faListUl}{Contents}
+\vspace{1mm}
+{\hypersetup{linkcolor=cInk}%
+ \makeatletter\@starttoc{toc}\makeatother}
+\vfill
+\begin{center}\footnotesize\itshape\color{cInk!60}
+Fourteen chapters \textbullet\ one growing project \textbullet\ every concept practised, not just read.
+\end{center}
+\clearpage

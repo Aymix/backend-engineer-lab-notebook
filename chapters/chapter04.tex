@@ -1,0 +1,606 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 04 ============================
+\daychapter{04}{API Layer}{REST API Design}{Building APIs like a professional --- DTOs, validation, errors, pagination, versioning, OpenAPI}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Design resource-oriented REST APIs with correct HTTP semantics --- the right method, the right status code, the right idempotency guarantee for every path.
+  \item Build a DTO layer that decouples your public contract from your persistence model, with an explicit mapper you control.
+  \item Enforce Bean Validation at the controller boundary and centralise every failure into one consistent error shape via \code{@RestControllerAdvice}.
+  \item Implement pagination and filtering behind a stable response envelope, and choose a versioning strategy you can live with for years.
+  \item Publish the API as a machine-readable contract with OpenAPI/Swagger so frontend, QA and gateways consume it without asking you questions.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Days 1--3 gave you a container full of beans, real SQL, and JPA entities with repositories. But nothing outside your JVM can talk to any of it yet. Today you build the \keyterm{edge} of the system --- the thin, deliberate layer where the outside world meets your domain. The question that separates a junior from a mid-level engineer here is not \emph{"how do I return JSON?"} (any annotation does that) but \emph{"what exactly is my contract, and how do I keep it stable while the code behind it churns?"}
+
+\glabel{Why backend engineers need it.} The API is the one part of your system other teams actually see. A frontend developer, a partner integration, a mobile app, an API gateway --- they all consume the shapes and status codes you emit, and they build assumptions on top of them. A leaked entity field, an inconsistent error body, an unpaginated list endpoint: each becomes a production incident or a breaking change that ripples across every consumer. The discipline you learn today is what makes an API something people can \emph{depend on}.
+
+\begin{keyidea}
+An API is a \keyterm{contract}, not a side effect of your code. Everything today serves one goal: to make that contract \emph{explicit, consistent, and stable}. DTOs pin the shape, validation pins the inputs, a central error handler pins the failure shape, pagination pins the list shape, versioning pins the evolution, and OpenAPI writes it all down so no one has to guess.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} The API layer sits at the very top of the request pipeline you traced on Day 1. A request arrives through the filter chain and \code{DispatcherServlet}, lands on your \code{@RestController}, gets validated and mapped into your domain, and travels down into the service and repository layers you already have. The response travels back up and is serialised to JSON. Everything you build today is the boundary --- it owns \emph{translation and contract}, never business rules.
+
+\begin{wbfigure}{Fig 4.1 --- The API layer is the boundary: it translates between the outside world and the domain you built on Days 1--3.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=52mm] (client) {\textbf{Clients}\\\scriptsize browser · mobile · partner services · gateway};
+  \node[wbboxaccent, below=of client, text width=62mm] (api) {\textbf{API Layer} \;\scriptsize(this chapter)\\\scriptsize controllers · request/response DTOs · validation · error advice · pagination · OpenAPI};
+  \node[wbbox, below=of api, text width=52mm] (svc) {\textbf{Service Layer}\\\scriptsize business rules · transactions (Day 1)};
+  \node[wbboxdb, below=of svc, text width=52mm] (repo) {\textbf{Repositories / JPA}\\\scriptsize entities · queries (Days 2--3)};
+  \node[wbcyl, below=of repo, text width=24mm] (db) {Database};
+  \draw[wbarrow] (client)--(api); \draw[wbarrow] (api)--(svc);
+  \draw[wbarrow] (svc)--(repo); \draw[wbarrow] (repo)--(db);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} The proxies and transactions from Day 1 run \emph{below} your controller. The entities and repositories from Days 2--3 are exactly what you must \emph{not} expose --- today you build the wall that keeps them private. The service layer is where logic lives; your controller stays thin.
+
+\glabel{Real company examples.} Stripe's API is famous precisely because its contract almost never breaks --- additive changes only, dated versions, and an error shape identical across every endpoint. GitHub, Twilio and Shopify all publish OpenAPI specs that entire ecosystems build tooling against. The reason those APIs feel trustworthy is not clever code; it is the exact discipline in this chapter, applied relentlessly.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture. The contract sits at the top; every concept below it exists to keep one part of that contract honest.
+
+\begin{wbfigure}{Fig 4.2 --- The Day 4 concept map: a stable contract, supported by the DTO, validation, pagination, versioning and documentation concerns.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 7mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=70mm] (top) {\textbf{The API Contract}\\\scriptsize resources (nouns) · HTTP methods (verbs) · status codes (outcomes)};
+  \node[wbbox, below=12mm of top, text width=30mm] (dto) {\textbf{DTO Layer}\\\scriptsize request \& response shapes + mapper};
+  \node[wbbox, left=of dto, text width=30mm] (val) {\textbf{Validation}\\\scriptsize @Valid + @RestControllerAdvice};
+  \node[wbbox, right=of dto, text width=30mm] (page) {\textbf{Pagination}\\\scriptsize Pageable + stable envelope};
+  \node[wbbox, below=8mm of val, text width=30mm] (ver) {\textbf{Versioning}\\\scriptsize /v1 · evolve without breaking};
+  \node[wbbox, below=8mm of page, text width=30mm] (doc) {\textbf{OpenAPI}\\\scriptsize springdoc · Swagger UI};
+  \draw[wbarrow] (top)--(dto); \draw[wbarrow] (top)--(val); \draw[wbarrow] (top)--(page);
+  \draw[wbarrowg] (val)--(ver); \draw[wbarrowg] (page)--(doc);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Resource} $\rightarrow$ \keyterm{HTTP method} $\rightarrow$ \keyterm{Status code} $\rightarrow$ \keyterm{DTO} $\rightarrow$ \keyterm{Mapper} $\rightarrow$ \keyterm{Bean Validation} $\rightarrow$ \keyterm{@RestControllerAdvice} $\rightarrow$ \keyterm{Pageable} $\rightarrow$ \keyterm{Envelope} $\rightarrow$ \keyterm{Version} $\rightarrow$ \keyterm{OpenAPI}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad REST Principles \& HTTP Semantics}
+
+\glabel{What is it?} \keyterm{REST} models your system as a set of \keyterm{resources} --- nouns like \emph{order}, \emph{customer}, \emph{product} --- each addressed by a URL, and manipulated with a small fixed set of HTTP \keyterm{methods} that supply the verb. The URL names the thing; the method says what to do to it. So it is \code{POST /orders}, never \code{POST /createOrder}; \code{DELETE /orders/42}, never \code{POST /deleteOrder?id=42}.
+
+\glabel{Why does it exist?} A uniform interface is what lets caches, proxies, gateways and client libraries reason about your API \emph{without knowing your domain}. A cache knows \code{GET} is safe to store; a load balancer knows \code{PUT} can be retried; a browser knows \code{POST} should warn before re-submitting. When you invent action-URLs, you throw all of that infrastructure away and force every consumer to special-case your API.
+
+\glabel{How does it work internally?} Each method carries two properties that drive real behaviour. \keyterm{Safe} means the call has no side effects (\code{GET}, \code{HEAD}) --- infrastructure may prefetch or cache it freely. \keyterm{Idempotent} means calling it $N$ times leaves the server in the same state as calling it once. \code{GET}, \code{PUT}, \code{DELETE} are idempotent; \code{POST} is not. This is not academic: a client that times out on a \code{PUT} can safely retry, but a retried \code{POST} may create a second order.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{16mm} C{14mm} C{18mm} X@{}}
+\wbtablehead{Method} & \wbtablehead{Safe?} & \wbtablehead{Idempotent?} & \wbtablehead{Use for}\\\midrule
+GET & yes & yes & read a resource or a list, never mutate\\
+POST & no & no & create a new resource (server assigns id)\\
+PUT & no & yes & full replace of a known resource\\
+PATCH & no & no* & partial update of some fields\\
+DELETE & no & yes & remove a resource\\
+\end{tabularx}\end{center}
+\vspace{-1mm}
+{\footnotesize\itshape\color{cInk!68}*PATCH can be made idempotent by design, but is not guaranteed to be by the spec.}
+
+\begin{misconception}
+\code{PUT} is not "update" and \code{POST} is not "create" as a rule of thumb --- the real distinction is idempotency and who owns the identifier. \code{PUT /orders/42} means \emph{"make the resource at this exact URL look like this body"} (the client already knows the id, and repeating it is harmless). \code{POST /orders} means \emph{"take this and create something new for me"} (the server assigns the id, and repeating it makes another one). If you catch yourself doing \code{PUT} to a collection URL, you have the wrong method.
+\end{misconception}
+
+\begin{interview}
+Expect: \emph{"What is the difference between PUT and PATCH?"} The landing answer names both dimensions: \code{PUT} replaces the \emph{entire} resource and is idempotent, so a missing field means "set it to empty"; \code{PATCH} sends only the fields to change and is not required to be idempotent. Then add the consequence: sending a partial body to \code{PUT} silently wipes the fields you omitted.
+\end{interview}
+
+\wbsub{3.2\quad Status Codes --- the Contract of Outcomes}
+
+\glabel{What is it?} The status code is the first, most machine-readable part of your answer. Before a client parses a single byte of body, the code tells it what happened: success, client mistake, or server fault. Getting these right is the cheapest way to make an API feel professional.
+
+\glabel{Why does it exist?} Consumers branch on the code. A frontend shows a validation form on \code{400}, redirects to login on \code{401}, shows "you can't do that" on \code{403}, and shows "not found" on \code{404}. If you return \code{200} for everything and bury the real outcome in the JSON body, every client must parse your body to know if the call even succeeded --- and generic tooling (retries, alerting, gateways) is blinded entirely.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{14mm} L{34mm} X@{}}
+\wbtablehead{Code} & \wbtablehead{Meaning} & \wbtablehead{When to send it}\\\midrule
+200 & OK & successful read or update with a body\\
+201 & Created & resource created --- add a \code{Location} header\\
+204 & No Content & success with nothing to return (e.g. delete)\\
+400 & Bad Request & malformed or validation-failed input\\
+401 & Unauthorized & no or invalid credentials --- who \emph{are} you?\\
+403 & Forbidden & known identity, but not allowed\\
+404 & Not Found & the resource does not exist (or is hidden)\\
+409 & Conflict & state clash --- duplicate, stale version\\
+422 & Unprocessable & well-formed but semantically invalid\\
+500 & Server Error & your bug --- never the client's fault\\
+\end{tabularx}\end{center}
+
+\glabel{How does it work internally?} In Spring you rarely set the raw number. You either return a \code{ResponseEntity} (\code{ResponseEntity.created(uri).body(dto)} emits \code{201} plus the \code{Location} header), or you annotate a handler with \code{@ResponseStatus(HttpStatus.CREATED)} and return the body directly. The framework's \code{HttpMessageConverter} (Jackson) then serialises your object into the response.
+
+\begin{secwarn}[401 versus 403]
+These are the pair interviewers love because juniors swap them. \code{401 Unauthorized} is misnamed --- it means \emph{unauthenticated}: the server does not know who you are, so send credentials. \code{403 Forbidden} means the server \emph{knows exactly who you are} and you still may not do this. Rule of thumb: \code{401} $\rightarrow$ "log in"; \code{403} $\rightarrow$ "logging in as someone else won't help." A subtle production choice: some APIs return \code{404} instead of \code{403} for resources a user must not even know exist, to avoid leaking their existence.
+\end{secwarn}
+
+\wbsub{3.3\quad DTOs --- Never Expose Your Entities}
+
+\glabel{What is it?} A \keyterm{DTO} (Data Transfer Object) is a plain, intentional shape that crosses your API boundary --- one type for the request body, another for the response. In modern Java these are \code{record}s. They are separate from the JPA \code{@Entity} classes you wrote on Day 3.
+
+\glabel{Why does it exist?} An entity is an internal implementation detail bound to your database schema. Exposing it directly couples your public contract to your table structure, so a harmless column rename becomes a breaking API change. Worse, entities carry things you never want on the wire: password hashes, internal flags, audit columns, and lazy-loaded associations. DTOs let you decide --- field by field --- exactly what the world sees.
+
+\begin{wbfigure}{Fig 4.3 --- The DTO wall: entities stay private on the persistence side; DTOs are the only shapes that cross the boundary, via an explicit mapper.}
+\wbscale{\begin{tikzpicture}[node distance=7mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxdb, text width=40mm] (ent) {\textbf{Order (entity)}\\\scriptsize @Entity · lazy items · internalNotes · version · JPA proxies};
+  \node[wbboxaccent, right=10mm of ent, text width=24mm] (map) {\textbf{Mapper}\\\scriptsize toEntity\\toResponse};
+  \node[wbboxgood, right=10mm of map, text width=38mm] (dto) {\textbf{OrderResponse (DTO)}\\\scriptsize id · status · total · createdAt --- flat \& intentional};
+  \draw[wbarrow] (ent)--(map); \draw[wbarrow] (map)--(dto);
+  \node[wbcap, below=5mm of map, text width=46mm] {the wall: nothing above the mapper leaks below it};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[dto/OrderDtos.java]
+public record CreateOrderRequest(
+    @NotNull Long customerId,
+    @NotEmpty @Valid List<OrderItemRequest> items) {}
+
+public record OrderItemRequest(
+    @NotNull Long productId,
+    @Positive int quantity) {}
+
+public record OrderResponse(
+    Long id, String status, BigDecimal total, Instant createdAt) {}
+\end{javabox}
+
+\glabel{How does it work internally?} A \keyterm{mapper} translates in both directions: \code{toEntity} builds a domain object from the request, \code{toResponse} projects an entity into the response DTO. You can hand-write it (explicit, zero magic) or generate it with MapStruct (annotation-driven, compile-time). Start hand-written --- you learn what actually crosses the boundary.
+
+\begin{javabox}[mapper/OrderMapper.java]
+@Component
+public class OrderMapper {
+
+  public Order toEntity(CreateOrderRequest req) {
+    Order order = new Order(req.customerId());
+    req.items().forEach(i ->
+        order.addItem(i.productId(), i.quantity()));
+    return order;
+  }
+
+  public OrderResponse toResponse(Order o) {
+    return new OrderResponse(
+        o.getId(), o.getStatus().name(), o.getTotal(), o.getCreatedAt());
+  }
+}
+\end{javabox}
+
+\glabel{When should I use it?} Always, for anything that crosses the HTTP boundary in either direction. The DTO layer is not optional ceremony; it is the seam that lets the inside and outside evolve independently.
+
+\glabel{When should I \emph{not}?} Do not build a DTO for purely internal method calls between your own services --- that is just noise. The wall belongs at the network edge, not between every function.
+
+\begin{behind}
+When you return a JPA entity directly and Jackson serialises it, two disasters wait. First, a bidirectional association (\code{Order} $\rightarrow$ \code{items} $\rightarrow$ back to \code{Order}) makes Jackson recurse forever --- an infinite serialisation loop or a stack overflow. Second, touching a \code{LAZY} collection outside the transaction throws \code{LazyInitializationException} deep inside the HTTP converter, producing a \code{500} that has nothing to do with the caller's request. DTOs make both impossible by construction.
+\end{behind}
+
+\begin{interview}
+\emph{"Why should you never return JPA entities directly from a controller?"} Name three reasons in one breath: it couples the public contract to the database schema, it risks serialising fields you never meant to expose, and it triggers lazy-loading and cyclic-reference failures in the serialiser. DTOs are the fix for all three.
+\end{interview}
+
+\wbsub{3.4\quad Validation \& Centralised Error Handling}
+
+\glabel{What is it?} \keyterm{Bean Validation} (Jakarta Validation) lets you declare input constraints as annotations on the request DTO --- \code{@NotNull}, \code{@NotEmpty}, \code{@Positive}, \code{@Size}, \code{@Email} --- and have the framework check them automatically. \code{@Valid} at the controller parameter triggers the check; a \code{@RestControllerAdvice} turns any failure into a consistent error body.
+
+\glabel{Why does it exist?} Without it, every controller method starts with a wall of hand-written \code{if (req.customerId() == null) return badRequest()} checks, each returning a slightly different error shape. Declarative validation moves the rules onto the data itself, and centralised advice guarantees that \emph{every} endpoint --- present and future --- fails the same way.
+
+\glabel{How does it work internally?} When a request body fails \code{@Valid}, Spring throws \code{MethodArgumentNotValidException} \emph{before your method body ever runs}. That exception carries a \code{BindingResult} listing every field error. Your \code{@RestControllerAdvice} catches it, extracts the field errors, and maps them into your \code{ErrorResponse}. Because the advice is a single bean applied across all controllers, you write the mapping once.
+
+\begin{wbfigure}{Fig 4.4 --- Validation and error flow: a bad request is rejected before your logic runs; the advice shapes every failure identically.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=70mm, align=left, text width=64mm}]
+  \node[stg, wbboxghost] (req) {\textbf{Request body arrives} \hfill \scriptsize JSON};
+  \node[stg, below=of req] (valid) {\textbf{@Valid runs} \hfill \scriptsize Bean Validation checks constraints};
+  \node[stg, wbboxwarn, below=of valid] (fail) {\textbf{Invalid} $\rightarrow$ MethodArgumentNotValidException \hfill \scriptsize thrown before your method};
+  \node[stg, wbboxaccent, below=of fail] (advice) {\textbf{@RestControllerAdvice} catches it \hfill \scriptsize one place};
+  \node[stg, wbboxgood, below=of advice] (out) {\textbf{400 + ErrorResponse} \hfill \scriptsize code · message · path · field errors};
+  \foreach \a/\b in {req/valid,valid/fail,fail/advice,advice/out}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=5mm of valid, text width=22mm, anchor=west] {valid $\rightarrow$ your controller runs};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[error/ErrorResponse.java]
+public record ErrorResponse(
+    String code, String message, String path,
+    Instant timestamp, List<FieldError> errors) {
+
+  public static ErrorResponse of(String code, String msg,
+      String path, List<FieldError> errors) {
+    return new ErrorResponse(code, msg, path, Instant.now(), errors);
+  }
+
+  public record FieldError(String field, String message) {}
+}
+\end{javabox}
+
+\begin{javabox}[error/ApiExceptionHandler.java]
+@RestControllerAdvice
+public class ApiExceptionHandler {
+
+  @ExceptionHandler(MethodArgumentNotValidException.class)
+  @ResponseStatus(HttpStatus.BAD_REQUEST)
+  public ErrorResponse onValidation(
+      MethodArgumentNotValidException ex, HttpServletRequest req) {
+    List<ErrorResponse.FieldError> fields = ex.getBindingResult()
+        .getFieldErrors().stream()
+        .map(f -> new ErrorResponse.FieldError(
+            f.getField(), f.getDefaultMessage()))
+        .toList();
+    return ErrorResponse.of("VALIDATION_ERROR",
+        "Request validation failed", req.getRequestURI(), fields);
+  }
+
+  @ExceptionHandler(OrderNotFoundException.class)
+  @ResponseStatus(HttpStatus.NOT_FOUND)
+  public ErrorResponse onNotFound(
+      OrderNotFoundException ex, HttpServletRequest req) {
+    return ErrorResponse.of("NOT_FOUND", ex.getMessage(),
+        req.getRequestURI(), List.of());
+  }
+}
+\end{javabox}
+
+The error body every endpoint now emits, whatever failed:
+
+\begin{httpbox}[400 response body]
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+
+{
+  "code": "VALIDATION_ERROR",
+  "message": "Request validation failed",
+  "path": "/api/v1/orders",
+  "timestamp": "2026-07-18T10:15:30Z",
+  "errors": [
+    { "field": "customerId", "message": "must not be null" }
+  ]
+}
+\end{httpbox}
+
+\begin{secwarn}[never leak internals in errors]
+An error body is an attacker's map. Never let a stack trace, a SQL fragment, an entity class name, or an internal file path reach the client --- each one hands out reconnaissance for free. Spring's default \code{500} page and an unhandled exception both leak more than you think. Your \code{@RestControllerAdvice} must have a catch-all \code{@ExceptionHandler(Exception.class)} that logs the detail \emph{server-side} and returns a bland \code{500} body with a correlation id, never the exception message.
+\end{secwarn}
+
+\begin{prodtip}
+Put validation on the DTO, and \emph{business} rules in the service. \code{@NotNull} on \code{customerId} belongs on the record; "the customer must have an active account" belongs in \code{OrderService}, throwing a domain exception the advice maps to \code{409} or \code{422}. Do not put business logic inside the exception handler --- the advice is a translator, not a place to make decisions.
+\end{prodtip}
+
+\wbsub{3.5\quad Pagination, Filtering \& the Stable Envelope}
+
+\glabel{What is it?} A list endpoint must never return "all rows." \keyterm{Pagination} returns a bounded slice --- a page --- plus metadata about the whole set. Spring Data gives you \code{Pageable} (page number, size, sort) as a controller parameter and returns a \code{Page<T>} from the repository.
+
+\glabel{Why does it exist?} An unpaginated \code{getAll} is a latency and memory time-bomb: it works on 50 rows in dev and takes the service down on 5 million rows in production. It also transfers megabytes the client never renders. Pagination bounds the cost of every list call regardless of table size.
+
+\glabel{How does it work internally?} You accept a \code{Pageable}; Spring binds \code{?page=0\&size=20\&sort=createdAt,desc} from the query string. The repository translates it into \code{LIMIT}/\code{OFFSET} (plus a second \code{COUNT} query for the total). The result is a \code{Page<T>} carrying content and totals. Crucially, you must \emph{not} return the raw \code{Page<Entity>} --- Spring's \code{PageImpl} JSON shape is unstable across versions and, again, would serialise entities. Wrap it in your own envelope of DTOs.
+
+\begin{javabox}[dto/PageResponse.java]
+public record PageResponse<T>(
+    List<T> content, int page, int size,
+    long totalElements, int totalPages,
+    boolean first, boolean last) {
+
+  public static <T> PageResponse<T> from(Page<T> p) {
+    return new PageResponse<>(
+        p.getContent(), p.getNumber(), p.getSize(),
+        p.getTotalElements(), p.getTotalPages(),
+        p.isFirst(), p.isLast());
+  }
+}
+\end{javabox}
+
+\begin{wbfigure}{Fig 4.5 --- The pagination envelope: a bounded slice of DTOs plus the metadata a client needs to page through the whole set.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=64mm] (env) {\textbf{PageResponse}\\\scriptsize the stable outer shape you own};
+  \node[wbboxgood, below=of env, text width=64mm] (content) {\textbf{content}: [ OrderResponse, OrderResponse, \dots ]\\\scriptsize a bounded page of DTOs --- never entities};
+  \node[wbboxaccent, below=of content, text width=64mm] (meta) {\textbf{metadata}\\\scriptsize page · size · totalElements · totalPages · first · last};
+  \draw[wbarrow] (env)--(content); \draw[wbarrow] (env)--(meta);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{What about filtering?} For a couple of optional filters, plain \code{@RequestParam} query parameters are perfect: \code{?status=PENDING}. When filters multiply and must \emph{compose} arbitrarily, reach for JPA \keyterm{Specifications} (Criteria API under the hood) so that "status and customer and date-range" is built from small reusable predicates instead of exploding into \code{findByStatusAndCustomerAndCreatedBetween(...)} repository methods.
+
+\begin{perfnote}
+\code{OFFSET} pagination degrades on deep pages: \code{OFFSET 100000} makes the database scan and discard 100k rows before returning 20. For large or infinite feeds, prefer \keyterm{keyset (cursor) pagination} --- \code{WHERE created\_at < :lastSeen ORDER BY created\_at DESC LIMIT 20} --- which uses the index and stays constant-time no matter how deep the client scrolls. Offset paging is fine for admin tables of thousands; keyset is what powers social feeds of millions.
+\end{perfnote}
+
+\begin{dbinsight}
+Every paged query silently runs \emph{two} SQL statements: the \code{SELECT ... LIMIT} for the slice and a \code{SELECT COUNT(*)} for \code{totalElements}. On a huge, heavily-filtered table that count can cost more than the page itself. If you do not actually need the exact total (an infinite-scroll UI rarely does), use \code{Slice<T>} instead of \code{Page<T>} --- it fetches \code{size+1} rows to know if a next page exists and skips the count entirely.
+\end{dbinsight}
+
+\wbsub{3.6\quad Versioning \& OpenAPI Documentation}
+
+\glabel{What is it?} \keyterm{Versioning} is how your contract evolves without breaking existing clients. The three strategies: \keyterm{URI versioning} (\code{/api/v1/orders} --- most visible, most common, trivially explorable in a browser), \keyterm{header versioning} (\code{Accept: application/vnd.company.v2+json} --- cleaner URLs, harder to test by hand), and query-param versioning (rare). Pick one and be consistent; URI versioning is the pragmatic default and what ShopFlow uses.
+
+\glabel{When do you actually bump the version?} Only on a \emph{breaking} change --- removing a field, renaming one, changing a type, tightening validation. \keyterm{Additive} changes (a new optional field, a new endpoint, a new enum value clients can ignore) do not need a new version. Over-versioning is its own failure: every version is code you must keep alive for years.
+
+\begin{misconception}
+Cutting \code{v2} is not free and not a fresh start --- it is a promise to run \emph{both} \code{v1} and \code{v2} in production, often for years, until every client migrates. Teams that reach for a new version on every change drown in parallel code paths. The senior instinct is the opposite: exhaust additive, backward-compatible evolution first, and treat a version bump as a last resort with a real deprecation timeline.
+\end{misconception}
+
+\glabel{What is OpenAPI?} \keyterm{OpenAPI} is a machine-readable description of your API --- every path, method, parameter, request/response shape and status code. \code{springdoc-openapi} generates it directly from your controllers and DTOs and serves an interactive \keyterm{Swagger UI}. Frontend developers, QA, and API gateways all consume this spec; an undocumented endpoint is unfinished work, not a nice-to-have.
+
+\begin{javabox}[controller annotations]
+@Operation(summary = "Create a new order")
+@ApiResponses({
+  @ApiResponse(responseCode = "201", description = "Order created"),
+  @ApiResponse(responseCode = "400", description = "Validation failed")
+})
+@PostMapping
+public ResponseEntity<OrderResponse> create(
+    @Valid @RequestBody CreateOrderRequest req) { /* ... */ }
+\end{javabox}
+
+\begin{yamlbox}[application.yml --- springdoc]
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+\end{yamlbox}
+
+\begin{seniornote}
+Treat the OpenAPI spec as a build artifact, not documentation you write by hand. Because springdoc derives it from your code, it can never drift out of sync --- and you can export \code{/v3/api-docs} in CI and diff it between commits to \emph{catch breaking changes automatically} before they ship. A contract test that fails when a field disappears is worth more than any written changelog.
+\end{seniornote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Model resources as nouns; let the HTTP method be the verb. \code{POST /orders}, never \code{/createOrder}.
+  \item Return \code{201 Created} with a \code{Location} header pointing at the new resource.
+  \item Never expose entities --- request and response DTOs at every boundary, mapped explicitly.
+  \item Validate on the DTO; centralise every failure into one \code{ErrorResponse} shape.
+  \item Paginate list endpoints \emph{by default}; wrap the page in your own stable envelope.
+  \item Version only on breaking changes; document everything in OpenAPI from day one.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Using \code{GET} for actions that mutate state --- breaks caching and safety guarantees.
+  \item Returning \code{200} for everything with the real status buried in the body.
+  \item Exposing JPA entities, causing infinite serialisation loops and lazy-init errors.
+  \item Putting business logic inside the exception handler instead of the service layer.
+  \item Shipping an unpaginated \code{getAll} that works in dev and falls over in production.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have met five diagrams. Redraw two \emph{from memory} --- reproducing them is what moves a diagram from "recognised" to "known."
+
+\begin{writespace}[Redraw: the request \& error flow --- @Valid to a shaped 400, and the happy path to a 201]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the DTO wall --- entity, mapper, response DTO --- and label what must never cross it]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- The Order API}
+
+\textbf{Goal of this lab:} expose ShopFlow's first real, production-shaped endpoint --- \code{POST /api/v1/orders} --- with a full DTO layer, validation, a central error shape, and correct status codes. You will not paste a finished solution; you will build it step by step and watch each concern click into place.
+
+\resetlab
+\labstep{Create the request and response DTOs}
+In the \code{dto} package add \code{CreateOrderRequest}, \code{OrderItemRequest}, and \code{OrderResponse} as records, with \code{@NotNull}, \code{@NotEmpty} and \code{@Positive} constraints on the request side.
+\labwhy{The DTOs are the contract; defining them first forces you to decide exactly what crosses the boundary before any wiring exists.}
+
+\labstep{Write the mapper}
+Add \code{OrderMapper} with \code{toEntity(CreateOrderRequest)} and \code{toResponse(Order)}. Keep it a hand-written \code{@Component} --- no MapStruct yet.
+\labwhy{Hand-writing the mapper makes the entity/DTO wall visible; you literally see every field you choose to expose.}
+
+\labstep{Build the controller with correct status codes}
+Add \code{OrderController} mapped to \code{/api/v1/orders}. \code{create} takes \code{@Valid @RequestBody CreateOrderRequest} and returns \code{ResponseEntity.created(location).body(...)} for a \code{201} plus \code{Location}.
+\labwhy{The \code{201 + Location} pair is the single clearest signal to a client that a new resource now exists and where to find it.}
+
+\labstep{Add the centralised error handler}
+Create \code{ErrorResponse} and \code{ApiExceptionHandler} (\code{@RestControllerAdvice}). Handle \code{MethodArgumentNotValidException} $\rightarrow$ \code{400} and \code{OrderNotFoundException} $\rightarrow$ \code{404}, both returning the same shape.
+\labwhy{One advice bean means every endpoint you ever add inherits a consistent, professional error body for free.}
+
+\labstep{Add the paginated list endpoint}
+Add \code{GET /api/v1/orders} accepting an optional \code{status} \code{@RequestParam} and a \code{Pageable}, returning a \code{PageResponse<OrderResponse>} via your envelope.
+\labwhy{Wrapping \code{Page<T>} in your own envelope decouples the client from Spring's internal pagination JSON, which changes between versions.}
+
+\labstep{Wire up the not-found path}
+Add \code{GET /api/v1/orders/\{id\}}. In the service, throw \code{OrderNotFoundException} when the id is absent so the advice returns a shaped \code{404}.
+\labwhy{A missing resource is a \code{404} with your error body --- not a \code{500}, not an empty \code{200} --- and the service, not the controller, decides it.}
+
+\labstep{Turn on OpenAPI and read your own API}
+Add \code{springdoc-openapi-starter-webmvc-ui}, start the app, open \code{/swagger-ui.html}, and try every endpoint from the browser.
+\labwhy{Reading your API as an outside consumer exposes every unclear name and missing status code before a real frontend developer ever files a ticket.}
+
+\begin{prodtip}
+Do not test only the happy path. Send \code{POST /api/v1/orders} with an empty \code{items} list and a null \code{customerId}, and confirm you get a \code{400} with both field errors in the body. The moment your error shape survives a genuinely broken request is the moment the endpoint is actually done.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two --- make your reasoning explicit.
+
+\begin{thinkbox}
+A teammate proposes \code{POST /api/v1/orders/\{id\}/cancel} to cancel an order, arguing it "reads naturally." Is \code{cancel} a resource or an action? What is the more RESTful alternative, and when is the action-style URL actually the pragmatic choice?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your \code{POST /orders} is not idempotent, so a client that times out and retries may create two orders. Without changing the method, how could you make order creation safe to retry? (Hint: think about a client-supplied key.)
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You need to add a \code{discountCode} field that clients may send when creating an order. Does this require \code{/v2}? State the rule you are applying, then describe one change to the \emph{same} endpoint that \emph{would} force a version bump.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The infinite JSON that never ends}
+\textbf{Symptom.} \code{GET /api/v1/orders/1} hangs, then returns a \code{500} with a giant response and \code{StackOverflowError} in the logs. The order has line items.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderController.java]
+@GetMapping("/{id}")
+public Order getById(@PathVariable Long id) {   // returns the ENTITY
+  return orderRepository.findById(id).orElseThrow();
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The controller returns the JPA \code{Order} entity, which has a \code{List<OrderItem>} and each \code{OrderItem} has a back-reference to \code{Order}.
+  \item \textbf{Hypothesise.} Jackson serialises \code{Order} $\rightarrow$ \code{items} $\rightarrow$ each item's \code{order} $\rightarrow$ its \code{items} $\rightarrow$ forever.
+  \item \textbf{Verify.} Confirm the association is bidirectional and that no DTO sits between the entity and the response.
+  \item \textbf{Fix.} Return \code{OrderResponse} via the mapper; the DTO is flat and cannot cycle.
+  \item \textbf{Prevent.} Make "controllers return DTOs, never entities" a review rule --- an architecture test can even fail the build if a controller signature returns an \code{@Entity}.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Validation that quietly does nothing}
+\textbf{Symptom.} A \code{POST /api/v1/orders} with \code{customerId: null} and an empty \code{items} list returns \code{201 Created} instead of \code{400}. The bad order is persisted.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderController.java]
+@PostMapping
+public ResponseEntity<OrderResponse> create(
+    @RequestBody CreateOrderRequest req) {   // no @Valid
+  ...
+}
+\end{javabox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The constraints on the record are present, but no validation runs --- the request sails through.
+  \item \textbf{Hypothesise.} Without \code{@Valid} on the parameter, Spring never invokes the validator; annotations on the DTO are inert.
+  \item \textbf{Verify.} Add \code{@Valid} and resend the same body; expect \code{MethodArgumentNotValidException} and a \code{400}.
+  \item \textbf{Fix.} Add \code{@Valid} before \code{@RequestBody}; for a nested collection, ensure the element type is also marked (\code{@Valid List<OrderItemRequest>}).
+  \item \textbf{Prevent.} A test that posts a deliberately invalid body and asserts \code{400} --- validation you never test is validation you do not have.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Make correct status codes visible.\\
+\textbf{Context.} A controller returning a resource that may or may not exist.\\
+\textbf{Requirements.} Return \code{200} on a hit, a shaped \code{404} on a miss, and \code{201 + Location} on create.\\
+\textbf{Hints.} Use \code{ResponseEntity.created(uri)}; throw a domain exception for the miss and let the advice map it.\\
+\textbf{Expected outcome.} \code{curl -i} shows the exact status line and \code{Location} header for each path.\\
+\textbf{Common pitfalls.} Returning \code{200} with a \code{null} body for a miss instead of a real \code{404}.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Ship one consistent error shape across three failure types.\\
+\textbf{Context.} Validation errors, not-found, and a duplicate-order conflict.\\
+\textbf{Requirements.} One \code{@RestControllerAdvice} mapping \code{MethodArgumentNotValidException} $\rightarrow$ \code{400}, \code{OrderNotFoundException} $\rightarrow$ \code{404}, and a \code{DuplicateOrderException} $\rightarrow$ \code{409}, all returning the same \code{ErrorResponse}.\\
+\textbf{Hints.} Give each a distinct \code{code} string; keep \code{message} human-readable and safe.\\
+\textbf{Expected outcome.} Three different endpoints, three different status codes, one identical body structure.\\
+\textbf{Common pitfalls.} Putting the "is this a duplicate?" decision in the advice instead of the service.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} A composable, paginated, filtered list endpoint.\\
+\textbf{Context.} Ops need \code{GET /api/v1/orders} filterable by \code{status} and \code{customerId}, both optional, always paginated.\\
+\textbf{Requirements.} Use JPA \code{Specification}s to compose the optional filters; return a \code{PageResponse<OrderResponse>}; default to \code{size=20, sort=createdAt,desc}.\\
+\textbf{Hints.} Build each filter as a nullable \code{Specification} and \code{and()} together only the non-null ones.\\
+\textbf{Expected outcome.} Any combination of the two filters works, and the envelope reports correct \code{totalElements}/\code{totalPages}.\\
+\textbf{Common pitfalls.} Returning the raw \code{Page<Order>} (leaking entities and an unstable JSON shape) instead of your envelope of DTOs.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as reasoning, not trivia.
+
+\begin{seniornote}
+The controller is the thinnest layer in the whole system. Its entire job is: validate, map in, call one service method, map out, choose a status code. The moment you see a loop, an \code{if} about business state, or a repository call in a controller, the logic has leaked upward. A thin controller is not laziness --- it is what keeps your API contract independent of how the work actually gets done.
+\end{seniornote}
+
+\begin{interview}
+\emph{"How would you design centralised exception handling in Spring?"} The answer names the machinery and the boundary: a single \code{@RestControllerAdvice} with per-exception \code{@ExceptionHandler} methods, each mapping a domain exception to a status code and one shared \code{ErrorResponse}. Then the judgment: the advice \emph{translates}, it never decides --- business rules throw from the service; the advice only shapes the reply.
+\end{interview}
+
+\begin{perfnote}
+The cheapest API performance win is not caching --- it is not sending data. A response DTO that projects only the four fields a client renders beats returning a fat entity graph on every axis: less JSON to serialise, less to transfer, fewer lazy loads, smaller GC pressure. "Return less" scales further than "return faster."
+\end{perfnote}
+
+\begin{prodtip}
+Give every error response a correlation id (a request-scoped UUID, also logged server-side and returned in a header). When a user reports "I got an error," that id turns a needle-in-a-haystack log search into a single grep. It costs one filter to add and pays for itself the first time production breaks.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+Days 1--3 gave ShopFlow its skeleton: a layered Spring Boot module (Day 1), raw-SQL fluency (Day 2), and JPA entities plus repositories --- \code{Order}, \code{OrderItem}, and their queries (Day 3). Today you put a real, professional face on that domain: the Order API.
+
+\begin{buildalong}[Day 04 --- the Order API]
+\begin{wbitem}
+  \item \textbf{DTO layer.} \code{CreateOrderRequest}, \code{OrderItemRequest}, \code{OrderResponse} records in \code{dto}, plus a hand-written \code{OrderMapper} --- entities never cross the boundary.
+  \item \textbf{POST /api/v1/orders.} \code{@Valid @RequestBody}, delegates to \code{OrderService}, returns \code{201 Created} with a \code{Location} header pointing at the new order.
+  \item \textbf{GET /api/v1/orders?status=\&page=\&size=.} Optional \code{status} filter and a \code{Pageable}, returning a \code{PageResponse<OrderResponse>} envelope with correct totals.
+  \item \textbf{GET /api/v1/orders/\{id\}.} Returns the order DTO, or a shaped \code{404} via \code{OrderNotFoundException} thrown from the service.
+  \item \textbf{Central error shape.} One \code{@RestControllerAdvice} mapping validation $\rightarrow$ \code{400}, not-found $\rightarrow$ \code{404}, conflict $\rightarrow$ \code{409}, all returning the same \code{ErrorResponse}.
+  \item \textbf{OpenAPI.} Add springdoc, annotate the endpoints, and confirm \code{/swagger-ui.html} lists all three paths with their status codes.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} all three endpoints work with correct status codes on every path (including validation \code{400} and not-found \code{404}); every response --- success or failure --- is a DTO with a stable shape; the list endpoint is paginated by default; and the whole API is browsable in Swagger UI. ShopFlow now has a contract the rest of the world can build on.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item An API is a contract; DTOs, validation, error shape, pagination and versioning all exist to keep it stable.
+  \item Resources are nouns, methods are verbs, and status codes are the machine-readable outcome --- get all three right.
+  \item Never return entities: map to DTOs to avoid schema coupling, leaked fields, and serialisation cycles.
+  \item Validate at the boundary with \code{@Valid}; centralise every failure into one \code{@RestControllerAdvice} shape.
+  \item Paginate lists by default behind your own envelope; version only on breaking changes; document with OpenAPI.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{@Valid} is what \emph{triggers} validation --- the annotations on the DTO do nothing without it.
+  \item \code{201 Created} carries a \code{Location} header; \code{404} and \code{400} carry your \code{ErrorResponse}, never a stack trace.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Exposing entities $\rightarrow$ infinite JSON \& lazy-init \code{500}s. \quad$\bullet$\quad Missing \code{@Valid} $\rightarrow$ validation silently skipped.
+  \item Unpaginated \code{getAll} $\rightarrow$ production incident at scale. \quad$\bullet$\quad Business logic in the advice $\rightarrow$ tangled failures.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Methods}{GET safe+idempotent · PUT/DELETE idempotent · POST neither · PATCH partial.}
+\cheatitem{Status codes}{201+Location on create · 400 validation · 401 who? · 403 not allowed · 404 missing · 409 conflict.}
+\cheatitem{DTO rule}{controllers return DTOs, never entities --- map explicitly at the boundary.}
+\cheatitem{Validation}{constraints on the DTO + \code{@Valid} on the parameter + one \code{@RestControllerAdvice}.}
+\cheatitem{Pagination}{accept \code{Pageable}, wrap \code{Page<T>} in your own \code{PageResponse} envelope of DTOs.}
+\cheatitem{Versioning}{URI \code{/v1}; bump only on breaking changes; additive changes need no new version.}
+\cheatitem{Docs}{springdoc generates OpenAPI + Swagger UI from your controllers --- an undocumented endpoint is unfinished.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the difference between \code{PUT} and \code{PATCH}?}
+\iq{Why is idempotency important, and which HTTP methods are idempotent?}
+\iq{How do you version a public API without breaking existing clients?}
+\iq{How would you design centralised exception handling in Spring?}
+\iq{Why should you never return JPA entities directly from a controller?}
+\iq{401 versus 403 --- what is the actual difference?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Spring Framework Reference} --- "Web MVC" (controllers, \code{ResponseEntity}, exception handling).
+  \item \emph{RFC 9110} --- HTTP Semantics: the authoritative definition of methods and status codes.
+  \item \emph{springdoc-openapi} docs and the Stripe / GitHub public API references as models of contract discipline.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 5).} Your API now speaks clearly --- but it lets anyone in. Tomorrow you put a guard at the door: Spring Security, the filter chain that runs \emph{before} your controllers, authentication versus authorisation, and how a \code{401} and a \code{403} actually get produced. The error shapes you built today are exactly what the security layer will reuse.
+\end{keyidea}

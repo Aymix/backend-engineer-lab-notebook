@@ -1,0 +1,551 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 06 ============================
+\daychapter{06}{Quality}{Testing}{Unit, integration \& real-world confidence --- the test pyramid in practice}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Write unit tests that isolate a single class with Mockito --- and recognise the moment one quietly turns into a slow integration test.
+  \item Stand up a real, ephemeral PostgreSQL with Testcontainers so your data-layer tests catch dialect bugs H2 hides.
+  \item Test controllers through the real HTTP machinery with \code{@WebMvcTest} and \code{MockMvc} --- status codes, validation, and the \code{401}/\code{403} paths Day 5 added --- without booting a server.
+  \item Decide deliberately \emph{what to test at each layer}, and just as deliberately what not to bother testing.
+  \item Prove a business rule and detect an N+1 with tests that assert \emph{behaviour}, not implementation detail.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} For five days you have been \emph{building} ShopFlow --- a container of beans (Day 1), a persistence layer (Days 2--3), a REST API (Day 4), a JWT security chain (Day 5). Every one of those days ended with ``it works on my machine.'' Today answers a harder question: \emph{how do you know it still works tomorrow, after the next change, without clicking through the app by hand every time?} Testing is the machinery that turns ``I think it works'' into ``I can prove it works, in ninety seconds, before every commit.''
+
+\glabel{Why backend engineers need it.} A backend without tests is not slower to change --- it is \emph{dangerous} to change. The business rules you encoded (an order cannot exceed available stock; a total is the sum of its line items; a \code{PENDING} order may move to \code{PAID} but never back) are invisible and fragile. One refactor silently breaks one of them, and the first person to notice is a customer or an auditor. Tests make those rules executable and self-defending. They are also how you refactor with confidence --- exactly the skill Day 7 (clean architecture) will demand of you.
+
+\glabel{Where it fits in a Spring Boot application.} Testing is not a layer of the application; it is a \emph{net stretched under every layer}. Each layer you already built has a test tool matched to its shape: the service layer wants fast isolated unit tests, the repository wants a real database, the controller wants real HTTP without a real server. Picking the wrong tool for a layer is the single most common testing mistake --- and the reason so many suites are both slow \emph{and} low-confidence.
+
+\begin{wbfigure}{Fig 6.1 --- Testing is a net under the stack you already built. Each layer has a tool matched to its shape.}
+\wbscale{\begin{tikzpicture}[node distance=4mm and 16mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=38mm] (ctrl) {\textbf{Controller + Security}\\\scriptsize Day 4 · Day 5};
+  \node[wbbox, below=of ctrl, text width=38mm] (svc) {\textbf{Service}\\\scriptsize Day 1 --- business rules};
+  \node[wbbox, below=of svc, text width=38mm] (repo) {\textbf{Repository}\\\scriptsize Day 2 · Day 3 --- SQL};
+  \node[wbboxaccent, right=of ctrl, text width=42mm] (webt) {\textbf{@WebMvcTest + MockMvc}\\\scriptsize 200/400/404/401/403};
+  \node[wbboxgood, right=of svc, text width=42mm] (unit) {\textbf{JUnit 5 + Mockito}\\\scriptsize fast, isolated, many};
+  \node[wbboxdb, right=of repo, text width=42mm] (tc) {\textbf{Testcontainers}\\\scriptsize real PostgreSQL};
+  \draw[wbarrow] (ctrl)--(webt); \draw[wbarrow] (svc)--(unit); \draw[wbarrow] (repo)--(tc);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Every good habit from earlier days pays off here. Constructor injection (Day 1) is what lets you build a service in a test with plain \code{new} and hand it fake collaborators --- no Spring context, no reflection. The proxies you studied (Day 1) are why a \code{@Transactional} rollback is worth an explicit test. The N+1 query trap (Day 3) becomes a thing you can now \emph{catch automatically}. The JWT filter chain (Day 5) is why your controller tests must cover \code{401} and \code{403}, not just the happy path.
+
+\glabel{Real company examples.} Google popularised the ``test pyramid'' vocabulary and reports engineers run unit tests thousands of times a day. Testcontainers began at a handful of teams and is now standard at companies like Spotify and Zalando precisely because ``passes on H2, fails on Postgres'' cost them real incidents. At scale the economics are brutal and simple: a bug caught by a unit test costs seconds; the same bug caught in production costs an on-call engineer, a rollback, and trust.
+
+\begin{keyidea}
+A test suite is not a chore you add at the end --- it is a \keyterm{design tool} and a \keyterm{safety net}. The shape of your suite (many fast unit tests, fewer integration tests, a handful of end-to-end tests) determines whether you \emph{actually run it}. A suite you dread running protects nothing. Speed is a feature.
+\end{keyidea}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one shape. Read the pyramid bottom-to-top: the wide base is cheap and fast and there is a lot of it; the narrow tip is expensive and slow and there is very little of it. Width is quantity; height is cost.
+
+\begin{wbfigure}{Fig 6.2 --- The test pyramid. Width = how many you write; height = how slow and costly each one is.}
+\wbscale{\begin{tikzpicture}[node distance=3mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxwarn, text width=30mm, minimum height=9mm] (e2e) {\textbf{E2E}\\\scriptsize few · slow · minutes};
+  \node[wbboxaccent, below=of e2e, text width=64mm, minimum height=10mm] (int) {\textbf{Integration}\\\scriptsize Testcontainers · @WebMvcTest · seconds};
+  \node[wbboxgood, below=of int, text width=98mm, minimum height=11mm] (unit) {\textbf{Unit tests}\\\scriptsize JUnit 5 + Mockito · fast · milliseconds · many};
+  \node[wbcap, right=5mm of e2e, text width=26mm, anchor=west] {expensive, brittle --- reserve for critical journeys};
+  \node[wbcap, right=5mm of unit, text width=26mm, anchor=west] {cheap, precise --- your first line of defence};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{unit test} $\rightarrow$ \keyterm{test double} (mock / stub / spy / fake) $\rightarrow$ \keyterm{Mockito} $\rightarrow$ \keyterm{integration test} $\rightarrow$ \keyterm{Testcontainers} $\rightarrow$ \keyterm{slice test} (\keyterm{@WebMvcTest}) $\rightarrow$ \keyterm{MockMvc} $\rightarrow$ \keyterm{arrange--act--assert}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Test Pyramid --- why shape decides everything}
+
+\glabel{What is it?} The \keyterm{test pyramid} is a rule of thumb for the \emph{proportion} of test types in a healthy suite: a broad base of unit tests, a thinner band of integration tests, and a sliver of end-to-end tests. It is a shape you aim for, not a law.
+
+\glabel{Why does it exist?} Because tests trade off along two axes: \keyterm{speed} and \keyterm{fidelity}. A unit test runs in a millisecond but only proves one class behaves in isolation. An end-to-end test proves the real system works but takes minutes, needs the whole stack up, and fails for a dozen unrelated reasons (flaky network, slow container, a shared test database someone else mutated). If you invert the pyramid --- many slow broad tests, few fast ones --- the suite becomes so slow and flaky that engineers stop running it. A suite nobody runs has negative value: it costs maintenance and provides no protection.
+
+\glabel{How does it work internally?} Feedback speed compounds. Suppose a change breaks a business rule. With a fast unit test you learn in two seconds, at your desk, from a precise message pointing at one method. With only an end-to-end test you learn ten minutes later, in CI, from a failure that says ``expected 200 got 500'' with no hint which of forty classes is at fault. The pyramid is really a statement about \emph{where you want failures to surface}: as close to the cause, and as early, as possible.
+
+\begin{seniornote}
+The pyramid is a default, not a dogma. Some mature teams deliberately run a ``testing trophy'' shape --- fewer pure unit tests, a fat middle of integration tests --- because for a thin CRUD service most bugs live in wiring and SQL, not in branching logic. The point is never ``obey the shape.'' It is: \emph{spend your test budget where your bugs actually are}, and keep the fast tests fast enough to run constantly.
+\end{seniornote}
+
+\wbsub{3.2\quad Unit Testing with JUnit 5 \& Mockito}
+
+\glabel{What is it?} A \keyterm{unit test} exercises one class --- the \keyterm{class under test} --- while replacing its collaborators with \keyterm{test doubles}. \keyterm{JUnit 5} is the test runner and assertion framework; \keyterm{Mockito} is the library that fabricates the fake collaborators.
+
+\glabel{Why does it exist?} You want to test that \code{OrderService.placeOrder} throws \code{OutOfStockException} when stock is zero --- \emph{without} a database, a web server, or a real \code{ProductRepository}. Isolation buys you speed (no I/O) and precision (a failure can only mean the service logic is wrong, because everything else is a controlled fake).
+
+\glabel{How does it work internally?} \code{@Mock} asks Mockito to generate, at runtime, a subclass of the collaborator whose every method returns a harmless default (\code{null}, \code{0}, empty \code{Optional}) until you say otherwise. Mockito builds that subclass with ByteBuddy --- the same bytecode trick Spring uses for proxies. \code{when(mock.method()).thenReturn(x)} records a \keyterm{stub}: ``when this is called, answer \code{x}.'' \code{verify(mock).method()} checks an \keyterm{interaction} happened. \code{@InjectMocks} constructs the real class under test and pushes the mocks in --- trying constructor injection first, which is exactly why the Day 1 habit matters.
+
+\begin{wbfigure}{Fig 6.3 --- Unit isolation: real service in the middle, fabricated collaborators around it, assertions on the outputs.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=32mm] (m1) {\textbf{ProductRepository}\\\scriptsize @Mock (stubbed)};
+  \node[wbboxghost, right=of m1, text width=32mm] (m2) {\textbf{OrderRepository}\\\scriptsize @Mock (verified)};
+  \node[wbboxaccent, below=8mm of m1, xshift=21mm, text width=40mm] (cut) {\textbf{OrderService}\\\scriptsize the real class under test};
+  \node[wbboxgood, below=7mm of cut, text width=40mm] (assert) {\textbf{Assertions}\\\scriptsize thrown exception · no save()};
+  \draw[wbarrow] (m1) -- (cut); \draw[wbarrow] (m2) -- (cut);
+  \draw[wbarrow] (cut) -- (assert);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[OrderServiceTest.java]
+@ExtendWith(MockitoExtension.class)
+class OrderServiceTest {
+
+  @Mock  OrderRepository orderRepository;
+  @Mock  ProductRepository productRepository;
+  @InjectMocks OrderService orderService;
+
+  @Test
+  void throwsWhenProductOutOfStock() {
+    // arrange: a product that exists but has zero stock
+    when(productRepository.findById(1L))
+        .thenReturn(Optional.of(new Product(1L, "Widget", 0)));
+
+    // act + assert: the rule fires
+    assertThatThrownBy(() ->
+        orderService.placeOrder(new OrderRequest(1L, 5)))
+      .isInstanceOf(OutOfStockException.class);
+
+    // and nothing was written
+    verify(orderRepository, never()).save(any());
+  }
+}
+\end{javabox}
+
+\glabel{When should I use it?} For every branch of real logic: the out-of-stock throw, the totals calculation, each legal and illegal status transition, boundary values (ordering exactly the remaining stock, ordering zero). This is where the bulk of your tests should live.
+
+\glabel{When should I \emph{not}?} Do not unit-test framework behaviour (that Spring injects a bean, that Jackson serialises a field), getters and setters, or a method that only delegates. And the moment your ``unit'' test needs a real database or the Spring context to pass, it is no longer a unit test --- move it down to the integration band and stop pretending.
+
+\begin{prodtip}
+Use \keyterm{AssertJ} (\code{assertThat(...).isEqualTo(...)}, \code{assertThatThrownBy(...)}) rather than raw \code{assertEquals}. Its fluent chains read like a sentence, produce far better failure messages (``expected total 40 but was 35'' instead of ``expected 40 was 35'' with no context), and its collection assertions (\code{containsExactly}, \code{extracting}) turn three lines of loop into one readable line. It ships inside \code{spring-boot-starter-test}.
+\end{prodtip}
+
+\begin{misconception}
+``More mocking means a better unit test.'' The opposite is usually true. If a test mocks so much that it only asserts \emph{that mocks were called in a certain order}, it tests your implementation's internal wiring, not its behaviour --- so it breaks on every refactor and catches no real bug. Mock only what you must to gain isolation (I/O, collaborators you do not own). Prefer asserting on \emph{return values and thrown exceptions} over \code{verify(...)} on interactions.
+\end{misconception}
+
+\begin{behind}
+A ``mock'' is only one kind of \keyterm{test double}. A \keyterm{stub} returns canned answers (\code{thenReturn}). A \keyterm{mock} additionally lets you assert interactions (\code{verify}). A \keyterm{spy} wraps a \emph{real} object and intercepts only the methods you override. A \keyterm{fake} is a lightweight working implementation (an in-memory map standing in for a repository). Mockito's \code{@Mock} gives you a stub-and-mock hybrid; reach for a real object or a fake when behaviour, not interaction, is what you care about.
+\end{behind}
+
+\wbsub{3.3\quad Integration Testing with Testcontainers}
+
+\glabel{What is it?} An \keyterm{integration test} exercises several real components together --- your repository against a real database, your mappings against real SQL. \keyterm{Testcontainers} is a library that starts a throwaway Docker container (a real PostgreSQL) for the test run and tears it down afterwards.
+
+\glabel{Why does it exist?} The old shortcut was an in-memory H2 database: fast, no Docker, boots instantly. The problem is that H2 is \emph{not} PostgreSQL. Its ``PostgreSQL compatibility mode'' still differs on the things that bite you in production: \code{JSONB} and array columns, identity/sequence behaviour, \code{ON CONFLICT} upserts, \code{RETURNING}, case-folding of unquoted identifiers, \code{ILIKE}, and window-function edge cases. A query that is green on H2 can throw at runtime on real Postgres. Testcontainers removes the entire category of ``works on the fake database'' bugs by testing against the real engine.
+
+\glabel{How does it work internally?} Testcontainers talks to your local Docker daemon, pulls \code{postgres:16-alpine} (cached after the first run), and starts a container on a random free port. Because the port is random, you cannot hard-code the JDBC URL --- so \code{@DynamicPropertySource} feeds the live URL, username and password into Spring's \code{Environment} \emph{before} the context starts, and the app connects to the ephemeral database as if it were production.
+
+\begin{wbfigure}{Fig 6.4 --- The Testcontainers lifecycle: a real database is born for the test run and dies with it.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=82mm, minimum height=8mm, align=left, text width=76mm}]
+  \node[stg] (s1) {\textbf{1 · Start} \hfill \scriptsize Docker pulls \& runs postgres:16 on a random port};
+  \node[stg, wbboxaccent, below=of s1] (s2) {\textbf{2 · Wire} \hfill \scriptsize @DynamicPropertySource injects the live JDBC URL};
+  \node[stg, below=of s2] (s3) {\textbf{3 · Migrate} \hfill \scriptsize schema created (Flyway / ddl-auto) on real Postgres};
+  \node[stg, wbboxgood, below=of s3] (s4) {\textbf{4 · Test} \hfill \scriptsize repository queries run against the real engine};
+  \node[stg, wbboxghost, below=of s4] (s5) {\textbf{5 · Destroy} \hfill \scriptsize container stopped \& removed --- no state leaks};
+  \foreach \a/\b in {s1/s2,s2/s3,s3/s4,s4/s5}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[OrderRepositoryIT.java]
+@DataJpaTest
+@Testcontainers
+@AutoConfigureTestDatabase(replace = NONE)  // do NOT swap in H2
+class OrderRepositoryIT {
+
+  @Container
+  static PostgreSQLContainer<?> postgres =
+      new PostgreSQLContainer<>("postgres:16-alpine");
+
+  @DynamicPropertySource
+  static void props(DynamicPropertyRegistry registry) {
+    registry.add("spring.datasource.url", postgres::getJdbcUrl);
+    registry.add("spring.datasource.username", postgres::getUsername);
+    registry.add("spring.datasource.password", postgres::getPassword);
+  }
+
+  @Autowired OrderRepository orderRepository;
+
+  @Test
+  void savesAndReloadsOrder() {
+    Order saved = orderRepository.save(newPendingOrder());
+    assertThat(orderRepository.findById(saved.getId())).isPresent();
+  }
+}
+\end{javabox}
+
+\glabel{Catching the N+1 (Day 3) automatically.} The most valuable repository test proves a query does \emph{not} explode into one query per row. Hibernate exposes a live statement counter; assert on it. This turns the abstract ``avoid N+1'' rule into a regression test that fails the day someone drops a \code{JOIN FETCH}.
+
+\begin{javabox}[NPlusOneIT.java]
+@Test
+void loadingOrdersWithItemsRunsOneQuery() {
+  var stats = entityManagerFactory
+      .unwrap(SessionFactory.class).getStatistics();
+  stats.setStatisticsEnabled(true);
+  stats.clear();
+
+  List<Order> orders = orderRepository.findAllWithItems(); // JOIN FETCH
+  orders.forEach(o -> o.getItems().size());  // touch the collection
+
+  // one SELECT total, not 1 + N
+  assertThat(stats.getPrepareStatementCount()).isEqualTo(1);
+}
+\end{javabox}
+
+\begin{dbinsight}
+The whole reason to prefer a real Postgres here is fidelity. H2 will happily accept SQL that Postgres rejects and vice-versa, and it silently ``fixes'' things Postgres is strict about --- identifier case, transaction isolation defaults, type coercion. Testing persistence on H2 is like testing a bridge with a cardboard model: it tells you the shape is roughly right, not that it holds weight.
+\end{dbinsight}
+
+\begin{perfnote}
+Starting a container costs a second or two. Do not pay it per test. Make the container \code{static} so one instance is shared across all methods in the class, and enable Testcontainers' \keyterm{reusable containers} (or the Singleton-container pattern) so the same database is reused across test \emph{classes} in a run. Better still: run all your Testcontainers ITs in one Gradle/Maven task so the JVM and Docker warm-up amortise. Speed is what keeps you running them.
+\end{perfnote}
+
+\wbsub{3.4\quad Controller Testing with \code{@WebMvcTest} \& MockMvc}
+
+\glabel{What is it?} \code{@WebMvcTest} is a \keyterm{slice test}: it boots only the web layer --- your controller, the JSON converters, validation, exception handlers, and (if it is on the classpath) the Spring Security filter chain --- and nothing else. \keyterm{MockMvc} then drives it by simulating HTTP requests \emph{in-process}, with no real server or socket.
+
+\glabel{Why does it exist?} You want to prove that \code{POST /api/v1/orders} returns \code{400} for an invalid body, \code{404} for a missing product, \code{201} on success, and --- since Day 5 --- \code{401} without a token and \code{403} for the wrong role. A full \code{@SpringBootTest} could do this but boots the entire context (database, security, every bean) and runs an order of magnitude slower. The slice gives you real HTTP semantics at unit-test speed by mocking the service layer with \code{@MockBean}.
+
+\glabel{How does it work internally?} \code{@WebMvcTest(OrderController.class)} tells Spring to register only that controller and the MVC infrastructure, and to leave \code{@Service}/\code{@Repository} beans out. You supply the collaborators the controller needs as \code{@MockBean OrderService} --- a Mockito mock \emph{registered in the context} so the controller can be wired. \code{MockMvc.perform(...)} builds a \code{MockHttpServletRequest}, pushes it through the real \code{DispatcherServlet} and filter chain, and hands you the response to assert on.
+
+\begin{wbfigure}{Fig 6.5 --- The slice (left) loads only the web layer and mocks the service; the full context (right) loads everything.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=44mm] (slice) {\textbf{@WebMvcTest}\\\scriptsize loads: controller · filters ·\\validation · Jackson · security\\\smallskip service = @MockBean};
+  \node[wbboxghost, right=of slice, text width=44mm] (full) {\textbf{@SpringBootTest}\\\scriptsize loads: the whole context ---\\every bean, DB, security\\\smallskip real service · slow · rare};
+  \node[wbcap, below=3mm of slice, text width=44mm] {fast --- run many};
+  \node[wbcap, below=3mm of full, text width=44mm] {slow --- a handful only};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[OrderControllerTest.java]
+@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+
+  @Autowired MockMvc mockMvc;
+  @MockBean  OrderService orderService;
+
+  @Test
+  @WithMockUser(roles = "CUSTOMER")            // authenticated
+  void returns400OnInvalidBody() throws Exception {
+    mockMvc.perform(post("/api/v1/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content("{}"))                    // fails @Valid
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void returns401WhenNoToken() throws Exception {   // no @WithMockUser
+    mockMvc.perform(post("/api/v1/orders")
+            .contentType(MediaType.APPLICATION_JSON)
+            .content(validBody()))
+        .andExpect(status().isUnauthorized());
+  }
+
+  @Test
+  @WithMockUser(roles = "CUSTOMER")            // lacks ADMIN
+  void returns403OnAdminOnlyEndpoint() throws Exception {
+    mockMvc.perform(delete("/api/v1/orders/1"))
+        .andExpect(status().isForbidden());
+  }
+}
+\end{javabox}
+
+\begin{secwarn}[401 is not 403]
+Test both, and know the difference cold. \code{401 Unauthorized} means ``I do not know who you are'' --- no token, or an invalid/expired one; the Day 5 \code{ExceptionTranslationFilter} produces it. \code{403 Forbidden} means ``I know who you are, and you may not do this'' --- a valid token but the wrong role. A suite that only checks the happy path will happily ship an endpoint that returns \code{200} to anonymous callers. To exercise security inside the slice you need \code{spring-security-test} on the classpath and \code{@WithMockUser} (or \code{SecurityMockMvcRequestPostProcessors.jwt()} for token-shaped auth).
+\end{secwarn}
+
+\wbsub{3.5\quad What (and what NOT) to test at each layer}
+
+\glabel{The one table to internalise.} Match the tool to the layer, and know what each layer is \emph{for}. Testing business rules with a full \code{@SpringBootTest} is slow and imprecise; testing SQL with a mock proves nothing about the SQL.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{22mm} L{40mm} X@{}}
+\wbtablehead{Layer} & \wbtablehead{Tool} & \wbtablehead{What you actually test}\\\midrule
+Service & JUnit 5 + Mockito & Business rules, edge cases, thrown exceptions\\
+Repository & Testcontainers (real Postgres) & Query correctness, constraints, N+1\\
+Controller & \code{@WebMvcTest} + MockMvc & Status codes, validation, JSON shape, auth\\
+Full flow & \code{@SpringBootTest} + Testcontainers & A few critical journeys only (checkout, login)\\
+\end{tabularx}\end{center}
+
+\glabel{What NOT to test, ever.} Getters, setters, and \code{equals}/\code{hashCode} generated by Lombok or the compiler. That the framework injects a bean. That Jackson serialises a public field. Third-party library internals. Trivial delegation methods. Every one of these is either guaranteed by the platform or so trivial that a test costs more to maintain than the bug it could catch is worth.
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Name tests by behaviour: \code{throwsWhenProductOutOfStock}, never \code{test1}. The name is the spec.
+  \item One logical assertion focus per test; use AssertJ for readable failures.
+  \item Prefer Testcontainers over H2 for anything that touches real SQL semantics.
+  \item Keep full-context \code{@SpringBootTest} tests rare --- they are slow; use slices and units by default.
+  \item Follow \keyterm{arrange--act--assert}; keep each test independent and order-free.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Mocking so much the test only verifies mocks were called, not real behaviour.
+  \item Using H2 for integration tests and missing real Postgres-specific bugs.
+  \item Testing getters/setters and framework code instead of business logic.
+  \item Flaky tests from shared mutable state, real network calls, or clock/time-of-day dependence.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You met five diagrams; reproduce two \emph{from memory} below. Redrawing is what moves a picture from ``recognised'' to ``known.''
+
+\begin{writespace}[Redraw: the test pyramid, with speed/cost on one axis and quantity on the other]
+\reflectionlines[5]
+\end{writespace}
+
+\begin{writespace}[Redraw: the Testcontainers lifecycle, from ``start container'' to ``destroy'']
+\reflectionlines[5]
+\end{writespace}
+
+One consolidating picture --- the feedback loop that makes the pyramid worth its shape:
+
+\begin{wbfigure}{Fig 6.6 --- The feedback spectrum: the faster the test, the tighter the loop, the earlier the bug dies.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxgood, text width=30mm] (u) {\textbf{Unit}\\\scriptsize milliseconds\\at your desk};
+  \node[wbboxaccent, right=of u, text width=30mm] (i) {\textbf{Integration}\\\scriptsize seconds\\pre-commit};
+  \node[wbboxwarn, right=of i, text width=30mm] (e) {\textbf{E2E}\\\scriptsize minutes\\in CI};
+  \draw[wbarrow] (u)--(i); \draw[wbarrow] (i)--(e);
+  \node[wbcap, below=3mm of i, text width=90mm] {cost of a caught bug rises left $\rightarrow$ right; run the cheap ones constantly};
+\end{tikzpicture}}
+\end{wbfigure}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Testing the Order API}
+
+\textbf{Goal of this lab:} give ShopFlow's order-placement flow real coverage --- unit tests for every rule, a Testcontainers repository test, and \code{@WebMvcTest} tests including the Day 5 auth paths. Guide yourself through the steps; do not paste a finished suite. The learning is in watching each test go red, then green.
+
+\resetlab
+\labstep{Add the test dependencies}
+\code{spring-boot-starter-test} already brings JUnit 5, Mockito and AssertJ. Add the Testcontainers BOM plus \code{testcontainers:postgresql} and \code{testcontainers:junit-jupiter}, and \code{spring-security-test} for the auth tests.
+\labwhy{Getting the dependency set right once means every later test just works; \code{spring-security-test} is the piece juniors always forget when their \code{401} test refuses to compile.}
+
+\labstep{Unit-test the out-of-stock rule}
+With \code{@ExtendWith(MockitoExtension.class)}, \code{@Mock} the two repositories and \code{@InjectMocks} the service. Stub a zero-stock product and assert \code{placeOrder} throws, and that \code{save} was \emph{never} called.
+\labwhy{This is the canonical isolated unit test --- no database, no context, sub-millisecond --- and it locks down a rule that protects real inventory.}
+
+\labstep{Unit-test totals and status transitions}
+Add tests: the order total equals the sum of \code{quantity * unitPrice} across line items; a \code{PENDING} order may transition to \code{PAID}; a \code{PAID} order may \emph{not} transition back to \code{PENDING} (expect an exception).
+\labwhy{State machines and money are where silent bugs hide; each branch deserves its own named test so a failure tells you exactly which rule broke.}
+
+\labstep{Write the Testcontainers repository test}
+Use \code{@DataJpaTest} with \code{@AutoConfigureTestDatabase(replace = NONE)} and a \code{static PostgreSQLContainer}, wired via \code{@DynamicPropertySource}. Save an order with items, reload it, and assert the graph came back intact.
+\labwhy{This proves your JPA mappings work against the real engine you deploy on --- not against H2's approximation of it.}
+
+\labstep{Prove there is no N+1}
+Enable Hibernate statistics, call your \code{findAllWithItems()} (the \code{JOIN FETCH} query from Day 3), touch each order's items, and assert the prepared-statement count is exactly one.
+\labwhy{An N+1 is invisible until production load makes it a fire; this test makes the regression fail in CI the moment someone removes the fetch join.}
+
+\labstep{Slice-test the controller for 200/400/404}
+With \code{@WebMvcTest(OrderController.class)} and \code{@MockBean OrderService}, cover: a valid request returns \code{201}/\code{200}; an empty body fails validation with \code{400}; a service that throws ``product not found'' maps to \code{404}.
+\labwhy{You are testing real HTTP semantics --- status codes, validation wiring, exception-to-status mapping --- without paying for a full context.}
+
+\labstep{Add the auth paths (401 \& 403)}
+Add a test with no \code{@WithMockUser} that expects \code{401}, and one with a \code{CUSTOMER} role hitting an admin-only endpoint that expects \code{403}.
+\labwhy{Day 5 added a security filter chain; an API test suite that ignores it will ship an endpoint open to the world and never notice.}
+
+\begin{prodtip}
+Measure your suite. Run it with timing on (\code{mvn test} surfaces per-class times; Gradle's build scan ranks them) and find the slowest tests. Nine times out of ten the slow ones are accidental \code{@SpringBootTest} runs that should have been slices or units. Speeding up the slowest 5\% often halves total suite time --- and a suite that runs in seconds is a suite you run before every commit.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two --- the goal is to make your reasoning explicit.
+
+\begin{thinkbox}
+A colleague says ``we have 95\% code coverage, so we are well tested.'' Coverage measures which lines \emph{ran} during tests, not whether anything was \emph{asserted}. Describe a test suite with high coverage that catches almost no bugs. What would you measure instead?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your \code{OrderService} unit test needs a real \code{OrderRepository} to pass, so you \code{@Autowired} it and add \code{@SpringBootTest}. It still passes. What did you lose by doing this, and at what point should you have moved the test to a different layer of the pyramid?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Testcontainers gives you a real Postgres but starts a container. Where is the boundary between ``worth the seconds'' and ``too slow to keep''? How would you decide which handful of flows deserve a full \code{@SpringBootTest} + Testcontainers end-to-end test?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The green test that proves nothing}
+\textbf{Symptom.} \code{placeOrderSavesOrder} passes, yet in production orders are silently not persisted. The test is green; the feature is broken.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[OrderServiceTest.java]
+@Test
+void placeOrderSavesOrder() {
+  when(productRepository.findById(1L))
+      .thenReturn(Optional.of(new Product(1L, "Widget", 100)));
+  when(orderRepository.save(any())).thenReturn(new Order(1L));
+
+  Order result = orderService.placeOrder(new OrderRequest(1L, 2));
+
+  verify(orderRepository).save(any());   // the only assertion
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The test only asserts that \code{save} was \emph{called} with \code{any()} --- it never checks \emph{what} was saved, nor the returned order.
+  \item \textbf{Hypothesise.} The service builds an order with the wrong total or a null status; the mock accepts \code{any()} and returns a canned object, so the bug is invisible to the test.
+  \item \textbf{Verify.} Replace \code{any()} with an \code{ArgumentCaptor<Order>}; inspect the captured order's total and status. Assert on the \emph{returned} order too.
+  \item \textbf{Fix.} Assert real values: \code{captured.getTotal()} equals the expected sum, \code{captured.getStatus()} is \code{PENDING}.
+  \item \textbf{Prevent.} Adopt the rule ``assert on state and return values, not just interactions.'' Treat a test whose only assertion is \code{verify(...)} as a smell to review.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Green on H2, red on Postgres}
+\textbf{Symptom.} The repository test passes in CI (which uses H2) but the same query throws \code{column ... does not exist} the moment it runs against real Postgres in staging.
+
+\smallskip\textbf{Evidence.}
+\begin{sqlbox}[the failing query]
+-- entity mapped a camelCase column without quoting
+SELECT orderDate FROM orders WHERE ...   -- Postgres folds to orderdate
+-- H2 (default) preserved case and matched; Postgres did not
+\end{sqlbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} H2 and Postgres disagree on identifier case-folding; H2 accepted the mixed-case column, Postgres lower-folded it and found nothing.
+  \item \textbf{Hypothesise.} The whole class of dialect bugs (case, JSONB, sequences, \code{ON CONFLICT}) is hidden because the test database is not the production database.
+  \item \textbf{Verify.} Switch the repository test to Testcontainers Postgres with \code{@AutoConfigureTestDatabase(replace = NONE)} and re-run --- the bug now reproduces locally.
+  \item \textbf{Fix.} Correct the mapping/column naming (or an explicit \code{@Column(name = ...)}), and let the real engine validate it.
+  \item \textbf{Prevent.} Ban H2 for persistence tests. Make Testcontainers the default so ``passes in CI'' means ``passes on the real engine.''
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Write your first behaviour-named unit test with Mockito.\\
+\textbf{Context.} \code{OrderService.placeOrder} must reject a quantity that exceeds stock.\\
+\textbf{Requirements.} \code{@Mock} the repositories, \code{@InjectMocks} the service, stub a low-stock product, assert the exception, and \code{verify(save, never())}.\\
+\textbf{Hints.} Use \code{assertThatThrownBy(...).isInstanceOf(OutOfStockException.class)}; no Spring context, no \code{@SpringBootTest}.\\
+\textbf{Expected outcome.} A sub-millisecond test that fails if the rule is removed.\\
+\textbf{Common pitfalls.} Adding \code{@SpringBootTest} ``to be safe'' and turning a unit test into a slow context test.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Prove a query does not N+1, against real Postgres.\\
+\textbf{Context.} \code{findAllWithItems()} should load orders and their items in one query.\\
+\textbf{Requirements.} \code{@DataJpaTest} + a static \code{PostgreSQLContainer} + \code{@DynamicPropertySource}; enable Hibernate statistics and assert the statement count is \code{1}.\\
+\textbf{Hints.} Set \code{@AutoConfigureTestDatabase(replace = NONE)} so H2 is not substituted; clear stats before the call.\\
+\textbf{Expected outcome.} The test passes with a \code{JOIN FETCH} and fails the instant you revert to a lazy mapping.\\
+\textbf{Common pitfalls.} Forgetting to touch the collection (so lazy loading never triggers) and getting a false pass.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Cover the full Order API surface at the web layer, auth included.\\
+\textbf{Context.} \code{POST /api/v1/orders} and \code{DELETE /api/v1/orders/\{id\}} (admin only).\\
+\textbf{Requirements.} With \code{@WebMvcTest} + \code{@MockBean OrderService} + \code{spring-security-test}, assert \code{201} (valid), \code{400} (invalid body), \code{404} (service throws not-found), \code{401} (no user), \code{403} (\code{CUSTOMER} calling the admin delete).\\
+\textbf{Hints.} \code{@WithMockUser(roles = "ADMIN")} for the allowed delete; omit it for \code{401}; use it with \code{CUSTOMER} for \code{403}.\\
+\textbf{Expected outcome.} Five named tests, each pinned to one status code, running in well under a second total.\\
+\textbf{Common pitfalls.} Omitting \code{spring-security-test}, so \code{@WithMockUser} does nothing and every request is anonymous.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as mindset, not trivia.
+
+\begin{seniornote}
+The first question a senior asks of a failing test is not ``how do I make it green?'' but ``is the test wrong, or is the code wrong?'' A test that is hard to write is usually telling you the code is hard to use --- too many collaborators, hidden state, a method doing three jobs. Painful tests are design feedback. Listen to them before Day 7 makes you refactor anyway.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{``What is the difference between \code{@Mock} and \code{@MockBean}?''} \code{@Mock} (Mockito) is a plain fake object with no Spring involvement --- for pure unit tests. \code{@MockBean} (Spring Boot) creates a mock \emph{and registers it in the application context}, replacing the real bean --- for slice/context tests like \code{@WebMvcTest} where the framework must wire it. Say ``one is a bare object, the other is a bean in the context.''
+\end{interview}
+
+\begin{perfnote}
+Test suite speed is a production concern, not a nicety. A slow suite lengthens every developer's inner loop and lengthens CI, which lengthens the time-to-recover during an incident when you need to ship a fix fast. Budget it: aim for the unit tests to finish in a couple of seconds and the whole suite in the low minutes. When it creeps, hunt down the accidental full-context tests --- they are almost always the culprit.
+\end{perfnote}
+
+\begin{prodtip}
+Make tests deterministic. The two great sources of flakiness are \keyterm{shared mutable state} (a static field, a reused database row, test-order dependence) and \keyterm{real-world coupling} (the wall clock, random values, live network calls). Inject a \code{Clock} so you can freeze time; seed randomness; never let a unit test touch the network. A test that fails one run in fifty erodes trust in the whole suite --- people start re-running until green, which defeats the point.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+ShopFlow is now a secured Order API: a bean container (Day 1), a JPA persistence layer over PostgreSQL (Days 2--3), a REST controller (Day 4), and a JWT security chain that answers \code{401}/\code{403} (Day 5). Today you give all of it a real safety net so the next five days of change cannot silently break it.
+
+\begin{buildalong}[Day 06 --- real coverage for the Order API]
+\begin{wbitem}
+  \item \textbf{Service unit tests (JUnit 5 + Mockito)} for every order-placement rule: out-of-stock rejection, correct total from line items, and each legal/illegal status transition (\code{PENDING} $\rightarrow$ \code{PAID}, and the forbidden reverse). Mock the repositories; assert on state and thrown exceptions, not just interactions.
+  \item \textbf{A Testcontainers PostgreSQL repository test} that saves and reloads an order graph on the real engine, plus an N+1 guard: enable Hibernate statistics and assert the \code{JOIN FETCH} query (Day 3) runs exactly one statement.
+  \item \textbf{\code{@WebMvcTest} + MockMvc tests} for the Order API covering \code{200}/\code{201}, \code{400} (validation), and \code{404} (not found) --- with the service \code{@MockBean}-ed.
+  \item \textbf{Auth-path controller tests} covering the Day 5 additions: \code{401} for an anonymous request and \code{403} for an authenticated \code{CUSTOMER} hitting an admin-only endpoint, using \code{spring-security-test}.
+  \item \textbf{No H2 anywhere near persistence} --- \code{@AutoConfigureTestDatabase(replace = NONE)} so integration tests hit real Postgres.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{mvn test} runs green in under two minutes; every order-placement business rule has a named unit test; one Testcontainers test proves no N+1; and the Order API controller tests assert \code{200}/\code{400}/\code{404} \emph{and} \code{401}/\code{403}. From here, any refactor that breaks a rule turns the build red before it ever reaches a reviewer.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The pyramid is about \emph{speed of feedback}: many fast unit tests, fewer integration tests, a sliver of E2E.
+  \item Unit tests isolate one class with Mockito; assert behaviour (return values, exceptions), not mock interactions.
+  \item Testcontainers gives a real Postgres so you catch dialect bugs H2 hides --- never test persistence on H2.
+  \item \code{@WebMvcTest} + MockMvc test real HTTP (status, validation, JSON, auth) without booting a server.
+  \item Cover the auth paths: \code{401} = ``who are you?'', \code{403} = ``you may not.'' A happy-path-only suite ships open endpoints.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{@Mock} is a bare object; \code{@MockBean} is a mock \emph{registered in the Spring context}.
+  \item A test whose only assertion is \code{verify(...)} usually tests wiring, not behaviour --- add a real assertion.
+  \item Make containers \code{static} and reused; the slowest tests in a suite are almost always accidental full-context ones.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Over-mocking $\rightarrow$ tests that pass while the feature is broken.
+  \item H2 for integration $\rightarrow$ ``green in CI, red in production.'' \quad$\bullet$\quad Skipping \code{401}/\code{403} $\rightarrow$ an API open to anyone.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Test pyramid}{many fast unit · fewer integration · a few E2E; width = quantity, height = cost.}
+\cheatitem{Unit test}{\code{@ExtendWith(MockitoExtension.class)} + \code{@Mock} + \code{@InjectMocks}; assert state/exceptions.}
+\cheatitem{@Mock vs @MockBean}{bare Mockito object vs a mock registered in the Spring context.}
+\cheatitem{Testcontainers}{real ephemeral Postgres via \code{@Container} + \code{@DynamicPropertySource}; \code{replace = NONE}.}
+\cheatitem{N+1 guard}{Hibernate statistics; assert \code{getPrepareStatementCount()} == 1 after touching the collection.}
+\cheatitem{@WebMvcTest}{web slice only; \code{@MockBean} the service; MockMvc drives real HTTP in-process.}
+\cheatitem{Auth in tests}{\code{spring-security-test} + \code{@WithMockUser}; test \code{401} (no user) and \code{403} (wrong role).}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the difference between \code{@Mock} and \code{@MockBean}?}
+\iq{Why use Testcontainers instead of an in-memory database?}
+\iq{What does \code{@WebMvcTest} load compared to \code{@SpringBootTest}?}
+\iq{How do you test that a transaction rolls back correctly on exception?}
+\iq{What makes a good unit test versus a brittle one?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{JUnit 5 User Guide} --- lifecycle, parameterised tests, and extensions.
+  \item \emph{Mockito documentation} --- argument captors, \code{BDDMockito}, and when \emph{not} to mock.
+  \item \emph{Testcontainers for Java} --- reusable containers and the Singleton-container pattern.
+  \item \emph{Spring Boot Reference} --- ``Testing'' chapter: test slices, \code{@MockBean}, and \code{@DynamicPropertySource}.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 7).} You now have a safety net --- and a safety net is what makes fearless refactoring possible. Tomorrow you use it: SOLID principles, layered vs hexagonal architecture, and the design patterns Spring already leans on. With today's tests guarding every rule, you can reshape ShopFlow's internals aggressively and let the green build tell you nothing broke.
+\end{keyidea}

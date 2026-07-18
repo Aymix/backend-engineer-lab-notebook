@@ -1,0 +1,499 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 14 ============================
+\daychapter{14}{Capstone}{Final Project --- ShopFlow}{Assembling, verifying \& presenting a production-ready backend --- built by you}{10 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Read a real-world specification like an engineer: separate functional from non-functional requirements and turn ambiguity into documented decisions.
+  \item Assemble the thirteen prior days into one coherent backend --- persistence, REST, security, tests, containers, cache, messaging, resilience and CI.
+  \item Model the order lifecycle as an explicit, validated state machine instead of a free-form status string.
+  \item Diagnose the three incidents every on-call engineer meets: intermittent 500s, an exhausted connection pool, and a bad deploy that must be rolled back.
+  \item Present the project the way interviewers reward: justify every decision, name your trade-offs, and ship a repository that clones green.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} For thirteen days you learned mechanisms one at a time --- the IoC container, indexes, optimistic locking, JWT, Testcontainers, Docker, Redis, RabbitMQ, circuit breakers. Each was correct in isolation. This day answers the harder question: \emph{do they hold together as one system?} A production-ready backend is not a pile of correct features; it is a set of decisions that stay consistent under load, under failure, and under the gaze of the next engineer who reads your code. ShopFlow is where you prove you can make those decisions.
+
+\glabel{Why backend engineers need it.} Nobody is paid to write a \code{@Transactional} method. Engineers are paid to ship a \emph{system} that takes an order, charges nobody twice, never oversells stock, keeps answering during a dependency outage, and can be rolled back in ninety seconds when a deploy goes wrong. The capstone is the smallest honest rehearsal of that job --- a take-home assignment or a first-sprint project compressed into one domain.
+
+\begin{keyidea}
+``Production-ready'' is not a feeling; it is a checklist you can defend line by line. It means: \keyterm{correct} under concurrency, \keyterm{observable} when it misbehaves, \keyterm{recoverable} when a deploy is bad, \keyterm{tested} so a stranger can change it safely, and \keyterm{documented} so the reader understands \emph{why}, not just how to run it. ShopFlow is deliberately a two-entity domain carrying a very large amount of that engineering weight.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} ShopFlow is the same layered application you scaffolded on Day 1, now fully populated. The container still sits at the centre; every day since has plugged a component into it. Today you do no new mechanics --- you assemble, verify, and rehearse the story you will tell about it.
+
+\begin{wbfigure}{Fig 14.1 --- Thirteen days of isolated mechanisms converge into one production-shaped backend.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, minimum width=34mm, text width=32mm] (core) {\textbf{ShopFlow}\\\scriptsize production-ready backend};
+  \node[wbbox, above left=of core, text width=26mm] (persist) {\textbf{Persistence}\\\scriptsize SQL · JPA · locking\\Day 2--3};
+  \node[wbbox, above right=of core, text width=26mm] (web) {\textbf{REST · Security}\\\scriptsize /api/v1 · JWT · RBAC\\Day 4--5};
+  \node[wbbox, left=of core, text width=26mm] (quality) {\textbf{Tests · Clean}\\\scriptsize Testcontainers · SOLID\\Day 6--7};
+  \node[wbbox, right=of core, text width=26mm] (deliver) {\textbf{Deliver}\\\scriptsize Docker · Compose · CI\\Day 8, 12};
+  \node[wbbox, below left=of core, text width=26mm] (async) {\textbf{Cache · MQ · Async}\\\scriptsize Redis · Rabbit · @Async\\Day 9--11};
+  \node[wbbox, below right=of core, text width=26mm] (resil) {\textbf{Resilience · Obs}\\\scriptsize breaker · metrics · logs\\Day 13, 11};
+  \draw[wbarrowg] (persist)--(core); \draw[wbarrowg] (web)--(core);
+  \draw[wbarrowg] (quality)--(core); \draw[wbarrowg] (deliver)--(core);
+  \draw[wbarrowg] (async)--(core); \draw[wbarrowg] (resil)--(core);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Literally everything. The build order below is the roadmap in miniature: schema (Day 2--3), CRUD and error handling (Day 4), auth (Day 5), tests (Day 6), clean layering (Day 7), containers (Day 8), then the cross-cutting concerns of caching, messaging, async and resilience (Days 9--11, 13), finished by CI (Day 12). If any earlier day is fuzzy, ShopFlow is where the fuzz becomes a compile error.
+
+\glabel{Real company examples.} A senior take-home at Stripe, Monzo, or a typical Series-B startup is exactly this shape: a small domain, a big expectation of engineering rigour. Reviewers do not count features --- they clone the repo, run one command, read the README, and look for judgment. ShopFlow is engineered to survive that exact review.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole system in one picture before you touch a keyboard. Read it top-to-bottom (a request's path) and notice the three side concerns every production service carries: a message path, an observability path, and a delivery path.
+
+\begin{wbfigure}{Fig 14.2 --- The ShopFlow runtime: one app, three backing services, plus observability and CI around the edges.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=44mm] (client) {\textbf{Clients}\\\scriptsize Customer \& Admin --- browser / mobile};
+  \node[wbboxaccent, below=of client, text width=58mm] (app) {\textbf{ShopFlow API --- Spring Boot}\\\scriptsize JWT filter $\rightarrow$ Controller $\rightarrow$ Service $\rightarrow$ Repository\\\scriptsize validation · rate limit · error handler};
+  \draw[wbarrow] (client)--(app) node[wbcap, midway, right, xshift=1mm]{HTTPS /api/v1};
+  % datastores row
+  \node[wbcyl, below=13mm of app, xshift=-30mm, text width=20mm] (pg) {Postgres\\\scriptsize orders,\\products};
+  \node[wbcyl, below=13mm of app, text width=18mm] (redis) {Redis\\\scriptsize catalog\\cache};
+  \node[wbbox, below=13mm of app, xshift=30mm, text width=22mm] (mq) {RabbitMQ\\\scriptsize email queue};
+  \draw[wbarrow] (app)--(pg) node[wbcap,midway,left,xshift=-0.5mm]{JPA};
+  \draw[wbarrow] (app)--(redis);
+  \draw[wbarrow] (app)--(mq) node[wbcap,midway,right,xshift=0.5mm]{publish};
+  \node[wbbox, below=7mm of mq, text width=22mm] (worker) {Email Worker\\\scriptsize @RabbitListener};
+  \draw[wbarrow] (mq)--(worker);
+  % observability + CI row
+  \node[wbbox, below=11mm of pg, text width=26mm] (prom) {Prometheus\\\scriptsize scrapes /actuator};
+  \node[wbboxgood, right=of prom, text width=26mm] (graf) {Grafana\\\scriptsize dashboards · alerts};
+  \node[wbboxghost, right=of graf, text width=30mm] (ci) {CI --- GitHub Actions\\\scriptsize test · build · push tag};
+  \draw[wbarrowg] (app.west) to[out=180,in=90] (prom.north);
+  \draw[wbarrow] (prom)--(graf);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Requirement} $\rightarrow$ \keyterm{Domain model} $\rightarrow$ \keyterm{State machine} $\rightarrow$ \keyterm{Optimistic lock} $\rightarrow$ \keyterm{Async event} $\rightarrow$ \keyterm{Cache invalidation} $\rightarrow$ \keyterm{Observability} $\rightarrow$ \keyterm{Immutable artifact} $\rightarrow$ \keyterm{Rollback}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Reading a spec: functional vs non-functional}
+
+\glabel{What is it?} A specification has two halves that beginners blur together. \keyterm{Functional requirements} describe \emph{what the system does} --- observable behaviour a user could click through. \keyterm{Non-functional requirements} (NFRs) describe \emph{how well it must do it} --- the qualities that never appear on a screen but decide whether the system survives production: correctness under concurrency, security, testability, latency, recoverability.
+
+\glabel{Why does it exist?} Juniors ship the functional half and call it done; the demo works. Seniors know the NFRs are where the real work --- and the real interview signal --- lives. Anyone can write ``place an order.'' The craft is placing an order that cannot oversell stock, is covered by a test, emits a metric, and can be rolled back.
+
+\glabel{Why treat ambiguity as a decision?} The spec is deliberately underspecified in places (what TTL? keyset or offset pagination? cancel a SHIPPED order?). That is not an oversight to escalate --- it is an invitation to decide and \emph{write down why}. ``I chose a 60-second catalog TTL because prices change rarely and stale reads are tolerable for a minute'' is exactly the sentence an interviewer wants to hear.
+
+\wbsub{3.2\quad ShopFlow --- functional requirements}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{22mm} X C{9mm}@{}}
+\wbtablehead{Feature} & \wbtablehead{What the backend must do} & \wbtablehead{Day}\\\midrule
+Auth & Registration and JWT login; passwords BCrypt-hashed, never stored in clear. & 5\\
+Roles & \code{CUSTOMER} manages only their own orders; \code{ADMIN} manages the catalog and views all orders. & 5\\
+Catalog & CRUD for admins; paginated, filterable browsing for everyone. & 2, 4\\
+Orders & Validate stock, decrement inventory with optimistic locking, compute the total server-side. & 3\\
+Lifecycle & \code{PENDING} $\rightarrow$ \code{PAID} $\rightarrow$ \code{SHIPPED} $\rightarrow$ \code{DELIVERED} (or \code{CANCELLED}); every transition validated. & 3\\
+Email & Confirmation sent \emph{asynchronously} via a message queue on placement. & 10, 11\\
+Caching & Catalog reads served from Redis; the cache is invalidated on every write. & 9\\
+\end{tabularx}\end{center}
+
+\begin{misconception}
+``The total comes from the request body.'' Never. A client that computes its own price can pay one cent for a laptop. The server recomputes the total from the current product prices at placement time; the request only carries product ids and quantities. The same rule kills every ``negative quantity'' and ``someone else's order id'' exploit --- trust the server's data, validate the client's.
+\end{misconception}
+
+\wbsub{3.3\quad ShopFlow --- non-functional requirements}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{24mm} X C{9mm}@{}}
+\wbtablehead{Concern} & \wbtablehead{Requirement} & \wbtablehead{Day}\\\midrule
+Architecture & Layered (Controller/Service/Repository), SOLID, thin controllers. & 7\\
+Testing & Unit tests for every business rule; Testcontainers integration; MockMvc controller tests. & 6\\
+Security & JWT auth, BCrypt passwords, role-based authorization, locked-down CORS. & 5\\
+API & Versioned \code{/api/v1}, one consistent error format, OpenAPI docs, page- or keyset-based pagination. & 4\\
+Resilience & Circuit breaker on any external call; rate limiting on public endpoints. & 13\\
+Observability & Actuator health/metrics, structured logs with correlation ids, a Grafana dashboard. & 11, 13\\
+Delivery & Multi-stage Dockerfile, Compose (app+db+redis+mq), CI running tests and building the image. & 8, 12\\
+\end{tabularx}\end{center}
+
+\begin{seniornote}
+Read the NFR table as your grading rubric. When you present ShopFlow, an interviewer will silently walk exactly these rows: ``show me the concurrency test,'' ``show me the error format,'' ``show me the dashboard.'' A feature with no test, no metric, and no error contract is, to a reviewer, not finished --- it is a prototype wearing a finished feature's clothes.
+\end{seniornote}
+
+\wbsub{3.4\quad The domain model \& optimistic locking}
+
+\glabel{What is it?} Two entities carry the whole domain: \code{Product} (catalog item with a price and a stock count) and \code{Order} (a customer's basket with a status and line items). The engineering weight is concentrated in one field on \code{Product}: the stock count, mutated concurrently whenever two customers race for the last unit.
+
+\begin{javabox}[Product.java]
+@Entity
+public class Product {
+  @Id @GeneratedValue
+  private Long id;
+  private String name;
+  private BigDecimal price;
+  private int stock;
+
+  @Version              // optimistic-lock token
+  private long version;
+  // getters, no public setter for stock -> mutate via domain method
+}
+\end{javabox}
+
+\glabel{How does it work internally?} \code{@Version} makes Hibernate append the version to every \code{UPDATE}'s \code{WHERE} clause: \code{UPDATE product SET stock=?, version=version+1 WHERE id=? AND version=?}. If another transaction already bumped the version, zero rows match and Hibernate throws \code{OptimisticLockException}. No row is ever silently overwritten; the loser retries or fails cleanly.
+
+\begin{dbinsight}
+Optimistic locking is the right default for a web backend because conflicts are \emph{rare} --- two people wanting the same last unit at the same millisecond is the exception, not the rule. You pay nothing on the happy path (no held row locks, no blocked connections) and only handle contention when it actually happens. Pessimistic \code{SELECT ... FOR UPDATE} is the opposite trade: it serialises access up front and is worth it only under genuinely high contention on a hot row.
+\end{dbinsight}
+
+\begin{misconception}
+Optimistic locking does not \emph{prevent} the race --- it \emph{detects} it. The oversell (two reads both seeing ``1 available'') is stopped because the second \code{UPDATE} matches no row and fails, so inventory never goes to $-1$. Your service must catch \code{OptimisticLockException} and decide: retry, or return \code{409 Conflict} to the customer. Detection without a handling policy is just a different crash.
+\end{misconception}
+
+\wbsub{3.5\quad The order lifecycle as a validated state machine}
+
+\glabel{Why does it exist?} A \code{status} column that any code can set to any string is a bug generator: an order jumps from \code{PENDING} straight to \code{DELIVERED}, or a \code{CANCELLED} order ships. Modelling status as an explicit \keyterm{state machine} --- a fixed set of states and a fixed set of legal transitions --- turns ``did we validate this?'' into ``is this edge in the graph?''
+
+\begin{wbfigure}{Fig 14.3 --- The order state machine. Only the drawn edges are legal; every other transition is a 409.}
+\wbscale{\begin{tikzpicture}[node distance=9mm and 22mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=30mm] (pending) {\textbf{PENDING}\\\scriptsize order created, stock reserved};
+  \node[wbbox, below=of pending, text width=30mm] (paid) {\textbf{PAID}\\\scriptsize payment captured};
+  \node[wbbox, below=of paid, text width=30mm] (shipped) {\textbf{SHIPPED}\\\scriptsize handed to carrier};
+  \node[wbboxgood, below=of shipped, text width=30mm] (delivered) {\textbf{DELIVERED}\\\scriptsize terminal · success};
+  \node[wbboxwarn, right=of paid, text width=26mm] (cancelled) {\textbf{CANCELLED}\\\scriptsize terminal · stock released};
+  \draw[wbarrow] (pending)--(paid) node[wbcap,midway,right,xshift=1mm]{pay};
+  \draw[wbarrow] (paid)--(shipped) node[wbcap,midway,right,xshift=1mm]{ship};
+  \draw[wbarrow] (shipped)--(delivered) node[wbcap,midway,right,xshift=1mm]{deliver};
+  \draw[wbarrow] (pending.east) to[out=0,in=150] node[wbcap,midway,above,align=center]{cancel} (cancelled.north west);
+  \draw[wbarrow] (paid.east) -- node[wbcap,midway,above]{cancel + refund} (cancelled.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} Keep the legal edges in one place and refuse everything else. The transition method is the single choke point through which status ever changes.
+
+\begin{javabox}[Order.java]
+public enum OrderStatus {
+  PENDING, PAID, SHIPPED, DELIVERED, CANCELLED;
+
+  private static final Map<OrderStatus, Set<OrderStatus>> NEXT = Map.of(
+    PENDING, Set.of(PAID, CANCELLED),
+    PAID,    Set.of(SHIPPED, CANCELLED),
+    SHIPPED, Set.of(DELIVERED),
+    DELIVERED, Set.of(),
+    CANCELLED, Set.of());
+
+  public boolean canGoTo(OrderStatus target) {
+    return NEXT.get(this).contains(target);
+  }
+}
+// in Order:
+void transitionTo(OrderStatus target) {
+  if (!status.canGoTo(target))
+    throw new IllegalStateTransition(status, target);  // -> 409
+  this.status = target;
+}
+\end{javabox}
+
+\begin{interview}
+``How do you model an order's status?'' The weak answer is ``a string column.'' The answer that lands: ``an enum with an explicit transition table, so illegal transitions are impossible by construction and map to a \code{409}, not a corrupt row.'' Then mention the two side effects that ride on transitions --- releasing reserved stock on \code{CANCELLED}, and never allowing \code{DELIVERED} or \code{CANCELLED} to move again because they are terminal.
+\end{interview}
+
+\wbsub{3.6\quad One request, every day at once}
+
+\glabel{How does it work internally?} The reason ShopFlow is a good capstone is that a single ``place order'' request touches nearly every day of the roadmap. Trace it and you are reciting the whole book.
+
+\begin{wbfigure}{Fig 14.4 --- \code{POST /api/v1/orders}: one request threading through thirteen days of concepts.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=82mm, minimum height=7.4mm, align=left, text width=76mm}]
+  \node[stage, wbboxwarn] (s1) {1 · JWT filter authenticates \& sets \code{CUSTOMER} role \hfill \scriptsize Day 5};
+  \node[stage, below=of s1] (s2) {2 · Rate limiter checks the token bucket in Redis \hfill \scriptsize Day 13};
+  \node[stage, below=of s2] (s3) {3 · Controller validates the DTO, delegates (thin) \hfill \scriptsize Day 4, 7};
+  \node[stage, below=of s3] (s4) {4 · Service opens a transaction, computes total \hfill \scriptsize Day 1, 3};
+  \node[stage, wbboxaccent, below=of s4] (s5) {5 · Repository decrements stock, @Version guards it \hfill \scriptsize Day 2, 3};
+  \node[stage, below=of s5] (s6) {6 · Publish OrderPlaced event to RabbitMQ (async email) \hfill \scriptsize Day 10, 11};
+  \node[stage, below=of s6] (s7) {7 · Evict the catalog cache entry in Redis \hfill \scriptsize Day 9};
+  \node[stage, below=of s7] (s8) {8 · Timer + counter recorded, correlation id logged \hfill \scriptsize Day 11, 13};
+  \node[stage, wbboxgood, below=of s8] (s9) {9 · \code{201 Created} with the order JSON \hfill \scriptsize Day 4};
+  \foreach \a/\b in {s1/s2,s2/s3,s3/s4,s4/s5,s5/s6,s6/s7,s7/s8,s8/s9}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{perfnote}
+Notice what is \emph{inside} the transaction and what is not. Steps 4--5 are transactional and must be fast --- they hold a database connection. The email (step 6) must be \emph{outside} the transaction: never do slow I/O (SMTP, HTTP) while holding a connection, or you convert one slow dependency into an exhausted pool. Publishing an event and letting a worker send the mail is the whole reason the message queue exists.
+\end{perfnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Recompute money server-side; the client sends ids and quantities, never prices or totals.
+  \item Every status change goes through one \code{transitionTo} choke point --- no scattered \code{setStatus}.
+  \item Do slow I/O (email, external HTTP) outside the DB transaction, via the queue.
+  \item Write the test with the feature, not after; a rule with no test is a rule you will break.
+  \item Document each ambiguous decision (TTL, pagination style, cancel rules) in the README.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Trusting the request body's total or the client's product price.
+  \item A free-text \code{status} string that any code can set to anything.
+  \item Sending the confirmation email synchronously inside \code{placeOrder}, blocking the request.
+  \item Catching \code{OptimisticLockException} nowhere, so a lost race becomes an ugly 500.
+  \item Gold-plating: adding wishlists and coupons instead of hardening the two entities you have.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two diagrams carry this whole chapter. Redraw them \emph{from memory} --- if you can reproduce the architecture and the state machine on a whiteboard, you can answer most of the capstone interview.
+
+\begin{writespace}[Redraw: the ShopFlow architecture --- app, Postgres, Redis, RabbitMQ + worker, Prometheus/Grafana, CI]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the order state machine, and label what each transition validates and its side effect]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Assemble ShopFlow}
+
+\textbf{Goal of this lab:} walk the spec's \emph{Suggested Build Order}, one deliberate step at a time. Do not skip ahead to the exciting parts (caching, messaging) before the happy path works --- the order below exists because it minimises rework. Build depth on a small surface; resist every urge to add a feature.
+
+\resetlab
+\labstep{Schema, entities, migrations}
+Model \code{Product} and \code{Order} (with \code{OrderItem}); add \code{@Version} to \code{Product}. Write the tables as versioned migrations, not \code{ddl-auto=update}. Seed a few products.
+\labwhy{The schema is the contract every later layer depends on; migrations make it reproducible in CI and in a teammate's clone.}
+
+\labstep{Core CRUD, DTOs, validation, error handling}
+Build product CRUD (admin) and paginated browsing (all), plus order placement returning a DTO. Add \code{@Valid} on inputs and one \code{@RestControllerAdvice} that renders every error in a single JSON shape.
+\labwhy{A consistent error contract and DTO boundary is what makes the API usable by anyone but you --- and it is the first thing a reviewer inspects.}
+
+\labstep{Auth: registration, login, JWT, role checks}
+Add registration (BCrypt), login issuing a JWT, a filter that authenticates the token, and method/route rules so \code{CUSTOMER} sees only their orders and \code{ADMIN} manages the catalog. Lock CORS to known origins.
+\labwhy{Security is not a later layer you bolt on; wire it before the endpoints multiply, so every new route is protected by default.}
+
+\labstep{Tests as you go --- never at the end}
+For each rule you add, add its test: unit tests for the state machine and total computation, a Testcontainers test for the optimistic-lock oversell, MockMvc tests for the controller contract and auth.
+\labwhy{Tests written alongside the code pin behaviour while it is fresh; tests deferred to ``the end'' are the tests that never get written.}
+
+\labstep{Refactor toward clean layering}
+Once the happy path is green, push logic out of controllers into services, keep repositories thin, and make services depend on interfaces where a seam helps. Thin controllers, fat-enough services, dumb repositories.
+\labwhy{Refactor \emph{after} it works and \emph{with} tests as a safety net --- clean layering done up front is guesswork; done now it is informed by real code.}
+
+\labstep{Containerize and get \code{docker compose up} working end to end}
+Write a multi-stage Dockerfile and a Compose file bringing up app + Postgres + Redis + RabbitMQ. Externalise config via environment variables and a \code{prod} profile.
+\labwhy{``One command brings up the whole stack'' is a completion-checklist item and the single best signal to a reviewer that the project is real.}
+
+\labstep{Layer in the cross-cutting concerns, then CI}
+Now add Redis caching (invalidated on write), the async email via RabbitMQ, a circuit breaker on the external call, rate limiting on public routes, Actuator metrics with a Grafana dashboard --- then a CI pipeline that runs the tests and builds the image on every push.
+\labwhy{These are cross-cutting by design; adding them onto a working, tested core is safe, whereas building them first would be building on sand.}
+
+\begin{prodtip}
+After every step, run \code{docker compose down -v \&\& docker compose up}. The most valuable thing you can prove is that a \emph{cold} clone comes up green with one command. A repo that only works on your laptop because of a hand-run migration or a locally cached image is, to an interviewer, a broken repo --- no matter how good the code inside is.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+These are reflection prompts, not quiz questions. Write a sentence or two --- making your reasoning explicit is the point.
+
+\begin{thinkbox}
+The spec says ``resist the urge to add features.'' Why is depth on two entities a \emph{stronger} signal to an interviewer than breadth across ten? What does adding a wishlist actually demonstrate, and what does hardening the oversell path demonstrate instead?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You chose optimistic locking for stock. Under what traffic pattern would that choice become the wrong one, and what would you switch to? How would you \emph{know} from your metrics that you had crossed that line, rather than guessing?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+The confirmation email goes through a queue so it is asynchronous. What new failure mode did you just introduce (that a synchronous send did not have), and what does ShopFlow do if the email worker is down for an hour? Is a lost email acceptable? Defend your answer.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+The three incidents below are the ones every on-call backend engineer meets. They are also the ones interviewers ask as ``walk me through your process.'' Practise the process, not the guess.
+
+\begin{debuglab}{The app returns 500s intermittently}
+\textbf{Symptom.} Roughly one request in twenty fails with a 500; the rest are fine. It started around the last deploy but is not every request.
+
+\smallskip\textbf{Evidence.}
+\begin{bashbox}[grep by correlation id]
+# error rate ticked up right after 14:02 deploy
+grep 'level=ERROR' app.log | grep 'cid=7f3a'
+# -> OptimisticLockException on Product.stock, order path
+\end{bashbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} Open the dashboard: is the error-rate spike correlated with the deploy or with a traffic change? Note it began at 14:02.
+  \item \textbf{Hypothesise.} Intermittent, not total, points at contention or a bad code path on a fraction of requests --- here, lost optimistic-lock races on a hot product left unhandled.
+  \item \textbf{Verify.} Filter logs by \code{cid} (correlation id) for the failing requests; the stack shows \code{OptimisticLockException} bubbling to the default 500 handler.
+  \item \textbf{Fix.} Catch it in the service: retry once, or return \code{409 Conflict} with a clear message --- a lost race is a client outcome, not a server fault.
+  \item \textbf{Prevent.} Add a concurrency test that fires two decrements at the last unit and asserts one wins with 201 and the other gets 409, never a 500.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Connection pool exhausted}
+\textbf{Symptom.} Under load the app hangs, then throws \code{Unable to acquire JDBC Connection} after a timeout; requests queue and latency explodes.
+
+\smallskip\textbf{Evidence.}
+\begin{propsbox}[HikariCP log]
+Connection is not available, request timed out after 30000ms
+HikariPool-1 - Pool stats (total=10, active=10, idle=0, waiting=27)
+\end{propsbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{active=10, waiting=27} --- every connection is checked out and a queue is forming. The pool is not leaking idle; it is fully busy.
+  \item \textbf{Hypothesise.} Connections are held too long. The prime suspect in ShopFlow: slow I/O inside a transaction (an email send or external call that should have been async), or a slow un-indexed query.
+  \item \textbf{Verify.} Check whether the email/external call sits inside \code{@Transactional}; run \code{EXPLAIN ANALYZE} on the order-path queries for sequential scans.
+  \item \textbf{Fix.} Move the slow I/O out of the transaction (publish to the queue), add the missing index, keep transactions short. Only then consider raising the pool size.
+  \item \textbf{Prevent.} Alert on \code{hikaricp\_connections\_pending}; assert in a test that the email publish happens after commit, not inside the transaction.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{A bad deploy that must be rolled back}
+\textbf{Symptom.} The 14:02 deploy raised the error rate and the fix is not obvious. You need the site healthy \emph{now}, not a root cause in an hour.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Error rate and latency both stepped up exactly at the deploy; the previous version was healthy for days. This is a deploy correlation, not a slow-burning bug.
+  \item \textbf{Hypothesise.} The new image is bad. The safest path back to health is the last known-good \emph{artifact}, not a forward fix under pressure.
+  \item \textbf{Verify.} Confirm the previous image tag (e.g. \code{shopflow:1.8.3}) is still in the registry and was the last green CI build.
+  \item \textbf{Fix.} Redeploy the last known-good tag. Never rebuild from source under pressure --- that is a new, untested artifact when you least want one.
+  \item \textbf{Prevent.} This is exactly why CI/CD promotes immutable, tagged images: rollback is ``point at the old tag,'' a ninety-second operation, not a rebuild.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~30 min}
+\textbf{Goal.} Make the API's error contract consistent and self-documenting.\\
+\textbf{Context.} A reviewer hits a validation error, a 404, and a 409 and expects the same JSON shape each time.\\
+\textbf{Requirements.} One \code{@RestControllerAdvice} rendering \code{{timestamp, status, error, message, path}}; wire OpenAPI so the docs list every endpoint and status.\\
+\textbf{Hints.} Map \code{MethodArgumentNotValidException} $\rightarrow$ 400, \code{EntityNotFound} $\rightarrow$ 404, \code{IllegalStateTransition} $\rightarrow$ 409.\\
+\textbf{Expected outcome.} Every error path returns the same envelope; \code{/swagger-ui} reflects reality.\\
+\textbf{Common pitfalls.} Letting Spring's default whitelabel error leak on one path, so the contract is ``consistent except when it isn't.''
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~50 min}
+\textbf{Goal.} Prove, with a test, that ShopFlow cannot oversell.\\
+\textbf{Context.} One product, \code{stock=1}, two customers placing an order at the same instant.\\
+\textbf{Requirements.} A Testcontainers test firing two concurrent \code{placeOrder} calls; assert exactly one 201 and one 409, and that final \code{stock} is 0 (never $-1$).\\
+\textbf{Hints.} Use an \code{ExecutorService} + \code{CountDownLatch} to release both threads together; assert on the DB row afterward.\\
+\textbf{Expected outcome.} A deterministic, repeatable test that would fail if someone removed \code{@Version}.\\
+\textbf{Common pitfalls.} Testing against H2 instead of real Postgres, so locking semantics differ from production; both threads landing sequentially so no real race occurs.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~90 min}
+\textbf{Goal.} Make ShopFlow observable and resilient enough to debug the Part 7 incidents.\\
+\textbf{Context.} You want the ``500s intermittently'' and ``pool exhausted'' incidents to be visible on a dashboard before a user reports them.\\
+\textbf{Requirements.} Add a correlation-id filter (MDC) so every log line carries a \code{cid}; expose a \code{Timer} on order placement and a \code{Counter} on 409s; build a Grafana panel for p95 latency, error rate, and \code{hikaricp\_connections\_pending}; put a circuit breaker on the email publish.\\
+\textbf{Hints.} Micrometer \code{@Timed} + Actuator \code{/prometheus}; a fallback that logs and drops the email when the breaker is open.\\
+\textbf{Expected outcome.} A dashboard on which each Part 7 incident would show up as a visible spike.\\
+\textbf{Common pitfalls.} Instrumenting only the happy path, so the 409s and breaker-opens --- the interesting events --- are invisible.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment that turns a working project into a hireable one.
+
+\begin{seniornote}
+Know your project's weak points before the interviewer finds them. ``I'd add idempotency keys to order placement next, because a client retry can currently double-order'' earns more trust than a claim that the project is perfect. Reviewers hire the candidate who can critique their own code, because that is the candidate who will critique the team's.
+\end{seniornote}
+
+\begin{interview}
+Be able to whiteboard two things from memory: the \code{Order}/\code{Product}/\code{OrderItem} relationships (and where \code{@Version} lives), and the JWT flow --- register (BCrypt) $\rightarrow$ login issues a signed token $\rightarrow$ filter verifies the signature on every request $\rightarrow$ role drives authorization. If you can draw both without notes, you can carry the whole conversation.
+\end{interview}
+
+\begin{perfnote}
+Every cache decision is a staleness trade. A 60-second catalog TTL means a price change can be one minute stale --- fine for a catalog, unacceptable for stock. That is why ShopFlow caches catalog \emph{reads} but never the live stock count, and invalidates the cache on every write. Be ready to defend the exact TTL you chose and what a stale read would cost.
+\end{perfnote}
+
+\begin{prodtip}
+Have the test suite runnable and green in a fresh clone. An interviewer who clones your repo and it does not build has learned more about you than any code-style nit could tell them. ``\code{git clone}, one command, green'' is the single highest-leverage hour you can spend before a technical screen.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+This is the last increment: no new mechanics, only assembly, proof, and the document that ties it together. Everything from Days 1--13 already exists in your tree --- the layered module (Day 1), the schema and locking (Days 2--3), CRUD and errors (Day 4), auth (Day 5), tests (Day 6), clean layering (Day 7), containers (Day 8), cache/queue/async (Days 9--11), CI (Day 12), resilience and observability (Day 13). Today you make them one system and write the README that explains \emph{why}.
+
+\begin{buildalong}[Day 14 --- final assembly \& the README that explains decisions]
+\begin{wbitem}
+  \item Wire the cross-cutting concerns end to end: catalog cache invalidated on write (Day 9), async confirmation email via RabbitMQ (Days 10--11), circuit breaker + rate limiter (Day 13), Actuator metrics on a Grafana dashboard (Day 11, 13).
+  \item Confirm \code{docker compose up} brings the full stack --- app + Postgres + Redis + RabbitMQ --- to health with one command from a clean checkout.
+  \item Make CI green on every push: it runs the unit, Testcontainers and MockMvc suites, then builds and tags the image.
+  \item Verify each completion-checklist item: all 14 days represented, tests green in CI, OpenAPI accurate, one-command stack.
+  \item Write the README as a \emph{decision log}, not a run book: why layered, why optimistic locking, why this TTL, why keyset vs offset pagination, the state machine, the JWT flow, and one honest ``what I'd improve next.''
+  \item Rehearse the whiteboard: the entity relationships and the JWT flow, from memory, in under five minutes.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a stranger clones the repo, runs one command, watches the whole stack come up healthy and the tests pass in CI, opens the README and understands every architectural decision --- and you can defend each of them out loud.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Production-ready is a defensible checklist: correct, observable, recoverable, tested, documented.
+  \item The non-functional requirements --- not the features --- are where the engineering and the interview signal live.
+  \item Optimistic locking \emph{detects} the oversell race; your service must \emph{handle} it (retry or 409).
+  \item Model status as an explicit state machine so illegal transitions are impossible, not merely discouraged.
+  \item Roll back by redeploying the last known-good \emph{tagged image}, never by rebuilding under pressure.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Recompute money server-side; do slow I/O outside the transaction via the queue.
+  \item Correlation ids + metrics are what turn ``it's slow sometimes'' into a diagnosable incident.
+  \item Depth on two entities beats breadth across ten --- resist scope creep.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Trusting client-supplied totals. \quad$\bullet$\quad Free-text \code{status} with no transition guard.
+  \item Synchronous email inside \code{placeOrder} $\rightarrow$ pool exhaustion under load.
+  \item A repo that only builds on your laptop $\rightarrow$ the worst possible interview signal.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Race condition (oversell)}{two reads see the last unit; fixed by \code{@Version} optimistic lock or an atomic DB decrement with a check.}
+\cheatitem{500s intermittently}{dashboard for the spike $\rightarrow$ logs by correlation id $\rightarrow$ downstream health $\rightarrow$ resource saturation.}
+\cheatitem{Pool exhausted}{long transactions, slow downstream query, leaked connections, or an undersized pool --- fix the hold time first.}
+\cheatitem{Safe rollback}{redeploy the last known-good tagged image; never rebuild from source under pressure.}
+\cheatitem{JWT integrity}{token is signed (HMAC/RSA); the server verifies the signature on every request and rejects tampered payloads.}
+\cheatitem{Scale read-heavy}{cache (Redis) $\rightarrow$ read replicas $\rightarrow$ CDN for public data, before scaling the DB vertically.}
+\cheatitem{Fix N+1}{\code{JOIN FETCH}, \code{@EntityGraph}, or a DTO projection --- never blanket EAGER fetching.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Give a backend race condition and explain how optimistic locking fixes it.}
+\iq{The app returns 500s intermittently --- what is your process?}
+\iq{Connection pool exhausted --- what are the likely causes and your first fix?}
+\iq{How do you safely roll back a bad deploy, and why not rebuild?}
+\iq{Walk me through your JWT auth flow and where the token is verified.}
+\iq{Why a layered architecture, and what makes a controller ``thin''?}
+\iq{Justify your cache TTL and how you keep it from serving stale stock.}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Release It!} (Nygard) --- stability patterns: circuit breakers, bulkheads, timeouts in the wild.
+  \item \emph{Designing Data-Intensive Applications} (Kleppmann) --- the ``why'' behind locking, replication and consistency.
+  \item Spring Boot Reference --- \emph{Production-ready Features} (Actuator) and \emph{Testing} chapters.
+  \item Your own README --- reread it as a stranger; every unexplained decision is an interview question you have not yet answered.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What comes after Day 14.} You now have one small system you understand completely --- top to bottom, request to rollback. That is worth more than ten half-built ones. Next: pick a single NFR and take it further than the spec asked --- add idempotency keys, introduce read replicas, or trace a request across services with OpenTelemetry. The habit that carries you from junior to senior is the one this whole notebook rehearsed: understand the \emph{mechanism}, never just the annotation, and always be able to say \emph{why}.
+\end{keyidea}
+

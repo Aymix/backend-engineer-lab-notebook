@@ -1,0 +1,26 @@
+# --- build output ---
+build/
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.listing
+*.bbl
+*.blg
+
+# --- local authoring tooling (not part of the published workbook) ---
+authoring-workflow.js
+AUTHORING-GUIDE.md
+testchapter.tex
+
+# --- editors / OS ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

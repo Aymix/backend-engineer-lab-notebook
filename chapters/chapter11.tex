@@ -1,0 +1,570 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 11 ============================
+\daychapter{11}{Performance}{JVM Performance, Concurrency \& Observability}{Memory, garbage collection, thread pools, async \& metrics}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Draw the JVM heap from memory --- Eden, survivor spaces, old generation, Metaspace --- and use that picture to reason about \emph{why} an \code{OutOfMemoryError} happened.
+  \item Explain generational garbage collection and pick a collector (G1, ZGC) for a given latency budget.
+  \item Size a thread pool deliberately for CPU-bound versus I/O-bound work, and configure a \code{ThreadPoolTaskExecutor} instead of trusting an unbounded default.
+  \item Compose independent downstream calls concurrently with \code{CompletableFuture.thenCombine}, and \emph{always} attach a failure handler.
+  \item Instrument a service with Actuator and Micrometer so health, metrics and a Prometheus scrape endpoint exist from day one, not as an afterthought.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Up to now you have made ShopFlow \emph{correct}: it wires beans, persists orders, secures endpoints, caches reads and publishes events to RabbitMQ. This day makes it \emph{fast, resilient under load, and visible}. When a service falls over at 3am it is almost never because the logic was wrong --- it is because the heap filled up, a thread pool starved, an async exception vanished silently, or nobody could see the metric that would have predicted it an hour earlier. Today you build the mental models and the instrumentation to prevent all four.
+
+\glabel{Why backend engineers need it.} Performance and observability are the line between "it works on my laptop" and "it survives Black Friday." Every senior engineer can tell you, without a debugger, roughly \emph{where} memory goes, \emph{how many} threads a request consumes, and \emph{which} metric to look at first. These are not exotic skills --- they are the daily vocabulary of on-call. The JVM gives you extraordinary observability for free; most teams simply never learn to read it.
+
+\begin{keyidea}
+A running service is three finite resources fighting for room: \keyterm{heap} (memory the GC manages), \keyterm{threads} (units of concurrency), and \keyterm{connections} (to databases, brokers, downstreams). Almost every production incident is one of these three being exhausted. Today you learn to picture all three, bound them on purpose, and expose a metric for each.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} The container from Day 1 runs your beans; the async work you schedule today runs those beans \emph{on a different thread} via the same proxy mechanism (\code{@Async} is proxied exactly like \code{@Transactional}). The RabbitMQ publish from Day 10 becomes a background task on a pool \emph{you} sized. The metrics you export today feed the monitoring stack you assemble on Day 13.
+
+\begin{wbfigure}{Fig 11.1 --- Where today fits: a fast synchronous response, real work offloaded to a bounded pool, and every layer observed.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=26mm] (client) {\textbf{Client}\\\scriptsize POST /orders};
+  \node[wbboxgood, right=of client, text width=28mm] (ctrl) {\textbf{Controller}\\\scriptsize returns 202 fast};
+  \node[wbboxaccent, below=9mm of ctrl, text width=30mm] (pool) {\textbf{orderExecutor}\\\scriptsize bounded thread pool};
+  \node[wbbox, left=of pool, text width=26mm] (work) {\textbf{Confirmation}\\\scriptsize email · publish};
+  \node[wbboxdb, right=12mm of pool, text width=26mm] (obs) {\textbf{Actuator}\\\scriptsize /health /prometheus};
+  \draw[wbarrow] (client)--(ctrl);
+  \draw[wbarrow] (ctrl)--(pool);
+  \draw[wbarrow] (pool)--(work);
+  \draw[wbarrowg] (pool)--(obs);
+  \draw[wbarrowg] (ctrl.north) to[out=90,in=90] node[wbcap,above]{Micrometer counter} (obs.north);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1's proxies are the delivery mechanism for \code{@Async}. Day 9's cache and Day 10's broker are both downstream calls you will now run \emph{concurrently} instead of one after another. And the "fail fast at startup" reflex from Day 1 has a runtime sibling here: "observe continuously in production."
+
+\glabel{Real company examples.} Netflix wrote and open-sourced much of the JVM-tuning and async tooling the industry now takes for granted; their services routinely tune G1 and ZGC for tail latency. Every company running Prometheus + Grafana --- which is most of them --- is scraping a \code{/actuator/prometheus} endpoint produced by Micrometer, the exact facade you wire up today.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole day in one picture. The left half is \emph{memory} (where objects live and die), the middle is \emph{concurrency} (how work is scheduled onto threads), and the right is \emph{observability} (how you see any of it).
+
+\begin{wbfigure}{Fig 11.2 --- The Day 11 concept map: memory feeds concurrency; both are made visible by metrics.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=22mm] (heap) {Heap\\\scriptsize young · old};
+  \node[wbbox, right=of heap, text width=20mm] (gc) {GC\\\scriptsize G1 · ZGC};
+  \node[wbboxaccent, right=of gc, text width=22mm] (pool) {Thread\\Pool};
+  \node[wbbox, right=of pool, text width=24mm] (cf) {Completable-\\Future};
+  \node[wbboxdb, right=of cf, text width=22mm] (mm) {Micrometer\\\scriptsize registry};
+  \draw[wbarrow] (heap)--(gc);
+  \draw[wbarrow] (gc)--(pool);
+  \draw[wbarrow] (pool)--(cf);
+  \draw[wbarrow] (cf)--(mm);
+  \node[wbboxwarn, below=8mm of gc, text width=24mm] (oom) {Out\-Of\-Memory\\\scriptsize leak diagnosis};
+  \node[wbboxgood, below=8mm of cf, text width=24mm] (act) {Actuator\\\scriptsize /prometheus};
+  \draw[wbarrowg] (heap.south) to[out=-90,in=180] (oom.west);
+  \draw[wbarrowg] (mm.south) to[out=-90,in=0] (act.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Heap} $\rightarrow$ \keyterm{Young/Old Gen} $\rightarrow$ \keyterm{GC} $\rightarrow$ \keyterm{Thread Pool} $\rightarrow$ \keyterm{Executor} $\rightarrow$ \keyterm{CompletableFuture} $\rightarrow$ \keyterm{Micrometer} $\rightarrow$ \keyterm{Prometheus}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The JVM Heap --- where your objects actually live}
+
+\glabel{What is it?} The \keyterm{heap} is the region of memory where every object you \code{new} is allocated. The JVM splits it into a \keyterm{Young Generation} (further divided into \keyterm{Eden} and two \keyterm{Survivor} spaces, \code{S0} and \code{S1}) and an \keyterm{Old Generation} (also called Tenured). Separately, \keyterm{Metaspace} --- which is \emph{not} on the heap --- holds class metadata.
+
+\glabel{Why does it exist?} The split exists because of one empirical observation, the \keyterm{weak generational hypothesis}: \emph{most objects die young}. A request creates hundreds of short-lived objects --- DTOs, strings, intermediate collections --- that are garbage before the response is sent. A few objects (caches, connection pools, the Spring context itself) live for the whole process. Treating those two populations differently lets the collector be fast for the common case.
+
+\begin{wbfigure}{Fig 11.3 --- The heap: new objects land in Eden; survivors are copied between S0/S1; long-lived objects are promoted to Old. Metaspace is off-heap.}
+\wbscale{\begin{tikzpicture}[node distance=4mm and 4mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=70mm, align=center] (young) {\textbf{Young Generation} \scriptsize (collected often, fast)};
+  \node[wbbox, below=3mm of young.south west, anchor=north west, text width=32mm] (eden) {\textbf{Eden}\\\scriptsize new allocations};
+  \node[wbbox, right=3mm of eden, text width=16mm] (s0) {\textbf{S0}\\\scriptsize survivor};
+  \node[wbbox, right=3mm of s0, text width=16mm] (s1) {\textbf{S1}\\\scriptsize survivor};
+  \node[wbboxgood, below=9mm of eden.south west, anchor=north west, text width=70mm] (old) {\textbf{Old Generation (Tenured)}\\\scriptsize promoted long-lived objects · collected rarely, slower};
+  \node[wbboxdb, below=3mm of old.south west, anchor=north west, text width=70mm] (meta) {\textbf{Metaspace} \scriptsize (off-heap) --- class metadata, not your objects};
+  \draw[wbarrow] (eden.south) to[out=-90,in=90] (old.north);
+  \node[wbcap, right=2mm of old.east, text width=20mm, anchor=west] {age threshold reached};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} New objects go into Eden. When Eden fills, a \keyterm{minor GC} runs: live objects are \emph{copied} to a survivor space and everything else in Eden is reclaimed in one sweep (copying is why young GC is cheap --- dead objects cost nothing to collect). Each survivor round increments an object's \keyterm{age}; once age crosses a threshold (often 15), the object is \keyterm{promoted} to the Old Generation. Old-gen fills far more slowly and is collected by a \keyterm{major} (or, in G1, \keyterm{mixed}) GC, which is more expensive.
+
+\glabel{When should I care?} When you set \code{-Xmx} (max heap) and \code{-Xms} (initial heap). A container with a 512MB limit that runs the JVM with the default heap can be killed by the kernel OOM-killer even though the JVM never threw --- because the JVM sized its heap against the host, not the cgroup. Modern JDKs are container-aware, but you should still set limits explicitly.
+
+\begin{behind}
+"Stop-the-world" (STW) means the JVM pauses \emph{every} application thread to collect safely. A minor GC pauses for a few milliseconds; a full GC on a large old generation can pause for hundreds of milliseconds or more. Tail latency spikes that correlate with GC logs are one of the most common "the app randomly freezes" incidents --- and they are invisible unless you enabled GC logging.
+\end{behind}
+
+\wbsub{3.2\quad Garbage Collectors --- choosing for a latency budget}
+
+\glabel{What is it?} A \keyterm{garbage collector} is the subsystem that finds unreachable objects and reclaims their memory. You do not call it; you \emph{configure} which algorithm runs and give it a goal.
+
+\glabel{How does it work internally?} Every collector starts from \keyterm{GC roots} (thread stacks, static fields, JNI references) and marks everything reachable; the rest is garbage. They differ in \emph{how} they do this while minimising the pause:
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{20mm} L{30mm} X@{}}
+\wbtablehead{Collector} & \wbtablehead{Best for} & \wbtablehead{Character}\\\midrule
+Serial & tiny heaps, CLI tools & single-threaded, simplest\\
+Parallel & batch / throughput jobs & maximises throughput, longer pauses\\
+G1 & general server apps & default since JDK 9; region-based; pause target\\
+ZGC / Shenandoah & latency-critical & sub-millisecond pauses, huge heaps\\
+\end{tabularx}
+\end{center}
+
+\glabel{When should I use which?} \code{G1} (Garbage-First) is the right default for almost every Spring Boot service --- it divides the heap into regions and aims to meet a \emph{pause-time target} (\code{-XX:MaxGCPauseMillis=200}). Reach for \code{ZGC} (\code{-XX:+UseZGC}) only when you have measured that GC pauses are your tail-latency problem and you can afford slightly lower throughput for consistently tiny pauses.
+
+\glabel{When should I \emph{not} tune it?} Before you have GC logs. Changing collectors by intuition is the classic junior mistake. Turn on logging first: \code{-Xlog:gc*:file=gc.log}. Then, and only then, decide.
+
+\begin{perfnote}
+The single highest-value flag in production is \code{-XX:+HeapDumpOnOutOfMemoryError} together with \code{-XX:HeapDumpPath}. It costs nothing until the moment you need it, and then it hands you the exact object graph that filled the heap --- the difference between a five-minute diagnosis and a week of guessing.
+\end{perfnote}
+
+\begin{javabox}[run-shopflow.sh --- production JVM flags]
+java -Xms512m -Xmx512m \
+     -XX:+UseG1GC \
+     -XX:MaxGCPauseMillis=200 \
+     -XX:+HeapDumpOnOutOfMemoryError \
+     -XX:HeapDumpPath=/var/log/shopflow/heapdump.hprof \
+     -Xlog:gc*:file=/var/log/shopflow/gc.log:time,uptime:filecount=5 \
+     -jar shopflow.jar
+\end{javabox}
+
+\wbsub{3.3\quad Diagnosing an OutOfMemoryError \& memory leaks}
+
+\glabel{What is it?} An \code{OutOfMemoryError: Java heap space} means the collector ran, reclaimed everything it could, and \emph{still} could not find room for a new allocation. It is a symptom, not a cause.
+
+\glabel{Why does it exist? (in a language with GC)} Because "garbage collected" does not mean "leak-proof." A Java memory leak is not a lost pointer like in C --- it is an object that is \emph{still reachable} from a GC root but will never be used again. The collector cannot reclaim it because, as far as it can prove, you might still use it.
+
+\begin{wbfigure}{Fig 11.4 --- The three classic leak shapes: an ever-growing static collection, an unclosed resource, and a listener never unregistered.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=24mm] (root) {\textbf{GC Root}\\\scriptsize static field};
+  \node[wbboxwarn, right=of root, text width=30mm] (map) {\textbf{static Map}\\\scriptsize grows forever, never evicts};
+  \node[wbboxwarn, below=6mm of map, text width=30mm] (res) {\textbf{unclosed streams}\\\scriptsize held by try without finally};
+  \node[wbboxwarn, below=6mm of res, text width=30mm] (lst) {\textbf{listeners}\\\scriptsize registered, never removed};
+  \draw[wbarrow] (root)--(map);
+  \draw[wbarrowg] (root.south) to[out=-90,in=180] (res.west);
+  \draw[wbarrowg] (root.south) to[out=-90,in=180] (lst.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How do I diagnose it?} Work the evidence in order. (1) Confirm the shape from the heap dump --- open it in \keyterm{Eclipse MAT} or VisualVM and read the \emph{dominator tree}: the object retaining the most memory is almost always your leak. (2) Watch \code{jvm.memory.used} over time; a healthy service saw-tooths (GC reclaims); a leaking one climbs a staircase that never comes back down. (3) Correlate with a deploy --- leaks usually start at a code change.
+
+\begin{seniornote}
+A leak is a \emph{reachability} bug, so the fix is always "stop holding the reference," never "add more heap." Bumping \code{-Xmx} to make an \code{OutOfMemoryError} go away buys you a slower, larger crash later --- and hides the actual defect. The heap dump tells you which field holds the reference; go delete that reference.
+\end{seniornote}
+
+\begin{misconception}
+"Java has garbage collection, so it can't leak memory." Wrong, and dangerously so. GC reclaims \emph{unreachable} objects. A \code{static List} that you keep adding to, an unbounded in-memory cache (a real risk after Day 9 if you skip eviction), or ThreadLocals never cleared on a pooled thread will all grow until the heap is gone. GC is a floor, not a guarantee.
+\end{misconception}
+
+\wbsub{3.4\quad Thread Pools --- never spawn raw threads}
+
+\glabel{What is it?} A \keyterm{thread pool} is a fixed set of worker threads plus a queue of pending tasks. You submit work; a free worker picks it up; when none is free, the task waits in the queue. In Java the interface is \code{ExecutorService}; in Spring the friendly wrapper is \code{ThreadPoolTaskExecutor}.
+
+\glabel{Why does it exist?} Threads are expensive: each costs roughly 1MB of stack, plus OS scheduling overhead, and creating one is not free. "One new \code{Thread} per request" scales beautifully in a demo and collapses under load --- ten thousand concurrent requests become ten thousand threads, several gigabytes of stack, and a machine thrashing on context switches. A pool \keyterm{bounds} concurrency to a number you chose on purpose.
+
+\glabel{How does it work internally?} This is the detail almost everyone gets wrong. A \code{ThreadPoolExecutor} does \emph{not} grow to \code{maxPoolSize} when it gets busy. The real order is: fill \code{corePoolSize} threads first; then \emph{queue} tasks until the queue is full; only when the queue is full does it create threads up to \code{maxPoolSize}; when \emph{both} are full it invokes the \keyterm{rejection policy}.
+
+\begin{wbfigure}{Fig 11.5 --- A submitted task's path through a pool: core threads, then the queue, then extra threads, then rejection. Most people wrongly assume the queue comes last.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=74mm, minimum height=8mm, align=left, text width=68mm}]
+  \node[stage, wbboxghost] (t) {\textbf{Task submitted} to executor};
+  \node[stage, below=of t] (core) {\textbf{1.} A core thread free? \hfill \scriptsize run it now};
+  \node[stage, below=of core] (q) {\textbf{2.} Else queue not full? \hfill \scriptsize enqueue, wait};
+  \node[stage, wbboxaccent, below=of q] (max) {\textbf{3.} Else create thread up to maxPoolSize};
+  \node[stage, wbboxwarn, below=of max] (rej) {\textbf{4.} Else REJECT \hfill \scriptsize CallerRunsPolicy / AbortPolicy};
+  \foreach \a/\b in {t/core,core/q,q/max,max/rej}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How do I size it?} Two workload shapes, two formulas:
+\begin{wbitem}
+  \item \keyterm{CPU-bound} (hashing, compression, in-memory computation): pool size $\approx$ number of cores. More threads than cores just adds context-switching; the CPUs are already saturated. Rule of thumb: \code{cores} or \code{cores + 1}.
+  \item \keyterm{I/O-bound} (calling a database, an HTTP downstream, RabbitMQ): threads spend most of their time \emph{waiting}, so you want many more than cores. A useful starting point is Little's Law: \code{threads = cores * (1 + waitTime / computeTime)}. If a task waits 90\% of the time on 8 cores, that is roughly $8 \times 10 = 80$ threads.
+\end{wbitem}
+
+\begin{javabox}[AsyncConfig.java]
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+  @Bean("orderExecutor")
+  public ThreadPoolTaskExecutor orderExecutor() {
+    var ex = new ThreadPoolTaskExecutor();
+    ex.setCorePoolSize(8);       // kept alive always (I/O-bound work)
+    ex.setMaxPoolSize(16);       // ceiling under burst
+    ex.setQueueCapacity(100);    // backlog before growing to max
+    ex.setThreadNamePrefix("order-async-");
+    // Backpressure: run on the caller instead of dropping work.
+    ex.setRejectedExecutionHandler(
+        new ThreadPoolExecutor.CallerRunsPolicy());
+    ex.initialize();
+    return ex;
+  }
+}
+\end{javabox}
+
+\begin{prodtip}
+Set a \code{ThreadNamePrefix}. When you take a thread dump at 3am, \code{order-async-7} tells you instantly which pool is stuck; \code{pool-2-thread-7} tells you nothing. Naming your pools is the cheapest observability you will ever add.
+\end{prodtip}
+
+\begin{secwarn}[the unbounded default]
+If you annotate a method \code{@Async} \emph{without} naming an executor and never define one, Spring falls back to a \code{SimpleAsyncTaskExecutor} --- which is \emph{not a pool at all}. It creates a brand-new thread for every single call, unbounded. Under load it does exactly what raw \code{new Thread()} does: exhausts memory. Always name your executor, and always define it.
+\end{secwarn}
+
+\wbsub{3.5\quad CompletableFuture --- composing async work}
+
+\glabel{What is it?} \code{CompletableFuture<T>} is a handle to a value that will exist \emph{later}. Unlike the old \code{Future}, it is \emph{composable}: you can chain transformations (\code{thenApply}), combine two futures (\code{thenCombine}), and handle failure (\code{exceptionally}) --- all without blocking a thread until you actually need the answer.
+
+\glabel{Why does it exist?} To turn \emph{sequential waiting} into \emph{concurrent waiting}. If a request needs inventory from one service and pricing from another, doing them one after another costs \code{inventoryTime + pricingTime}. Running them concurrently costs \code{max(inventoryTime, pricingTime)}. For two 100ms calls that is 200ms versus 100ms --- a free halving of latency on every request.
+
+\begin{wbfigure}{Fig 11.6 --- thenCombine forks two independent calls onto the pool, waits for both, then merges. The exceptionally branch catches either failure.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=26mm] (start) {\textbf{Request}\\\scriptsize needs both};
+  \node[wbbox, above right=5mm and 14mm of start, text width=30mm] (inv) {\textbf{supplyAsync}\\\scriptsize inventory (100ms)};
+  \node[wbbox, below right=5mm and 14mm of start, text width=30mm] (price) {\textbf{supplyAsync}\\\scriptsize pricing (100ms)};
+  \node[wbboxaccent, right=52mm of start, text width=26mm] (comb) {\textbf{thenCombine}\\\scriptsize merge $\rightarrow$ Quote};
+  \node[wbboxwarn, below=7mm of comb, text width=30mm] (exc) {\textbf{exceptionally}\\\scriptsize Quote.failed(...)};
+  \draw[wbarrow] (start.east) to[out=0,in=180] (inv.west);
+  \draw[wbarrow] (start.east) to[out=0,in=180] (price.west);
+  \draw[wbarrow] (inv.east) to[out=0,in=150] (comb.west);
+  \draw[wbarrow] (price.east) to[out=0,in=210] (comb.west);
+  \draw[wbarrowg] (comb)--(exc);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[QuoteService.java]
+public OrderQuote quote(long id) {
+  var inv = CompletableFuture.supplyAsync(
+      () -> inventoryClient.check(id), orderExecutor);
+  var price = CompletableFuture.supplyAsync(
+      () -> pricingClient.get(id), orderExecutor);
+
+  return inv
+      .thenCombine(price, (i, p) -> new OrderQuote(i, p))
+      .exceptionally(ex -> OrderQuote.failed(ex.getMessage()))
+      .join();   // block ONCE, here -- not on each call
+}
+\end{javabox}
+
+\glabel{How does it work internally?} Each stage runs on a thread from an \code{Executor} --- \emph{always pass your own}, or the work lands on the shared \code{ForkJoinPool.commonPool()}, which is sized to your CPU count and shared with every parallel stream in the JVM. \code{thenCombine} registers a callback that fires when \emph{both} inputs complete. \code{join()} is the one place you block, and you do it once at the end.
+
+\glabel{When should I \emph{not} use it?} When the calls are \emph{dependent} (B needs A's result) --- then there is nothing to parallelise, and \code{thenCompose} (flat-map for futures) expresses the sequential dependency more honestly. Also do not reach for it to parallelise CPU-bound loops; a parallel stream or a sized pool is clearer.
+
+\begin{misconception}
+An unhandled exception in a \code{CompletableFuture} chain does \emph{not} crash your app or print a stack trace by default --- it is stored inside the future and only surfaces if you call \code{join()}/\code{get()} or attach \code{exceptionally}/\code{handle}. Forget the handler and the failure vanishes silently: the email is never sent and nobody ever knows. Every chain needs an explicit failure path.
+\end{misconception}
+
+\wbsub{3.6\quad Observability --- Actuator \& Micrometer}
+
+\glabel{What is it?} \keyterm{Spring Boot Actuator} exposes operational HTTP endpoints --- \code{/actuator/health}, \code{/actuator/metrics}, \code{/actuator/prometheus} --- describing the live state of the app. \keyterm{Micrometer} is the vendor-neutral metrics \emph{facade} behind it (think SLF4J, but for metrics): you write to one API, and a registry ships the data to Prometheus, Datadog, CloudWatch, whichever you configure.
+
+\glabel{Why does it exist?} Because a service you cannot see is a service you cannot operate. Health endpoints let Kubernetes and load balancers know whether to route traffic; metrics let you alert \emph{before} users notice; the Prometheus endpoint is the standard scrape target the whole cloud-native ecosystem speaks.
+
+\begin{wbfigure}{Fig 11.7 --- Metrics flow: your code writes to Micrometer; the Prometheus registry renders text at /actuator/prometheus; Prometheus scrapes it; Grafana draws it.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=66mm, minimum height=8mm, align=left, text width=60mm}]
+  \node[stage, wbboxgood] (code) {\textbf{Your code} \hfill \scriptsize counter.increment()};
+  \node[stage, below=of code] (mm) {\textbf{Micrometer} facade \hfill \scriptsize MeterRegistry};
+  \node[stage, below=of mm] (reg) {\textbf{Prometheus registry} \hfill \scriptsize renders text format};
+  \node[stage, wbboxaccent, below=of reg] (ep) {\textbf{/actuator/prometheus} \hfill \scriptsize scrape endpoint};
+  \node[stage, below=of ep] (prom) {\textbf{Prometheus} \hfill \scriptsize pulls every 15s};
+  \node[stage, wbboxdb, below=of prom] (graf) {\textbf{Grafana} \hfill \scriptsize dashboards \& alerts};
+  \foreach \a/\b in {code/mm,mm/reg,reg/ep,ep/prom,prom/graf}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} Add \code{spring-boot-starter-actuator} and \code{micrometer-registry-prometheus} and the registry auto-configures (Day 1 conditions at work). Micrometer ships dozens of meters for free --- \code{jvm.memory.used}, \code{jvm.gc.pause}, \code{executor.active} (your pool!), \code{http.server.requests}. You add domain meters on top.
+
+\begin{javabox}[OrderMetrics.java]
+@Service
+public class OrderMetrics {
+  private final Counter ordersPlaced;
+
+  public OrderMetrics(MeterRegistry registry) {
+    this.ordersPlaced = Counter.builder("shopflow.orders.placed")
+        .description("Total orders placed")
+        .tag("channel", "web")
+        .register(registry);
+  }
+
+  public void recordOrder() { ordersPlaced.increment(); }
+}
+\end{javabox}
+
+\glabel{Counter vs the rest.} A \keyterm{Counter} only goes up (orders placed, errors); a \keyterm{Gauge} samples a current value (queue depth, active threads); a \keyterm{Timer} records duration \emph{and} count together (request latency). "Orders per minute" is a Counter --- Prometheus computes the per-minute rate at query time with \code{rate(shopflow\_orders\_placed\_total[1m])}. You never compute the rate yourself; you just count.
+
+\begin{seniornote}
+Expose \code{health} and \code{prometheus} on \emph{day one} of a service, not after the first incident. The endpoints cost almost nothing and mean that when something does go wrong, the data already exists. Retrofitting observability during an outage is like installing smoke detectors while the kitchen is on fire.
+\end{seniornote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Size every pool deliberately from measured workload (CPU vs I/O), never a copied default.
+  \item Give every executor a \code{ThreadNamePrefix} so thread dumps are readable.
+  \item Every async chain has an explicit \code{exceptionally}/\code{handle} failure path.
+  \item Set \code{-XX:+HeapDumpOnOutOfMemoryError} and GC logging in production from the start.
+  \item Expose \code{/actuator/health} and \code{/actuator/prometheus} before you need them.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item \code{@Async} with no configured executor --- silently unbounded thread creation.
+  \item Blocking calls inside a "concurrent" stream, gaining nothing but complexity.
+  \item Swallowing exceptions in a \code{CompletableFuture} chain with no handler.
+  \item Raising \code{-Xmx} to "fix" a leak instead of finding the retained reference.
+  \item Tuning the garbage collector by intuition, before ever reading a GC log.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two of today's diagrams carry most of the day's meaning. Redraw them from memory --- the act of reproducing a diagram is what promotes it from "recognised" to "owned."
+
+\begin{writespace}[Redraw: the heap (Eden, S0, S1, Old, Metaspace) with the promotion arrow]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: a task's four-step path through a thread pool (core $\rightarrow$ queue $\rightarrow$ max $\rightarrow$ reject)]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Make the Confirmation Path Async \& Observable}
+
+\textbf{Goal of this lab:} take ShopFlow's order-confirmation work off the request thread, run two downstream lookups concurrently, and prove the whole thing is visible through Actuator. You guide the design; do not paste a finished solution.
+
+\resetlab
+\labstep{Add the dependencies}
+Add \code{spring-boot-starter-actuator} and \code{micrometer-registry-prometheus} to the build. Restart and hit \code{/actuator} to see which endpoints are live by default.
+\labwhy{Observability is a dependency decision --- with the registry on the classpath, auto-configuration (Day 1) wires the Prometheus endpoint for you.}
+
+\labstep{Define a bounded \code{orderExecutor}}
+Create the \code{AsyncConfig} from Part 3 with explicit core/max/queue and a \code{ThreadNamePrefix}. Add \code{@EnableAsync} on it.
+\labwhy{This is the one bean that stops "async" from meaning "unbounded thread creation" --- everything else in this lab runs on it.}
+
+\labstep{Make confirmation \code{@Async}}
+Annotate \code{sendConfirmation(Order)} with \code{@Async("orderExecutor")} and return \code{CompletableFuture<Void>}. Log the current thread name inside it.
+\labwhy{Seeing \code{order-async-3} in the log (not \code{http-nio-8080}) is your proof the work actually hopped threads.}
+
+\labstep{Run two lookups with \code{thenCombine}}
+Fetch inventory and pricing concurrently via \code{supplyAsync(..., orderExecutor)}, combine into an \code{OrderQuote}, and attach \code{exceptionally}.
+\labwhy{You are converting sequential waiting into concurrent waiting --- and forcing yourself to write the failure path that most people forget.}
+
+\labstep{Add the orders-placed counter}
+Wire the \code{OrderMetrics} counter and call \code{recordOrder()} when an order is persisted. Confirm \code{shopflow\_orders\_placed\_total} appears at \code{/actuator/prometheus}.
+\labwhy{A domain metric is what lets you graph "orders per minute" tomorrow --- business signal, not just JVM internals.}
+
+\labstep{Expose the endpoints deliberately}
+In \code{application.yml}, set \code{management.endpoints.web.exposure.include} to \code{health,info,metrics,prometheus}. Scrape it with \code{curl}.
+\labwhy{Actuator hides most endpoints by default for safety; you opt in explicitly, so you know exactly what is public.}
+
+\labstep{Watch the pool under load}
+Fire concurrent requests (\code{hey} or \code{ab}) and watch \code{executor.active} and \code{executor.queued} at \code{/actuator/metrics}.
+\labwhy{You will \emph{see} the queue fill and the active count climb --- Fig 11.5 becomes a live graph instead of a static picture.}
+
+\begin{prodtip}
+Do not just trust that the work went async --- log \code{Thread.currentThread().getName()} on both the controller and inside \code{sendConfirmation}. Two different names is your receipt. One name means the proxy was bypassed (self-invocation, exactly the Day 1 trap) and you are still running synchronously.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two to make your reasoning explicit.
+
+\begin{thinkbox}
+Generational GC exists because "most objects die young." Think of a request in ShopFlow: name three objects it creates that die within milliseconds, and one that lives for the whole process. How does that split justify collecting the young generation far more often than the old?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You have an 8-core machine. One endpoint hashes passwords (pure CPU); another calls three slow HTTP downstreams (mostly waiting). Why would sizing both pools to 8 threads be wrong for at least one of them? Work out a defensible size for each.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+An unhandled exception in a \code{CompletableFuture} chain "fails silently." Predict, step by step, what a user sees when the confirmation email throws inside an async chain with no \code{exceptionally}. Where does the exception actually go, and why is that worse than a loud crash?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The heap that only ever climbs}
+\textbf{Symptom.} ShopFlow runs fine for a day, then throws \code{OutOfMemoryError: Java heap space} and restarts. The graph of \code{jvm.memory.used} is a staircase that never comes down --- no saw-tooth.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[NotificationRegistry.java]
+@Service
+public class NotificationRegistry {
+  // never evicted, never bounded
+  private static final List<Order> SENT = new ArrayList<>();
+
+  public void remember(Order o) { SENT.add(o); }  // grows forever
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{jvm.memory.used} climbs monotonically; GC runs but reclaims almost nothing; a heap dump was written by \code{-XX:+HeapDumpOnOutOfMemoryError}.
+  \item \textbf{Hypothesise.} A reachable-but-unused collection is retaining every \code{Order} ever seen --- a static \code{List} that only ever grows.
+  \item \textbf{Verify.} Open the dump in Eclipse MAT; the dominator tree shows \code{NotificationRegistry.SENT} retaining ~90\% of the heap.
+  \item \textbf{Fix.} Remove the static accumulation, or bound it (a size-capped cache with eviction); persist to the database if the history is genuinely needed.
+  \item \textbf{Prevent.} Ban unbounded static collections in review; add an alert on sustained \code{jvm.memory.used} growth over a rolling window.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The async email that never arrives}
+\textbf{Symptom.} Orders succeed and return 202, but customers report no confirmation email. No error appears in the logs --- nothing at all.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[ConfirmationService.java]
+@Async("orderExecutor")
+public CompletableFuture<Void> send(Order o) {
+  var body = CompletableFuture.supplyAsync(
+      () -> template.render(o), orderExecutor);
+  // renders, then sends -- but nothing catches a failure
+  return body.thenAccept(b -> mailClient.send(o.email(), b));
+}
+\end{javabox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} 202 returns instantly; \code{mailClient} is never hit for some orders; logs are empty --- suspiciously so.
+  \item \textbf{Hypothesise.} \code{template.render} (or \code{mailClient.send}) throws; with no \code{exceptionally}/\code{handle}, the exception is captured inside the future and never logged.
+  \item \textbf{Verify.} Attach \code{.exceptionally(ex -> \{ log.error("confirm failed", ex); return null; \})} and reproduce --- the stack trace finally appears.
+  \item \textbf{Fix.} Add the failure handler permanently; on failure, record a metric and enqueue a retry rather than dropping the email.
+  \item \textbf{Prevent.} Make "every chain ends in \code{exceptionally} or \code{handle}" a review rule; add a \code{shopflow.confirmations.failed} counter and alert on it.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} See a thread pool's four-step behaviour with your own eyes.\\
+\textbf{Context.} A deliberately tiny pool: core 2, max 2, queue 2.\\
+\textbf{Requirements.} Submit 10 tasks that each sleep 1s; log start/end with the thread name.\\
+\textbf{Hints.} Use a \code{ThreadPoolTaskExecutor} and \code{CallerRunsPolicy}; count how many run on the caller.\\
+\textbf{Expected outcome.} Two tasks run at once, two wait in the queue, and the rest run \emph{on the calling thread} --- backpressure made visible.\\
+\textbf{Common pitfalls.} Assuming max threads spawn immediately; they only appear after the queue is full.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~40 min}
+\textbf{Goal.} Halve a request's latency with \code{thenCombine}.\\
+\textbf{Context.} An endpoint that needs inventory and pricing, each a 200ms simulated call.\\
+\textbf{Requirements.} Implement it sequentially first, time it, then convert to two \code{supplyAsync} calls combined with \code{thenCombine}; time again.\\
+\textbf{Hints.} Pass \code{orderExecutor} explicitly to both; add \code{exceptionally} before \code{join}.\\
+\textbf{Expected outcome.} Sequential ~400ms, concurrent ~200ms; a failure in either call yields a graceful fallback, not a hang.\\
+\textbf{Common pitfalls.} Forgetting the executor argument, so work runs on the shared \code{commonPool}; omitting the handler and losing the error.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~60 min}
+\textbf{Goal.} Ship the "orders per minute" metric end to end.\\
+\textbf{Context.} Product wants a live orders-per-minute graph; ops wants a pool-saturation alert.\\
+\textbf{Requirements.} Add the \code{shopflow.orders.placed} counter, expose \code{/actuator/prometheus}, scrape it, and write the PromQL \code{rate(shopflow\_orders\_placed\_total[1m]) * 60}.\\
+\textbf{Hints.} Also chart \code{executor.active} / \code{executor.pool.max} for the pool; tag the counter by channel.\\
+\textbf{Expected outcome.} A rate that tracks real order volume, and a saturation ratio you can alert on above 0.8.\\
+\textbf{Common pitfalls.} Computing the rate in Java instead of letting Prometheus do it; forgetting the \code{\_total} suffix Prometheus adds to counters.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as hard-won reflexes.
+
+\begin{perfnote}
+"Profile before you optimise" is not a platitude --- it is the whole discipline. Attach \keyterm{Java Flight Recorder} (\code{-XX:StartFlightRecording}) or async-profiler, capture a real load, and read where time and allocation actually go. The bottleneck is almost never where intuition points; optimising a guessed hot path wastes more time than it ever saves.
+\end{perfnote}
+
+\begin{interview}
+Expect: \emph{"What's the difference between concurrency and parallelism?"} The crisp answer: \keyterm{concurrency} is \emph{structuring} work as independent tasks that can make progress in overlapping time windows; \keyterm{parallelism} is \emph{physically} running them at the same instant on multiple cores. A single-core machine can be concurrent (interleaving) but not parallel. Thread pools give you concurrency; multiple cores turn some of it into parallelism.
+\end{interview}
+
+\begin{seniornote}
+Backpressure is a design choice you make on purpose. When a pool is full you can drop the task (\code{AbortPolicy}), silently discard it (\code{DiscardPolicy}), or slow the producer by running the work on its own thread (\code{CallerRunsPolicy}). For order confirmations, \code{CallerRunsPolicy} is usually right --- it throttles intake instead of losing a customer's email. Choosing "just make the queue bigger" only moves the cliff further out.
+\end{seniornote}
+
+\begin{prodtip}
+Micrometer meters are cheap, but \emph{tags} are not free: every distinct tag combination is a separate time series. Never tag a counter with something unbounded like an order ID or user ID --- you will create millions of series and melt Prometheus (this is called a "cardinality explosion"). Tag with bounded dimensions: channel, region, status.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+ShopFlow already persists orders (Days 2--3), secures them (Day 5), caches reads (Day 9) and publishes an \code{OrderPlaced} event to RabbitMQ (Day 10). Today you make that async path \emph{correct} and \emph{observable} --- bounded, resilient, and measured.
+
+\begin{buildalong}[Day 11 --- async made correct \& observable]
+\begin{wbitem}
+  \item Define a dedicated, explicitly-sized \code{ThreadPoolTaskExecutor} named \code{orderExecutor} (core/max/queue set on purpose, named threads, \code{CallerRunsPolicy}) --- never the unbounded default.
+  \item Move order-confirmation work (render + email + the Day 10 RabbitMQ publish) onto that pool via \code{@Async("orderExecutor")}, returning \code{CompletableFuture<Void>}.
+  \item Fetch inventory and pricing concurrently with \code{CompletableFuture.thenCombine}, guarded by an \code{exceptionally} fallback, so one slow downstream can't hang the request.
+  \item Add \code{spring-boot-starter-actuator} + \code{micrometer-registry-prometheus}; expose \code{health}, \code{metrics} and \code{prometheus}, with \code{health} details shown only when authorised (Day 5).
+  \item Add a Micrometer \code{Counter} \code{shopflow.orders.placed} incremented on each persisted order; verify \code{rate(...[1m])} yields orders-per-minute.
+  \item Set production JVM flags: \code{-Xms}/\code{-Xmx} pinned, \code{-XX:+UseG1GC}, heap dump on OOM, GC logging.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} placing an order returns fast; confirmation runs on \code{order-async-*} threads (proven by the logged thread name); \code{/actuator/prometheus} shows \code{shopflow\_orders\_placed\_total}, \code{jvm\_memory\_used\_bytes} and \code{executor\_active\_threads}; and a forced downstream failure returns a graceful fallback quote instead of hanging.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The heap is split young/old because most objects die young; young GC is cheap copying, old GC is rarer and costlier.
+  \item An \code{OutOfMemoryError} is a reachability bug --- find the retained reference, don't raise \code{-Xmx}.
+  \item A thread pool fills core threads, then the queue, then grows to max, then rejects --- in that order.
+  \item Size CPU-bound pools near core count; size I/O-bound pools much higher because threads mostly wait.
+  \item \code{thenCombine} runs independent calls concurrently; every chain needs an \code{exceptionally}/\code{handle}.
+  \item Actuator + Micrometer give health, JVM metrics and a Prometheus endpoint --- expose them from day one.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Always name your executor and your threads; an unnamed \code{@Async} silently uses an unbounded default.
+  \item Pass your own \code{Executor} to \code{supplyAsync}, or work lands on the shared \code{commonPool}.
+  \item Counters only go up; let Prometheus compute the rate --- and never tag with unbounded cardinality.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Unbounded \code{@Async} default $\rightarrow$ thread exhaustion under load. \quad$\bullet$\quad Missing \code{exceptionally} $\rightarrow$ silent async failure.
+  \item Raising \code{-Xmx} to hide a leak $\rightarrow$ a slower, bigger crash later.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Heap layout}{Young (Eden + S0/S1) $\rightarrow$ promote by age $\rightarrow$ Old; Metaspace is off-heap.}
+\cheatitem{GC choice}{G1 = sane default (pause target); ZGC = sub-ms pauses; log first, tune second.}
+\cheatitem{OOM}{reachability bug --- read the heap-dump dominator tree, delete the reference.}
+\cheatitem{Pool order}{core $\rightarrow$ queue $\rightarrow$ max $\rightarrow$ reject; CPU$\approx$cores, I/O$\approx$cores$\times$(1+wait/compute).}
+\cheatitem{CompletableFuture}{\code{supplyAsync} + \code{thenCombine} + \code{exceptionally}; pass your executor; \code{join} once.}
+\cheatitem{Metrics}{Counter (up-only) · Gauge (sample) · Timer (duration+count); rate at query time.}
+\cheatitem{Actuator}{expose \code{health,metrics,prometheus}; micrometer ships JVM \& pool meters free.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Explain Young vs Old generation and why generational GC exists.}
+\iq{How would you size a thread pool for an I/O-bound service?}
+\iq{What happens if you don't handle an exception in a \code{CompletableFuture} chain?}
+\iq{What is the difference between concurrency and parallelism?}
+\iq{How would you diagnose a memory leak in a running Spring Boot app?}
+\iq{When would you choose ZGC over G1, and how would you justify it with data?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Java Performance} (Scott Oaks) --- the JVM memory and GC chapters.
+  \item \emph{Spring Boot Reference} --- "Production-ready Features" (Actuator) and Micrometer docs.
+  \item The G1 and ZGC tuning guides in the OpenJDK documentation; \code{jdk.jfr} for Flight Recorder.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 12).} You can now build a service that is fast and observable --- but shipping it by hand does not scale. Tomorrow you automate the path from commit to running container: build, test, package and deploy through CI/CD, so the "one artifact, many environments" promise from Day 1 finally comes true on every push.
+\end{keyidea}

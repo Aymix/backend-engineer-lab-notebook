@@ -1,0 +1,522 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 12 ============================
+\daychapter{12}{Delivery}{CI/CD}{Shipping safely and often --- pipelines, artifacts \& secrets}{7 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Build a GitHub Actions pipeline that runs the full test suite on every pull request and blocks the merge when it is red.
+  \item Explain and apply \emph{build once, promote the same artifact} --- and say precisely what drifts when you rebuild per environment.
+  \item Distinguish Continuous Delivery from Continuous Deployment, and place a manual approval gate in exactly the right spot.
+  \item Manage secrets and per-environment configuration safely: injected from the CI secret store at run time, never committed, never logged.
+  \item Add quality gates --- static analysis and dependency-CVE scanning --- that fail the build before a vulnerable change can merge.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} You have a service that builds, tests, containerises and reports its own health. But right now \emph{you} are the pipeline: you run \code{./mvnw verify} on your laptop, you type \code{docker build}, you remember to push the image, you SSH somewhere and restart it. That is slow, it is inconsistent between engineers, and it is exactly where a Friday-evening outage is born. Today you replace the human with an automated pipeline that does the same steps the same way on every change --- and refuses to ship when something is wrong.
+
+\glabel{Why backend engineers need it.} The single largest predictor of whether a team ships reliably is not talent --- it is the \emph{deployment pipeline}. Small, frequent, automatically-verified changes fail small and recover fast; big, manual, quarterly releases fail catastrophically. CI/CD is how a backend engineer turns "it works on my machine" into "it is proven to work, byte-for-byte, in production." Every incident you will ever post-mortem traces back through this pipeline: which commit, which build, which artifact, which gate did or did not catch it.
+
+\begin{keyidea}
+CI/CD is not a tool you install; it is a \keyterm{contract about how change reaches production}. The contract has three clauses: \keyterm{every change is automatically verified} (CI), \keyterm{every verified change produces one immutable artifact} (build once), and \keyterm{that same artifact is promoted --- never rebuilt --- through each environment} (CD). Learn the contract and the specific tool (GitHub Actions, Jenkins, GitLab CI) becomes an implementation detail.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} CI/CD sits \emph{around} everything you have built, not inside it. It consumes the tests from your earlier days, the \code{Dockerfile} from Day 8, and the metrics and health endpoints from Day 11 --- and it produces a tagged image in a registry plus a running deployment. Nothing in your application code changes; what changes is that a machine now performs the ritual of verifying and shipping it, identically, every time.
+
+\begin{wbfigure}{Fig 12.1 --- CI/CD wraps the whole application: it consumes your code and tests, emits one artifact, and promotes it into each environment.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=40mm] (push) {\textbf{git push / Pull Request}\\\scriptsize a developer proposes a change};
+  \node[wbboxaccent, below=of push, text width=52mm] (pipe) {\textbf{CI/CD Pipeline}\\\scriptsize \emph{this chapter} --- test $\rightarrow$ scan $\rightarrow$ build $\rightarrow$ promote};
+  \node[wbboxdb, below=of pipe, text width=52mm] (reg) {\textbf{Container Registry (GHCR)}\\\scriptsize one image, tagged by commit SHA};
+  \node[wbboxgood, below=of reg, text width=52mm] (env) {\textbf{Staging $\rightarrow$ Production}\\\scriptsize same artifact, only env vars differ};
+  \draw[wbarrow] (push)--(pipe); \draw[wbarrow] (pipe)--(reg); \draw[wbarrow] (reg)--(env);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 taught \emph{one jar, many environments} via profiles and environment variables; today that promise finally pays off, because the pipeline builds the jar once and lets the environment supply the differences. Day 8 gave you a container image; today the pipeline builds and tags it deterministically. Day 11 gave you observability; today it becomes the thing you watch during and after a deploy to know it worked.
+
+\glabel{Real company examples.} Amazon deploys to production thousands of times per day --- a number only possible because every deploy runs through an automated pipeline with automated verification and rollback. GitHub, GitLab and Netflix built their entire engineering culture around "merge to main is safe because the pipeline guarantees it." The 2018--2023 DORA research (the "Accelerate" studies) put numbers on it: elite teams deploy on-demand and recover from incidents in under an hour, and the mechanism is always a trustworthy pipeline.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Read this top-to-bottom as one change's journey from a developer's laptop to production. Every arrow is a place the pipeline can \emph{stop} the change if it is not good enough.
+
+\begin{wbfigure}{Fig 12.2 --- The Day 12 concept map: a single change flows down; each stage is a gate that can halt it. The image is built exactly once.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=70mm, minimum height=8mm, align=left, text width=64mm}]
+  \node[stg, wbboxghost] (s0) {\textbf{Push / Pull Request} \hfill \scriptsize a change is proposed};
+  \node[stg, below=of s0] (s1) {\textbf{Build + Unit \& Integration Tests} \hfill \scriptsize \code{./mvnw verify}};
+  \node[stg, below=of s1] (s2) {\textbf{Static Analysis + Dependency-CVE Scan} \hfill \scriptsize lint · SAST};
+  \node[stg, wbboxaccent, below=of s2] (s3) {\textbf{Build Image ONCE} \hfill \scriptsize tag = commit SHA};
+  \node[stg, wbboxdb, below=of s3] (s4) {\textbf{Push to Registry (GHCR)} \hfill \scriptsize immutable artifact};
+  \node[stg, below=of s4] (s5) {\textbf{Deploy Staging + Smoke Tests} \hfill \scriptsize prove it runs};
+  \node[stg, wbboxwarn, below=of s5] (s6) {\textbf{Manual Approval Gate} \hfill \scriptsize a human decides};
+  \node[stg, wbboxgood, below=of s6] (s7) {\textbf{Deploy Production} \hfill \scriptsize the \emph{same} image};
+  \foreach \a/\b in {s0/s1,s1/s2,s2/s3,s3/s4,s4/s5,s5/s6,s6/s7}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=5mm of s1, text width=26mm, anchor=west] {red build blocks the merge};
+  \node[wbcap, right=5mm of s2, text width=26mm, anchor=west] {a High CVE fails the job};
+  \node[wbcap, right=5mm of s6, text width=26mm, anchor=west] {Delivery = gate here; Deployment = no gate};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Continuous Integration} $\rightarrow$ \keyterm{Pipeline} $\rightarrow$ \keyterm{Job} $\rightarrow$ \keyterm{Runner} $\rightarrow$ \keyterm{Artifact} $\rightarrow$ \keyterm{Registry} $\rightarrow$ \keyterm{Promotion} $\rightarrow$ \keyterm{Approval Gate} $\rightarrow$ \keyterm{Continuous Delivery / Deployment}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Why CI/CD Exists: Integration Pain and the Release Cliff}
+
+\glabel{What is it?} \keyterm{Continuous Integration} (CI) means every push is automatically built and tested, so integration problems surface within minutes of the commit that caused them. \keyterm{Continuous Delivery} extends this so that every build which passes is \emph{ready to release} at the push of a button. \keyterm{Continuous Deployment} removes even the button --- a green build goes to production on its own.
+
+\glabel{Why does it exist?} Before CI, teams practised "integration week": everyone merged months of divergent work at once, then spent days untangling conflicts and regressions. And before CD, a release was a rare, manual, all-hands, terrifying event --- the "release cliff" --- which meant releases were batched large, which made them riskier still, a vicious circle. CI/CD breaks the circle by making the safe thing (small, frequent, verified change) also the easy thing.
+
+\glabel{How does it work internally?} A \keyterm{trigger} (a push or pull request) fires an event; the CI system spins up a clean, disposable machine; it checks out the exact commit, runs your build and tests, and reports a pass/fail status back onto the commit. \keyterm{Branch protection} then refuses to merge a pull request whose required status is not green. That single mechanism --- a required, automated status check --- is what mechanically prevents "merging past a red build."
+
+\glabel{When should I use it?} Always, from the second commit of any project that more than one person will touch, or that will run anywhere other than your laptop. The cost of a basic pipeline is an afternoon; the cost of not having one compounds forever.
+
+\glabel{When should I \emph{not}?} A throwaway spike or a one-file script does not need a pipeline. And Continuous \emph{Deployment} (fully automatic to prod) is a poor fit until your test suite and observability are genuinely trustworthy --- otherwise you are just automating the delivery of bugs.
+
+\begin{misconception}
+"CI just means running the tests on a server." Running tests is necessary but not sufficient. CI is the discipline of \emph{integrating small changes frequently into a shared main branch}, each one automatically verified. A pipeline that runs tests on a branch nobody merges for three weeks gives you the machinery of CI with none of its benefit --- the integration pain you were avoiding is still waiting for you at merge time.
+\end{misconception}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{30mm} X X@{}}
+\wbtablehead{Aspect} & \wbtablehead{Continuous Delivery} & \wbtablehead{Continuous Deployment}\\\midrule
+Release to prod & one click / manual approval & fully automatic on green build\\
+Human gate & yes, before production & none\\
+Prerequisite & trustworthy tests & trustworthy tests \emph{and} strong observability + fast rollback\\
+Good default for & most teams, regulated domains & mature teams with high test confidence\\
+\end{tabularx}\end{center}
+
+\wbsub{3.2\quad Build Once, Promote the Same Artifact}
+
+\glabel{What is it?} The pipeline builds your deployable \keyterm{artifact} --- for a containerised Spring Boot app, a Docker image --- \emph{exactly once}, then ships those identical bytes to staging, then (unchanged) to production. You never run \code{docker build} again for a later environment.
+
+\glabel{Why does it exist?} Because a rebuild is never guaranteed to be the same. Between your staging build and your prod build, a transitive dependency can publish a new patch, a base image tag like \code{eclipse-temurin:21} can move to a newer digest, a Maven mirror can return a different jar, the build clock changes, and a flaky test can pass this time. So "the same source" does not mean "the same binary." Promoting one artifact eliminates that entire class of "it worked in staging but not prod" mysteries.
+
+\glabel{How does it work internally?} The build produces an image identified by a content-addressed \keyterm{digest} (\code{sha256:...}). You additionally \emph{tag} it with the git commit SHA so a human can trace image $\rightarrow$ commit. Promotion is then just "tell environment N to run the image at this digest." Configuration that must differ between environments (database URL, feature flags, log level) is supplied at run time via environment variables --- the Day 1 and Day 8 lesson --- so the artifact itself carries no environment-specific baggage.
+
+\begin{wbfigure}{Fig 12.3 --- One immutable image feeds every environment; only the injected environment variables differ. Nothing is rebuilt.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=54mm] (img) {\textbf{Image @sha256:9f3c\dots (built once)}\\\scriptsize tag: \code{ghcr.io/org/shopflow:<sha>}};
+  \node[wbboxgood, below left=of img, text width=38mm] (stg) {\textbf{Staging}\\\scriptsize \code{DB\_URL=stg\dots}\\\code{LOG\_LEVEL=DEBUG}};
+  \node[wbboxgood, below right=of img, text width=38mm] (prd) {\textbf{Production}\\\scriptsize \code{DB\_URL=prod\dots}\\\code{LOG\_LEVEL=INFO}};
+  \draw[wbarrow] (img)--(stg); \draw[wbarrow] (img)--(prd);
+  \node[wbcap, below=10mm of img, text width=40mm] {same bytes --- only env vars change};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+An image tag is a mutable pointer; a digest is not. \code{shopflow:latest} can point at three different images this week --- which is why deploying \code{latest} to production is how you end up unable to answer "what is actually running?" Tagging by commit SHA (and pinning deploys to the immutable \code{sha256} digest) makes every running container traceable to one line of code.
+\end{behind}
+
+\begin{prodtip}
+Never deploy the \code{latest} tag to any environment you care about. Tag with the commit SHA (\code{ghcr.io/org/shopflow:\$GITHUB\_SHA}) so the image name itself answers "which commit is this?", and record the resolved \code{sha256} digest in your deploy log so a rollback is "point back at the previous digest," not "rebuild an old commit and hope."
+\end{prodtip}
+
+\wbsub{3.3\quad GitHub Actions, Anatomy First}
+
+\glabel{What is it?} \keyterm{GitHub Actions} runs a \keyterm{workflow} --- a YAML file in \code{.github/workflows/} --- in response to repository \keyterm{events}. A workflow contains \keyterm{jobs}; each job runs on a fresh \keyterm{runner} (a disposable VM); each job is a sequence of \keyterm{steps}; a step either runs a shell command or invokes a reusable \keyterm{action}.
+
+\glabel{How does it work internally?} On an event, GitHub schedules your jobs onto ephemeral runners. By default jobs run \emph{in parallel} on \emph{separate} machines that share nothing; you declare ordering with \code{needs:}, and pass files between jobs by uploading/downloading \keyterm{artifacts} or restoring a dependency \keyterm{cache}. Within a job, steps run sequentially and \emph{do} share the runner's filesystem and a per-job \code{GITHUB\_TOKEN}. When the job ends the runner is destroyed --- so every run starts from a clean, reproducible state, which is the whole point.
+
+\begin{wbfigure}{Fig 12.4 --- GitHub Actions anatomy. Each job gets a brand-new runner; nothing survives between jobs except artifacts and caches you explicitly persist.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=66mm, align=left, text width=60mm}]
+  \node[stg, wbboxghost] (ev) {\textbf{Event} \hfill \scriptsize \code{push} · \code{pull\_request}};
+  \node[stg, below=of ev] (wf) {\textbf{Workflow} \hfill \scriptsize \code{.github/workflows/ci.yml}};
+  \node[stg, wbboxaccent, below=of wf] (job) {\textbf{Job} on a fresh runner \hfill \scriptsize \code{ubuntu-latest}, ephemeral};
+  \node[stg, below=of job] (steps) {\textbf{Steps} (sequential, shared FS) \hfill \scriptsize checkout · setup · verify};
+  \node[stg, wbboxgood, below=of steps] (act) {\textbf{Actions} (reusable) \hfill \scriptsize \code{actions/checkout@v4}};
+  \foreach \a/\b in {ev/wf,wf/job,job/steps,steps/act}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work in practice?} Here is the workhorse workflow: test on every pull request, and on merge to \code{main} additionally build and push the image. Read the annotations top to bottom.
+
+\begin{yamlbox}[.github/workflows/ci.yml]
+name: CI
+on:
+  pull_request:            # run on every PR
+  push:
+    branches: [ main ]     # and on merge to main
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven      # restore ~/.m2 between runs
+      - run: ./mvnw --batch-mode verify   # compile + unit + integration
+  build-push:
+    needs: build-test                     # only if tests passed
+    if: github.ref == 'refs/heads/main'   # only on main, not PRs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                     # allow pushing to GHCR
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" \
+             | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build & push image (tagged by commit SHA)
+        run: |
+          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+\end{yamlbox}
+
+\glabel{The two decisions that matter here.} The \code{needs: build-test} makes the push job wait for --- and depend on --- a green test job. The \code{if: github.ref == 'refs/heads/main'} means pull requests are tested but never build or push an image, so a contributor's branch can never publish an artifact. Those two lines encode the entire "verify first, publish only trusted commits" policy.
+
+\begin{seniornote}
+Ephemeral runners are a security and correctness feature, not just a convenience. Because the machine is destroyed after each job, a compromised dependency in one run cannot linger to affect the next, and "works on the runner" genuinely means "works from a clean checkout." Seniors distrust any pipeline that runs on a long-lived, hand-maintained server precisely because state accumulates there --- the pipeline slowly becomes another pet you cannot reproduce.
+\end{seniornote}
+
+\begin{perfnote}
+The slowest part of most Java pipelines is re-downloading dependencies. Caching \code{~/.m2} (via \code{setup-java}'s \code{cache: maven}) and using Docker layer caching turns a five-minute cold build into a sub-minute warm one. But cache is an \emph{optimisation, never a correctness input}: a nightly job should occasionally build with the cache disabled, so a "works only because of a stale cached artifact" bug cannot hide forever.
+\end{perfnote}
+
+\wbsub{3.4\quad Secrets \& Environment Configuration Across Stages}
+
+\glabel{What is it?} A \keyterm{secret} is any credential the pipeline needs but must never appear in the repository: a registry token, a cloud key, a database password. CI providers offer an \keyterm{encrypted secret store}; you reference a secret by name and the value is injected at run time and never written to disk in your repo.
+
+\glabel{How does it work internally?} In GitHub Actions the \code{secrets} context resolves \code{\$\{\{ secrets.NAME \}\}} at run time from the encrypted store (scoped to the repo, the organisation, or a specific \keyterm{environment}). The runner substitutes the value into the step's environment and \emph{automatically masks} it in logs --- any exact match of the secret's value is replaced with \code{***}. The value lives only in the runner's memory for the life of the job, then vanishes with the runner.
+
+\begin{wbfigure}{Fig 12.5 --- A secret never touches the repo or the image. It is injected into the runner at run time and masked in logs.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=64mm, align=left, text width=58mm}]
+  \node[stg, wbboxdb] (store) {\textbf{Encrypted secret store} \hfill \scriptsize repo / org / environment};
+  \node[stg, below=of store] (inj) {\textbf{Injected at run time} \hfill \scriptsize as an env var in the step};
+  \node[stg, below=of inj] (use) {\textbf{Step uses it} \hfill \scriptsize \code{docker login}, deploy, \dots};
+  \node[stg, wbboxgood, below=of use] (log) {\textbf{Masked in logs} \hfill \scriptsize printed as \code{***}};
+  \foreach \a/\b in {store/inj,inj/use,use/log}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbboxwarn, right=8mm of inj, text width=30mm] {NEVER in: git repo, Dockerfile, image layers, \code{.env} commit};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Per-environment configuration.} The artifact is one image, so everything that differs between staging and production is a variable, not a rebuild. Non-secret differences (log level, feature flags) live in the deploy manifest; secret differences (the prod DB password) live in that environment's secret scope. GitHub \keyterm{Environments} let you attach both the variables and the secrets --- and the approval rules --- to a named environment like \code{production}.
+
+\begin{secwarn}[secrets do not belong in logs, forks, or images]
+Three ways beginners leak a secret. \textbf{(1)} \code{echo}-ing it for "debugging" --- masking catches exact matches but not base64 or partial prints, so never echo a secret at all. \textbf{(2)} Baking it into the image with \code{ENV API\_KEY=...} or \code{ARG} --- it is then in a layer anyone who pulls the image can read with \code{docker history}. \textbf{(3)} Exposing secrets to workflows triggered by \emph{forked} pull requests: on a plain \code{pull\_request} from a fork, GitHub withholds secrets for exactly this reason --- never "fix" that by switching to \code{pull\_request\_target}, which runs untrusted code \emph{with} your secrets.
+\end{secwarn}
+
+\begin{prodtip}
+The strongest secret is no long-lived secret. For deploys to AWS/GCP/Azure, use \keyterm{OIDC}: the workflow requests a short-lived identity token (\code{permissions: id-token: write}) that the cloud trusts for a few minutes, so there is no static key to leak or rotate. Long-lived tokens in the secret store are fine for a registry; they are a liability for cloud infrastructure.
+\end{prodtip}
+
+\wbsub{3.5\quad Quality Gates: Static Analysis, CVEs, and the Approval Gate}
+
+\glabel{What is it?} A \keyterm{quality gate} is a pipeline step that can \emph{fail the build} on grounds other than a failing test: a style/bug pattern from static analysis, a known vulnerability in a dependency, or --- for production --- a human who has not yet clicked approve.
+
+\glabel{Why does it exist?} Tests prove your code does what you meant; they do not catch a \code{log4j}-class vulnerability in a library you transitively depend on, or a resource leak a linter would flag, or a change that simply should not go to prod at 5pm on a Friday. Gates catch the failure modes tests structurally cannot.
+
+\glabel{How does it work internally?} \keyterm{Static analysis} (SpotBugs, PMD, Checkstyle) and \keyterm{SAST} (GitHub CodeQL) parse your code without running it and flag suspect patterns. \keyterm{Dependency scanning} (OWASP Dependency-Check, Trivy, Dependabot, Snyk) reads your lockfile, matches every dependency and its transitives against CVE databases, and fails the job if a vulnerability at or above a chosen severity is found. Each is just another job whose non-zero exit blocks the merge via branch protection.
+
+\begin{yamlbox}[scan-job snippet]
+  cve-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan dependencies for CVEs (fail on High)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: '1'      # non-zero -> the build fails
+\end{yamlbox}
+
+\glabel{The manual approval gate.} For a production deploy you want a human in the loop. In GitHub this is an \keyterm{Environment} with \emph{required reviewers}: a job that targets \code{environment: production} pauses and waits for an approver before its steps run. This is the exact line between Continuous Delivery (the gate exists) and Continuous Deployment (the gate is removed).
+
+\begin{yamlbox}[deploy-prod job]
+  deploy-prod:
+    needs: [ build-push ]
+    runs-on: ubuntu-latest
+    environment: production   # <- requires reviewer approval
+    steps:
+      - name: Promote the tested image
+        run: ./deploy.sh ghcr.io/${{ github.repository }}:${{ github.sha }}
+\end{yamlbox}
+
+\begin{dbinsight}
+Database migrations are the sharpest edge in any deploy pipeline, because the database --- unlike your stateless image --- cannot be rolled back by "point at the old digest." Gate migrations too: run them as an explicit, ordered step (Flyway/Liquibase) \emph{before} the app rolls out, and keep every migration backward-compatible with the previous app version, so the old and new image can briefly run against the same schema during a rolling deploy.
+\end{dbinsight}
+
+\begin{interview}
+Expect: \emph{"What would you include as a gate before allowing a deploy to production?"} A strong answer names layers, not one thing: green tests (required status check), passing static analysis, a dependency-CVE scan with a severity threshold, a successful staging deploy with smoke tests, and a human approval on the production environment --- plus a rollback plan defined \emph{before} the deploy, not during the incident.
+\end{interview}
+
+\wbsub{3.6\quad Jenkins --- Why It Is Still Around}
+
+\glabel{What is it?} \keyterm{Jenkins} is the open-source automation server that predates hosted CI. A \code{Jenkinsfile} (Groovy, declarative or scripted) expresses the same idea --- stages of checkout, build, test, deploy --- but runs on \keyterm{agents} you host and maintain yourself.
+
+\begin{bashbox}[Jenkinsfile (declarative)]
+pipeline {
+  agent any
+  stages {
+    stage('Build & Test') { steps { sh './mvnw verify' } }
+    stage('Image')        { steps { sh 'docker build -t app:$GIT_COMMIT .' } }
+    stage('Deploy')       {
+      when { branch 'main' }
+      steps { sh './deploy.sh app:$GIT_COMMIT' }
+    }
+  }
+}
+\end{bashbox}
+
+\glabel{When should I use it?} When the hosted model does not fit: on-prem or air-gapped infrastructure, heavy existing plugin/pipeline investment, or approval and audit workflows that predate and outlive any single SaaS. Jenkins trades operational overhead (you patch it, you scale the agents, you secure it) for total control.
+
+\glabel{When should I \emph{not}?} For a new project on GitHub with cloud deploys, a hosted runner (Actions, GitLab CI) removes an entire server you would otherwise own. The concepts transfer either way --- the same stages, the same "build once, promote," the same secret discipline --- so learn the model, and the tool is interchangeable.
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Fail the pipeline on any test failure --- and enforce it as a \emph{required status check} so a red build cannot be merged.
+  \item Build the image once; promote that exact artifact (by digest) through every environment.
+  \item Store secrets in the CI provider's encrypted store; prefer short-lived OIDC tokens for cloud access.
+  \item Run static analysis and a dependency-CVE scan as blocking gates, not advisory reports.
+  \item Define the rollback path (previous digest) \emph{before} you deploy, and keep migrations backward-compatible.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Skipping or disabling tests in CI "to make the pipeline faster."
+  \item Rebuilding the image separately for each environment, inviting silent drift.
+  \item Committing a \code{.env} file with real credentials, or baking secrets into an image layer.
+  \item Deploying the \code{latest} tag, so nobody can say which commit is in production.
+  \item No rollback plan --- deployment is one-directional with no fast revert.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these two from memory --- reproducing them is what moves the pipeline from "I read it" to "I could design it."
+
+\begin{writespace}[Redraw: the full pipeline from Push/PR to Production, marking every gate that can stop a change and where the image is built]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: one artifact promoted to staging and prod --- show what is identical and what differs]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Ship ShopFlow Through a Pipeline}
+
+\textbf{Goal of this lab:} give ShopFlow a real delivery pipeline --- tested on every pull request, built once and pushed on merge, and promoted to production only behind a human gate. You will not paste a finished workflow; you will grow it stage by stage and watch each gate work.
+
+\resetlab
+\labstep{Add the PR test workflow}
+Create \code{.github/workflows/ci.yml} with an \code{on: pull\_request} trigger and one \code{build-test} job that checks out, sets up Temurin 21 with Maven caching, and runs \code{./mvnw --batch-mode verify}. Open a pull request and watch the check run.
+\labwhy{Every later stage depends on a trustworthy "did the tests pass?" signal; you build that signal first.}
+
+\labstep{Make the check required}
+In the repo's branch-protection settings for \code{main}, mark the \code{build-test} check as required. Push a commit that breaks a test and confirm the merge button is disabled.
+\labwhy{A pipeline that \emph{reports} red without \emph{blocking} the merge is theatre --- branch protection is what turns it into a gate.}
+
+\labstep{Add the static-analysis and CVE gates}
+Add a \code{cve-scan} job (e.g. Trivy filesystem scan) configured to fail on \code{HIGH,CRITICAL}, and wire your static analysis (SpotBugs/Checkstyle) into \code{verify}. Introduce a dependency with a known CVE and watch the build go red.
+\labwhy{You are proving the gate catches a class of failure your tests never could --- a vulnerable library.}
+
+\labstep{Build once and push on merge, tagged by SHA}
+Add a \code{build-push} job with \code{needs: build-test} and \code{if: github.ref == 'refs/heads/main'} that logs in to GHCR with \code{GITHUB\_TOKEN}, builds the image, and pushes it tagged \code{ghcr.io/<org>/shopflow:\$\{\{ github.sha \}\}}.
+\labwhy{This is "build once": the artifact is created exactly here, on a trusted commit, and never rebuilt downstream.}
+
+\labstep{Deploy to staging and smoke-test the artifact}
+Add a \code{deploy-staging} job (\code{needs: build-push}) that runs the pushed image and hits its \code{/actuator/health} endpoint (Day 11) as a smoke test, failing if it is not \code{UP}.
+\labwhy{Promotion is only trustworthy if you prove the exact artifact actually boots and serves before you consider production.}
+
+\labstep{Add the production approval gate}
+Create a GitHub \code{production} environment with a required reviewer, and a \code{deploy-prod} job that targets \code{environment: production} and deploys \emph{the same} image digest from staging.
+\labwhy{This single line is the difference between Continuous Delivery and Continuous Deployment --- put the human exactly here.}
+
+\labstep{Wire secrets and verify nothing leaks}
+Move the registry/deploy credentials into the environment's secret store, reference them via the \code{secrets} context, and grep the run logs to confirm every value shows as \code{***}.
+\labwhy{The habit you are hard-wiring: a credential is injected at run time and masked --- it never lives in the repo, the image, or the logs.}
+
+\begin{prodtip}
+Do not deploy to a real cloud in this lab; a \code{deploy.sh} that just \code{echo}s "would deploy \code{<digest>} to \code{<env>}" is enough to exercise every gate. The learning is in seeing the pipeline \emph{stop} at a red test, a High CVE, and the approval prompt --- not in provisioning infrastructure.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Your teammate proposes rebuilding the image in the production deploy job "so prod always has a fresh build." Name three specific things that could differ between that rebuild and the image you tested in staging --- and explain why "same Dockerfile, same commit" does not guarantee "same bytes."
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Continuous Deployment removes the human approval gate. Under what concrete conditions (about your tests, your observability, and your rollback speed) would you \emph{trust} that automation --- and what is the first thing that would make you put the gate back?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A secret is masked in logs, so a colleague argues it is safe to \code{echo} it for debugging. Explain why masking is a last line of defence and not a licence --- give one way a masked secret can still leak.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The deploy that "succeeded" but shipped the wrong code}
+\textbf{Symptom.} The pipeline is green and the deploy job reports success, but production is still serving last week's behaviour. Nobody can say which commit is live.
+
+\smallskip\textbf{Evidence.}
+\begin{yamlbox}[deploy.yml (excerpt)]
+- run: docker build -t ghcr.io/org/shopflow:latest .
+- run: docker push ghcr.io/org/shopflow:latest
+- run: ./deploy.sh ghcr.io/org/shopflow:latest   # prod pulls "latest"
+\end{yamlbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} Every stage tags and pulls \code{latest}; the running container's image ID does not match the newest pushed digest.
+  \item \textbf{Hypothesise.} \code{latest} is a mutable pointer; the node cached an older \code{latest} and \code{deploy.sh} did not force a re-pull, so it re-ran the stale image.
+  \item \textbf{Verify.} Compare the \code{sha256} digest the deploy actually pulled against the digest built in this run; they differ.
+  \item \textbf{Fix.} Tag by commit SHA and deploy by the immutable digest, never by \code{latest}.
+  \item \textbf{Prevent.} Make the deploy log the resolved digest, and add a smoke check that asserts a \code{/actuator/info} build-commit matches the expected SHA.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Forked pull request fails --- "secret is empty"}
+\textbf{Symptom.} An external contributor's pull request fails at \code{docker login} with an empty password, though the same job works on internal branches.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{\$\{\{ secrets.GHCR\_TOKEN \}\}} resolves to an empty string only on PRs from forks.
+  \item \textbf{Hypothesise.} GitHub deliberately withholds secrets from \code{pull\_request} runs triggered by forks, because the PR contains untrusted code.
+  \item \textbf{Verify.} The same commit pushed to an internal branch has the secret and succeeds.
+  \item \textbf{Fix.} Do not need secrets on PR validation --- test and scan on PRs (no secrets), and build/push only on \code{push} to \code{main}, where secrets are available.
+  \item \textbf{Prevent.} Never "solve" it with \code{pull\_request\_target}, which would run the fork's untrusted code with your secrets --- a classic supply-chain foot-gun.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Make a red test block a merge.\\
+\textbf{Context.} A repo with a trivial passing test and a protected \code{main}.\\
+\textbf{Requirements.} Add a \code{pull\_request} workflow running \code{./mvnw verify}; mark it required; open a PR that fails the test.\\
+\textbf{Hints.} Branch protection lives in Settings $\rightarrow$ Branches; the check name must match the job.\\
+\textbf{Expected outcome.} The merge button is disabled with "required check failing."\\
+\textbf{Common pitfalls.} Reporting the check but not marking it \emph{required} --- the merge stays allowed.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~40 min}
+\textbf{Goal.} Build once and tag by commit SHA.\\
+\textbf{Context.} The Day 8 Dockerfile and a GHCR-enabled repo.\\
+\textbf{Requirements.} On \code{push} to \code{main}, build the image, tag it \code{ghcr.io/<org>/shopflow:\$\{\{ github.sha \}\}}, push, and print the resolved \code{sha256} digest.\\
+\textbf{Hints.} Grant \code{packages: write}; log in with \code{GITHUB\_TOKEN}; PRs must \emph{not} run this job.\\
+\textbf{Expected outcome.} A SHA-tagged image in GHCR and its digest in the log.\\
+\textbf{Common pitfalls.} Also tagging \code{latest} and then deploying \code{latest} --- defeating traceability.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~60 min}
+\textbf{Goal.} A gated promotion: staging auto, production on approval.\\
+\textbf{Context.} A pushed SHA-tagged image and two GitHub Environments.\\
+\textbf{Requirements.} Auto-deploy to \code{staging} with a health smoke test; then a \code{production} job requiring a reviewer that promotes the \emph{same} digest; CVE scan gates the whole chain.\\
+\textbf{Hints.} Use \code{needs:} to order jobs; \code{environment: production} enforces the reviewer.\\
+\textbf{Expected outcome.} The run pauses for approval before prod; approving promotes the identical artifact.\\
+\textbf{Common pitfalls.} Re-building or re-tagging between staging and prod, so "the same artifact" is a lie.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{seniornote}
+The question a senior asks of any pipeline is "what does green actually guarantee?" If green means "unit tests passed" but not "the image boots" or "no critical CVEs," then green is a comforting lie. Design the gates so that a green main branch is genuinely a promise you would stake a deploy on --- and treat a broken main as a stop-the-line, fix-it-now event, not background noise.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{"Why promote the same artifact instead of rebuilding per environment?"} The answer that lands names the mechanism: a rebuild can pull a moved base-image digest or a newer transitive dependency, so identical source can yield a different binary --- and then staging no longer tested what production runs. Promoting one digest makes staging a real test of the prod artifact.
+\end{interview}
+
+\begin{secwarn}[the pipeline is a supply-chain attack surface]
+Your CI has write access to your registry and, often, your cloud. Treat third-party actions like dependencies: pin them to a full commit SHA (not a moving tag), grant each job the least \code{permissions} it needs, and never expose secrets to untrusted (forked) code. A compromised action with your credentials is a breach, not a bug.
+\end{secwarn}
+
+\begin{perfnote}
+Fast pipelines get run; slow ones get skipped. Parallelise independent jobs, cache dependencies, and put the cheapest gates first (compile, unit tests) so a broken change fails in seconds, not after a ten-minute integration suite. But never trade away correctness for speed --- disabling a flaky test instead of fixing it is borrowing against a future outage.
+\end{perfnote}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+ShopFlow is already observable (Day 11) and containerised (Day 8), configured entirely through environment variables (Day 1). Today you automate its delivery so no human ever hand-builds or hand-ships it again.
+
+\begin{buildalong}[Day 12 --- an automated delivery pipeline]
+\begin{wbitem}
+  \item Add \code{.github/workflows/ci.yml}: on every pull request, check out, set up Temurin 21 (Maven cache), and run \code{./mvnw --batch-mode verify}; mark this check \emph{required} on \code{main}.
+  \item Add a dependency-CVE scan and static-analysis gate that fail the build on High/Critical findings.
+  \item On merge to \code{main}, build the Docker image \emph{once} and push it to GHCR tagged with \code{\$\{\{ github.sha \}\}}; log the resolved \code{sha256} digest.
+  \item Auto-deploy that image to a \code{staging} environment and smoke-test \code{/actuator/health} before proceeding.
+  \item Add a \code{production} GitHub Environment with a required reviewer; the prod job promotes the \emph{same} digest --- no rebuild.
+  \item Inject every credential from the environment's secret store via the \code{secrets} context; confirm all values appear as \code{***} in logs and that no \code{.env} is committed.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a pull request runs tests and scans and cannot merge while red; a merge to \code{main} publishes one SHA-tagged image, deploys it to staging, and pauses for human approval before promoting the identical artifact to production --- with no secret anywhere in the repository, image, or logs.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item CI verifies every change automatically; CD promotes verified changes; the pipeline is a contract, not a tool.
+  \item Build the artifact once and promote that exact digest --- rebuilding per environment invites silent drift.
+  \item Continuous Delivery keeps a human approval gate before prod; Continuous Deployment removes it.
+  \item Secrets come from the encrypted store at run time, masked in logs, never in the repo, image, or a committed \code{.env}.
+  \item Gates (tests, static analysis, CVE scan, staging smoke test, approval) define what "green" is allowed to mean.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item A required status check --- not just a reported one --- is what actually blocks a red merge.
+  \item Tag by commit SHA and deploy by immutable digest; \code{latest} destroys traceability and rollback.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Rebuilding per environment $\rightarrow$ "worked in staging, broke in prod." \quad$\bullet$\quad Secret in an image layer $\rightarrow$ readable via \code{docker history}.
+  \item Deploying \code{latest} $\rightarrow$ nobody knows what is live. \quad$\bullet$\quad No rollback plan $\rightarrow$ a one-way door.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{CI vs CD}{CI = auto build+test every change; Delivery = one-click release; Deployment = auto release, no gate.}
+\cheatitem{Build once}{one image, tagged by commit SHA, pinned by \code{sha256} digest; promote it unchanged.}
+\cheatitem{Config split}{same artifact; env vars differ per environment; secrets per environment scope.}
+\cheatitem{Secrets}{\code{\$\{\{ secrets.X \}\}} injected at run time, masked in logs; never committed or baked into an image.}
+\cheatitem{Gate}{required tests + static analysis + CVE scan + staging smoke test + human approval on prod.}
+\cheatitem{Runners}{ephemeral VMs; jobs parallel and stateless; order with \code{needs:}, share files via artifacts/cache.}
+\cheatitem{Jenkins}{same stages, self-hosted agents, Groovy \code{Jenkinsfile}; control at the cost of operational overhead.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{What is the difference between Continuous Delivery and Continuous Deployment?}
+\iq{How do you manage secrets in a CI/CD pipeline?}
+\iq{Why should the same artifact be promoted across environments instead of rebuilt?}
+\iq{What would you include as a gate before allowing a deploy to production?}
+\iq{Why do CI runners being ephemeral matter for correctness and security?}
+\iq{How does Jenkins differ from GitHub Actions, and when would you still choose it?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Continuous Delivery} (Humble \& Farley) --- the canonical text; chapters on the deployment pipeline and build-once.
+  \item GitHub Actions docs --- "Workflow syntax," "Encrypted secrets," and "Using environments for deployment."
+  \item The DORA / \emph{Accelerate} research --- the four key metrics and why pipelines drive them.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 13).} You can now ship safely and often --- but shipping is not the same as staying up. Tomorrow you make ShopFlow \keyterm{resilient}: timeouts, retries, circuit breakers and bulkheads, so that when a downstream dependency fails (and it will), your service degrades gracefully instead of collapsing. Delivery gets the code out; resilience keeps it alive once it is there.
+\end{keyidea}

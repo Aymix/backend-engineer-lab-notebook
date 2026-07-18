@@ -1,0 +1,571 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 09 ============================
+\daychapter{09}{Performance}{Redis \& Caching}{Serving reads without hammering the database --- cache-aside, TTL, eviction}{6--7 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Decide \emph{when} caching genuinely helps and when it only buys you a new consistency problem to debug.
+  \item Explain the cache-aside pattern precisely --- who owns the logic, what a hit and a miss actually do, and why the write-back step matters.
+  \item Implement Spring's cache abstraction correctly with Redis: \code{@Cacheable} on reads, \code{@CacheEvict} on every write path, and a deliberately configured cache manager.
+  \item Choose a sane TTL and a Redis eviction policy for real data, instead of caching "forever" and inheriting eventual staleness.
+  \item Prove a cache works by measuring its \emph{hit ratio} under load, and recognise the low-ratio smell that means you are paying serialization cost for nothing.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} Your ShopFlow catalog endpoint answers the same question thousands of times a minute: "give me product 42." Every one of those calls opens a connection, plans a query, reads pages off disk or the buffer pool, serialises rows, and hands them back --- tens of milliseconds of work to return data that did not change since the last request. Caching is the discipline of \emph{not doing expensive work you already did}. Today you put a fast in-memory layer in front of the database so repeated reads cost sub-millisecond lookups instead of full query round-trips.
+
+\glabel{Why backend engineers need it.} The database is almost always the hardest thing in your stack to scale. You can add stateless app servers behind a load balancer in minutes; you cannot casually add a primary database. Caching is how teams survive traffic they could never afford to serve from the database directly --- and it is where a specific, dangerous class of bug lives: \keyterm{stale data}. The engineer who reaches for a cache without a plan for invalidation ships a system that is fast \emph{and wrong}. This day is as much about knowing when \emph{not} to cache as about the annotations.
+
+\begin{keyidea}
+A cache is a \keyterm{bet that a read will repeat before the data changes}. When that bet pays off you turn a database query into a memory lookup. When it does not --- data that changes every request, or a write path that forgets to invalidate --- you have added latency, memory, serialization cost, and a consistency bug, for zero benefit. Caching is a trade, not a free win.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} Caching lives \emph{between} your service layer and everything expensive behind it. It is delivered by the exact proxy mechanism you studied on Day 1: \code{@Cacheable} is advice wrapped around your bean, checked \emph{before} your method body runs. It leans on the Redis container you added to the Compose stack on Day 8. And it sits directly on top of the JPA repositories from Days 2--3 --- the cache's whole job is to let those repositories rest.
+
+\begin{wbfigure}{Fig 9.1 --- Where caching fits: a read layer in front of the database that absorbs repeated reads, so only misses reach the repository.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=54mm, align=left, text width=48mm}]
+  \node[stg, wbboxghost] (client) {\textbf{Client} \hfill \scriptsize GET /api/v1/products/42};
+  \node[stg, below=of client] (svc) {\textbf{ProductService} \hfill \scriptsize @Cacheable proxy};
+  \node[stg, wbboxaccent, below=of svc] (cache) {\textbf{Redis cache} \hfill \scriptsize hit $\rightarrow$ return in sub-ms};
+  \node[stg, wbboxdb, below=of cache] (db) {\textbf{PostgreSQL} \hfill \scriptsize only a miss reaches here};
+  \draw[wbarrow] (client)--(svc);
+  \draw[wbarrow] (svc)--node[wbcap, right=1mm]{look up first}(cache);
+  \draw[wbarrow] (cache)--node[wbcap, right=1mm]{miss only}(db);
+  \draw[wbarrowg] (db) to[out=180,in=180] node[wbcap, left=1mm]{populate} (cache.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Real company examples.} Reddit famously caches rendered comment trees and listing pages in Redis/memcached because the same hot threads are read millions of times between edits. Twitter's timeline delivery is a giant fan-out cache problem. Stack Overflow serves the vast majority of its traffic from a small number of cache servers, keeping the SQL Server tier almost idle for reads. In every case the shape is identical to your ShopFlow catalog: read-heavy, change-rarely data that would crush the database if served fresh every time.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture before the details. Read it top-to-bottom (a single read) and notice the two callouts hanging off it --- the write path and the memory limit --- because those are where caches go wrong.
+
+\begin{wbfigure}{Fig 9.2 --- The Day 9 concept map: a read consults the cache first; two forces keep it honest --- eviction on write, and eviction under memory pressure.}
+\wbscale{\begin{tikzpicture}[node distance=5.5mm and 10mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=42mm, align=center, text width=38mm}]
+  \node[stg] (read) {\textbf{Read}\\\scriptsize @Cacheable};
+  \node[stg, wbboxaccent, below=of read] (lookup) {\textbf{Cache lookup}\\\scriptsize key = products::42};
+  \node[stg, wbboxgood, below left=of lookup] (hit) {\textbf{Hit}\\\scriptsize return, no DB};
+  \node[stg, wbboxwarn, below right=of lookup] (miss) {\textbf{Miss}\\\scriptsize query DB, populate};
+  \node[stg, wbboxdb, below=16mm of lookup] (ttl) {\textbf{TTL}\\\scriptsize entry self-expires};
+  \node[stg, right=14mm of lookup] (evict) {\textbf{@CacheEvict}\\\scriptsize write invalidates};
+  \node[stg, wbboxghost, left=14mm of lookup] (mem) {\textbf{Eviction policy}\\\scriptsize LRU when memory full};
+  \draw[wbarrow] (read)--(lookup);
+  \draw[wbarrow] (lookup)--(hit);
+  \draw[wbarrow] (lookup)--(miss);
+  \draw[wbarrow] (miss)--(ttl);
+  \draw[wbarrowg] (evict)--(lookup);
+  \draw[wbarrowg] (mem)--(lookup);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{cache-aside} $\rightarrow$ \keyterm{hit / miss} $\rightarrow$ \keyterm{@Cacheable} $\rightarrow$ \keyterm{key} $\rightarrow$ \keyterm{TTL} $\rightarrow$ \keyterm{@CacheEvict} $\rightarrow$ \keyterm{eviction policy} $\rightarrow$ \keyterm{hit ratio}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Why caching exists --- the read-amplification problem}
+
+\glabel{What is it?} A \keyterm{cache} is a small, fast store that holds copies of data whose authoritative home is somewhere slower. \keyterm{Redis} is the industry-standard choice: a single-threaded, in-memory key-value store with rich data structures, native \keyterm{TTL} (time-to-live) support, and optional persistence. You talk to it over the network in microseconds.
+
+\glabel{Why does it exist?} Because reads massively outnumber writes for most catalog-shaped data, and the database is the resource you cannot cheaply multiply. A product's price is written maybe once a week and read a million times before it changes. Serving those million reads from the database means a million query plans, a million buffer-pool touches, a million serializations --- to return bytes that were identical each time. Caching collapses that to one database read followed by 999{,}999 memory lookups.
+
+\glabel{How does it work internally?} Redis keeps its entire dataset in RAM, indexed by a hash table, so a \code{GET} is an O(1) memory read with no disk, no query planner, no join. Your app serialises a value once (say, a product as JSON), stores it under a key, and every later read deserialises from memory. The latency difference is not marginal: a Postgres round-trip is typically 1--20\,ms; a Redis \code{GET} on the same network is 0.1--0.5\,ms, and the database is freed to do work only it can do --- writes and cache misses.
+
+\begin{perfnote}
+The headline win is often not the per-request latency --- it is \emph{database load shed}. If 95\% of catalog reads become cache hits, your database sees a twentieth of the read traffic. That is frequently the difference between one database instance and a painful, expensive sharding project. Measure both: p99 latency \emph{and} queries-per-second at the database.
+\end{perfnote}
+
+\glabel{When should I use it?} Read-heavy, change-rarely, tolerant-of-slight-staleness data: product catalogs, configuration, reference tables, expensive computed aggregates, rendered fragments. \glabel{When should I \emph{not}?} Data that changes on nearly every read (a live counter you also write constantly), data where \emph{any} staleness is unacceptable and you have no clean invalidation hook, or data so cheap to fetch that serialization to Redis costs more than the query it replaces.
+
+\wbsub{3.2\quad The cache-aside pattern}
+
+\glabel{What is it?} \keyterm{Cache-aside} (also called lazy loading) means \emph{the application}, not the database, owns the caching logic. On a read the app looks in the cache first; on a hit it returns the cached copy; on a miss it queries the database, writes the result back into the cache with a TTL, and returns it. The cache is populated \emph{on demand}, by misses.
+
+\glabel{Why does it exist?} It is the simplest pattern that gives you the two properties you want: the cache only ever holds data someone actually asked for (no wasted memory pre-loading cold data), and the database remains the single source of truth. Other patterns exist --- read-through, write-through, write-behind --- but cache-aside is the default in Spring applications because \code{@Cacheable} implements exactly this flow for you.
+
+\begin{wbfigure}{Fig 9.3 --- Cache-aside read: only a miss touches the database, and the result is written back with a TTL so the next identical read is a hit.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=70mm, align=left, text width=64mm}]
+  \node[stg, wbboxghost] (req) {\textbf{1 · Read request} \hfill \scriptsize getProduct(42)};
+  \node[stg, below=of req] (look) {\textbf{2 · Look up key in Redis} \hfill \scriptsize GET products::42};
+  \node[stg, wbboxgood, below=of look] (hit) {\textbf{HIT} --- value present, return it \hfill \scriptsize sub-ms · DB never touched};
+  \node[stg, wbboxwarn, below=of hit] (miss) {\textbf{MISS} --- key absent, fall through \hfill \scriptsize the interesting path};
+  \node[stg, wbboxdb, below=of miss] (db) {\textbf{3 · Query the database} \hfill \scriptsize SELECT ... WHERE id = 42};
+  \node[stg, wbboxaccent, below=of db] (fill) {\textbf{4 · Write back with TTL} \hfill \scriptsize SET products::42 = json  EX 300};
+  \node[stg, below=of fill] (ret) {\textbf{5 · Return result} \hfill \scriptsize next identical read is now a HIT};
+  \draw[wbarrow] (req)--(look);
+  \draw[wbarrow] (look)--(hit);
+  \draw[wbarrow] (look)--(miss);
+  \draw[wbarrow] (miss)--(db);
+  \draw[wbarrow] (db)--(fill);
+  \draw[wbarrow] (fill)--(ret);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{misconception}
+Cache-aside does \emph{not} mean the cache and database update together atomically. On a miss there is a tiny window between "read from DB" and "write to cache" where a concurrent writer could change the row --- so a cache can briefly hold a value that is already one version behind. For catalog data with a short TTL this is fine. If it is not fine for your data, that is a strong signal you should not be caching it this way.
+\end{misconception}
+
+\wbsub{3.3\quad Spring's cache abstraction --- \code{@Cacheable}, \code{@CacheEvict}, \code{@CachePut}}
+
+\glabel{What is it?} Spring gives you a declarative caching layer that is \emph{provider-agnostic}: you annotate methods and Spring wires the cache-aside flow around them, whether the backing store is Redis, Caffeine, or a plain \code{ConcurrentHashMap}. You switch providers by changing configuration, not code.
+
+\glabel{How does it work internally?} Exactly like \code{@Transactional} from Day 1: a \keyterm{proxy}. When you annotate a bean method with \code{@Cacheable}, Spring wraps that bean in a proxy at the \code{postProcessAfterInitialization} step of the bean lifecycle. Calls from \emph{outside} the bean hit the proxy first; the proxy computes a key, checks the cache, and only invokes your real method body on a miss.
+
+\begin{wbfigure}{Fig 9.4 --- @Cacheable is proxy advice: on a hit your method body never runs. This is the same interception mechanism as @Transactional (Day 1).}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=66mm, align=left, text width=60mm}]
+  \node[stg, wbboxghost] (call) {\textbf{Caller} \hfill \scriptsize productService.getProduct(42)};
+  \node[stg, wbboxaccent, below=of call] (proxy) {\textbf{Cache proxy} intercepts \hfill \scriptsize builds key products::42};
+  \node[stg, wbboxgood, below=of proxy] (present) {\textbf{Key present?} $\rightarrow$ return cached \hfill \scriptsize method body SKIPPED};
+  \node[stg, wbboxwarn, below=of present] (absent) {\textbf{Key absent?} $\rightarrow$ invoke real method \hfill \scriptsize your code runs once};
+  \node[stg, wbboxdb, below=of absent] (body) {\textbf{Real getProduct()} \hfill \scriptsize hits repository / DB};
+  \node[stg, below=of body] (store) {\textbf{Proxy stores return value} \hfill \scriptsize then returns to caller};
+  \draw[wbarrow] (call)--(proxy);
+  \draw[wbarrow] (proxy)--(present);
+  \draw[wbarrow] (proxy)--(absent);
+  \draw[wbarrow] (absent)--(body);
+  \draw[wbarrow] (body)--(store);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[ProductService.java]
+@Service
+public class ProductService {
+  private final ProductRepository repo;
+  public ProductService(ProductRepository repo) { this.repo = repo; }
+
+  // On a hit, the method body below NEVER executes.
+  @Cacheable(value = "products", key = "#id")
+  public ProductResponse getProduct(Long id) {
+    return repo.findById(id)
+        .map(ProductResponse::from)
+        .orElseThrow(() -> new ProductNotFoundException(id));
+  }
+
+  // The write path MUST invalidate the cached copy.
+  @CacheEvict(value = "products", key = "#id")
+  public ProductResponse updateProduct(Long id, UpdateProductRequest req) {
+    Product p = repo.findById(id).orElseThrow();
+    p.applyUpdate(req);
+    return ProductResponse.from(repo.save(p));
+  }
+
+  @CacheEvict(value = "products", key = "#id")
+  public void deleteProduct(Long id) {
+    repo.deleteById(id);
+  }
+}
+\end{javabox}
+
+\glabel{The three annotations, sharply distinguished.} \code{@Cacheable} is read-through: check first, run the method only on a miss, store the result. \code{@CacheEvict} removes an entry --- use it on every write path so the next read repopulates from the database. \code{@CachePut} \emph{always} runs the method and overwrites the cached value with its return --- it is "update and refresh the cache in one step," useful when your update method already returns the fresh entity and you would rather refresh than invalidate.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{26mm} C{20mm} C{22mm} X@{}}
+\wbtablehead{Annotation} & \wbtablehead{Runs method?} & \wbtablehead{Touches cache} & \wbtablehead{Use when}\\\midrule
+\code{@Cacheable} & only on miss & read + write-back & Read paths you want to serve from cache.\\
+\code{@CacheEvict} & always & removes entry & Any write (update/delete) that makes the cached copy wrong.\\
+\code{@CachePut} & always & overwrites entry & Update methods that return the fresh value and should refresh, not invalidate.\\
+\end{tabularx}\end{center}
+
+\begin{secwarn}[the self-invocation trap, again]
+Because \code{@Cacheable} is proxy advice, the Day 1 self-invocation rule applies verbatim: a method calling \emph{another \code{@Cacheable} method on \code{this}} bypasses the proxy, so the cache is never consulted and the method runs every time. If a controller calls \code{service.getProduct()} the proxy intercepts; if \code{getProduct()} internally calls \code{this.getProductInternal()} where the annotation lives, the advice never fires. Keep cached methods as external entry points, or split them into a separate bean.
+\end{secwarn}
+
+\begin{prodtip}
+Spend real thought on the \code{key}. The default key is derived from \emph{all} method parameters, which is rarely what you want. Use SpEL to name it explicitly: \code{key = "\#id"}. Two different methods writing the same logical entity must produce the \emph{same} key, or an evict on one will not clear the entry cached by the other --- a classic source of "I evicted it but it is still stale."
+\end{prodtip}
+
+\wbsub{3.4\quad Configuring the Redis cache manager}
+
+\glabel{What is it?} Spring Boot will auto-configure a \code{RedisCacheManager} the moment \code{spring-boot-starter-data-redis} is on the classpath and \code{spring.cache.type=redis} is set --- another Day 1 auto-configuration reacting to the classpath. But the defaults serialise with JDK serialization and cache "forever," neither of which you want in production. You override the manager deliberately.
+
+\glabel{How does it work internally?} A \code{RedisCacheManager} owns one \code{RedisCacheConfiguration} per named cache. That config carries the TTL, the key prefix, the null-handling policy, and --- crucially --- the \keyterm{serializer} that turns your objects into bytes and back. Choose JSON serialization so the values are human-readable in \code{redis-cli} and portable across app restarts and language boundaries.
+
+\begin{javabox}[CacheConfig.java]
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+  @Bean
+  public RedisCacheManager cacheManager(RedisConnectionFactory cf) {
+    RedisCacheConfiguration base = RedisCacheConfiguration
+        .defaultCacheConfig()
+        .entryTtl(Duration.ofMinutes(5))       // default TTL for all caches
+        .disableCachingNullValues()            // do not cache "not found"
+        .serializeValuesWith(SerializationPair.fromSerializer(
+            new GenericJackson2JsonRedisSerializer()));
+
+    return RedisCacheManager.builder(cf)
+        .cacheDefaults(base)
+        .withCacheConfiguration("products",
+            base.entryTtl(Duration.ofMinutes(5)))   // per-cache override
+        .enableStatistics()                          // hit/miss counters
+        .build();
+  }
+}
+\end{javabox}
+
+\begin{yamlbox}[application.yml]
+spring:
+  cache:
+    type: redis
+  data:
+    redis:
+      host: redis        # the service name from Day 8 docker-compose
+      port: 6379
+      timeout: 2s        # fail fast if Redis is unreachable
+\end{yamlbox}
+
+\begin{dbinsight}
+\code{disableCachingNullValues()} is a small decision with big consequences. If you \emph{do} cache nulls, a lookup for a missing id stores an empty value for the whole TTL --- which protects the database against a burst of requests for a non-existent product (a cheap defence against \keyterm{cache penetration}). If you do \emph{not}, every request for a missing id falls through to the database. Neither is universally right; the point is to choose on purpose, knowing the trade.
+\end{dbinsight}
+
+\wbsub{3.5\quad TTL and eviction --- two different ways entries leave the cache}
+
+\glabel{What is it?} Entries leave a Redis cache for two independent reasons. \keyterm{TTL} expiry: every key you set carries a countdown, and Redis deletes it when the timer hits zero --- this is \emph{time-based} and per-key. \keyterm{Eviction}: when Redis hits its \code{maxmemory} limit, it forcibly removes keys to make room --- this is \emph{memory-pressure-based} and governed by a policy you configure. Do not confuse them; a key can vanish because its TTL expired \emph{or} because Redis was full and chose it as the victim.
+
+\glabel{Why does TTL matter?} Because caching "forever" guarantees eventual staleness. Even with perfect \code{@CacheEvict} on every write path, a bug, a missed code path, or an out-of-band database change (a DBA runs an \code{UPDATE}) will eventually leave a stale entry. A TTL is your \keyterm{backstop}: it caps how long any staleness can possibly last. Choose it by how tolerant the data is --- a product price might happily tolerate 5 minutes; a user's own just-edited profile might need seconds or immediate eviction.
+
+\begin{wbfigure}{Fig 9.5 --- A key's life: set with a TTL, served on hits, then removed by whichever comes first --- an explicit evict, TTL expiry, or memory-pressure eviction.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=50mm, align=left, text width=44mm}]
+  \node[stg, wbboxaccent] (set) {\textbf{SET + EX 300} \hfill \scriptsize written on a miss};
+  \node[stg, wbboxgood, below=of set] (serve) {\textbf{Served on hits} \hfill \scriptsize until it leaves};
+  \node[stg, wbboxwarn, below=of serve] (evict) {\textbf{@CacheEvict} \hfill \scriptsize a write removes it};
+  \node[stg, wbboxdb, below=of evict] (ttl) {\textbf{TTL expiry} \hfill \scriptsize timer hits zero};
+  \node[stg, wbboxghost, below=of ttl] (mem) {\textbf{Memory eviction} \hfill \scriptsize LRU picks a victim};
+  \draw[wbarrow] (set)--(serve);
+  \draw[wbarrowg] (serve.west) to[out=180,in=180] (evict.west);
+  \draw[wbarrowg] (serve.west) to[out=180,in=180] (ttl.west);
+  \draw[wbarrowg] (serve.west) to[out=180,in=180] (mem.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does eviction work internally?} When \code{used\_memory} approaches \code{maxmemory}, Redis applies its \code{maxmemory-policy} to decide which keys to drop. The policies differ on \emph{which keys are candidates} (all keys, or only those with a TTL set) and \emph{how a victim is chosen} (least-recently-used, least-frequently-used, random, or by nearest expiry).
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L{34mm} X@{}}
+\wbtablehead{maxmemory-policy} & \wbtablehead{Behaviour when memory is full}\\\midrule
+\code{noeviction} & Reject writes with an error. Safe for a datastore, dangerous for a cache --- writes start failing.\\
+\code{allkeys-lru} & Evict the least-recently-used key among \emph{all} keys. The sensible default for a pure cache.\\
+\code{allkeys-lfu} & Evict the least-\emph{frequently}-used key. Better when a stable hot set dominates.\\
+\code{volatile-lru} & Evict LRU, but \emph{only} among keys that have a TTL. Keeps TTL-less keys pinned.\\
+\code{volatile-ttl} & Evict the key with the shortest remaining TTL first.\\
+\end{tabularx}\end{center}
+
+\begin{propsbox}[redis.conf --- configure deliberately, not on defaults]
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+\end{propsbox}
+
+\begin{seniornote}
+The default policy in many Redis builds is \code{noeviction}. For a \emph{cache} that is a trap: the day your working set outgrows memory, Redis stops accepting writes and your cache-aside populate step throws instead of degrading gracefully. A senior sets \code{allkeys-lru} (or \code{allkeys-lfu}) explicitly and sizes \code{maxmemory} below the container limit, so eviction --- not the OOM killer --- reclaims memory.
+\end{seniornote}
+
+\wbsub{3.6\quad The consistency problem --- when caching hurts}
+
+\glabel{What is it?} The moment you keep a second copy of data, you own a \keyterm{consistency problem}: the cached copy and the database can disagree. Every technique this day teaches --- TTLs, \code{@CacheEvict}, \code{@CachePut} --- exists to bound that disagreement. Caching does not remove the problem; it makes it \emph{your} problem to manage deliberately.
+
+\glabel{When does caching actively hurt?} Four cases worth memorising. (1) \emph{Write-heavy data:} if a key is evicted almost as often as it is read, you pay serialization and invalidation cost for near-zero hit rate. (2) \emph{Low cardinality of repeats:} if every request asks for a different key (a per-user, per-second unique query), nothing is ever read twice before it expires --- the hit ratio floors at zero. (3) \emph{Correctness-critical reads:} inventory counts at checkout, account balances --- serving a stale value here is a bug with a dollar cost, and a 5-minute TTL is unacceptable. (4) \emph{Huge or lazy-loaded objects:} caching a JPA entity with lazy associations either explodes into a giant payload or throws a serialization error when Jackson touches an uninitialised proxy.
+
+\begin{misconception}
+"Add a cache to make it faster" is not a strategy. A cache with a 5\% hit ratio is \emph{slower} than no cache: every read now pays a Redis round-trip \emph{and} a database query on the 95\% of misses. If you cannot articulate why a given read will repeat before its data changes, you do not yet have a caching candidate --- you have a guess.
+\end{misconception}
+
+\begin{perfnote}
+Cache raw entities and you invite two failures: the lazy-association serialization blow-up, and cache-wide invalidation churn on any field change. Prefer caching a purpose-built, immutable \keyterm{response DTO} (e.g. \code{ProductResponse}) --- it serialises cleanly to JSON, carries only the fields the reader needs, and is decoupled from your persistence model.
+\end{perfnote}
+
+\wbsub{3.7\quad Proving it works --- the cache hit ratio}
+
+\glabel{What is it?} The \keyterm{hit ratio} is \code{hits / (hits + misses)} --- the fraction of reads served from cache without touching the database. It is the single number that tells you whether a cache is earning its keep. A ratio above roughly 80--90\% on catalog data is healthy; a ratio in the single digits means you are caching the wrong thing.
+
+\glabel{How do I measure it?} Two ways. Redis itself tracks \code{keyspace\_hits} and \code{keyspace\_misses} server-wide, visible in \code{redis-cli INFO stats}. Spring's \code{RedisCacheManager} tracks per-cache statistics once you call \code{.enableStatistics()} --- readable through the \code{RedisCache} at runtime, which lets you log a per-cache ratio line under load.
+
+\begin{bashbox}[inspect Redis directly]
+$ redis-cli
+127.0.0.1:6379> KEYS products::*
+1) "products::42"
+127.0.0.1:6379> TTL products::42
+(integer) 287
+127.0.0.1:6379> GET products::42
+"{\"id\":42,\"name\":\"Aeron Chair\",\"price\":1395.00}"
+127.0.0.1:6379> INFO stats
+keyspace_hits:18342
+keyspace_misses:271
+\end{bashbox}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Always set an explicit TTL. It is your backstop against every invalidation bug you have not found yet.
+  \item Evict on \emph{every} write path (update \emph{and} delete). Never rely on TTL alone for correctness-sensitive data.
+  \item Cache immutable response DTOs and computed aggregates --- not raw entities you will mutate.
+  \item Set \code{maxmemory} and \code{allkeys-lru} deliberately; never ship a cache on \code{noeviction}.
+  \item Log the hit ratio. A cache you do not measure is a cache you cannot trust.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Caching data that changes nearly every request --- zero benefit, pure added latency and complexity.
+  \item Forgetting \code{@CacheEvict} on the update path, serving stale data indefinitely (the \#1 bug).
+  \item Caching entities with lazy associations --- serialization errors or enormous payloads.
+  \item Treating Redis as the source of truth, with no plan for a cold or wiped cache.
+  \item Calling a \code{@Cacheable} method via \code{this} and wondering why it never caches.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have met five diagrams. Redraw two \emph{from memory} --- reproducing them is what moves them from "recognised" to "known."
+
+\begin{writespace}[Redraw: the cache-aside read flow --- hit path, miss path, and the write-back-with-TTL step]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the three ways a key leaves the cache --- @CacheEvict, TTL expiry, memory-pressure eviction]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Cache the Product Catalog}
+
+\textbf{Goal of this lab:} put a Redis-backed cache in front of ShopFlow's product read endpoint, prove it works with \code{redis-cli}, then deliberately break and fix consistency. Guide yourself through the steps --- do not paste a finished solution.
+
+\resetlab
+\labstep{Enable caching and point Spring at Redis}
+Add \code{spring-boot-starter-data-redis}, annotate a config class with \code{@EnableCaching}, and set \code{spring.cache.type=redis} with the \code{redis} host from your Day 8 Compose stack.
+\labwhy{Caching is off until \code{@EnableCaching} registers the proxy infrastructure --- without it, your annotations are silently inert.}
+
+\labstep{Annotate the read with \code{@Cacheable}}
+Put \code{@Cacheable(value = "products", key = "\#id")} on \code{getProduct(Long id)}. Return an immutable \code{ProductResponse} DTO, never the JPA entity.
+\labwhy{The DTO serialises cleanly to JSON and dodges the lazy-association blow-up; the explicit key makes eviction predictable.}
+
+\labstep{Configure the cache manager and TTL}
+Define a \code{RedisCacheManager} bean with a 5-minute \code{entryTtl}, JSON value serialization, and \code{.enableStatistics()}.
+\labwhy{Defaults use JDK serialization and no TTL --- both are production hazards you override once, here.}
+
+\labstep{Prove the hit with \code{redis-cli}}
+Call the endpoint twice. Run \code{redis-cli KEYS 'products::*'}, then \code{TTL} and \code{GET} on the key. Confirm the value is readable JSON and the TTL counts down.
+\labwhy{Seeing the key, its countdown, and its payload turns "I added an annotation" into "I can observe the cache working."}
+
+\labstep{Break consistency on purpose}
+Update the product \emph{without} \code{@CacheEvict}. Read it again and watch the stale price come back for the full TTL. This is the \#1 caching bug, reproduced deliberately.
+\labwhy{You cannot reliably prevent a bug you have never watched happen --- reproduce it once so you recognise it forever.}
+
+\labstep{Fix it with \code{@CacheEvict}}
+Add \code{@CacheEvict(value = "products", key = "\#id")} to \code{updateProduct} and \code{deleteProduct}. Repeat the update-then-read; confirm the fresh value now appears immediately.
+\labwhy{Eviction on the write path is the correctness half of caching; the TTL is only the backstop.}
+
+\labstep{Log the hit ratio under load}
+Fire a burst of reads (a loop or a small load tool). On a schedule, read the \code{RedisCache} statistics and log \code{hits}, \code{misses}, and the computed ratio.
+\labwhy{A hit ratio near your read-repeat rate proves the cache earns its cost; a low ratio tells you to stop caching this endpoint.}
+
+\begin{prodtip}
+Do not benchmark on a warm cache and call it a win. Measure \emph{cold} (first requests, all misses) and \emph{warm} (steady state) separately, and record database queries-per-second in both. The number that justifies the cache to your team is usually "database read QPS fell by 20x," not "p50 dropped 3\,ms."
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two to make your reasoning explicit.
+
+\begin{thinkbox}
+Your catalog read has a 5-minute TTL and correct \code{@CacheEvict} on writes. A colleague argues the TTL is now pointless --- "we evict on every write, so the cache is always correct." Where is the hole in that argument? Name a concrete way a stale entry survives despite perfect eviction code.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You add caching to an endpoint and the hit ratio settles at 4\%. Before deleting the cache, what would you check to decide whether the problem is the \emph{key design}, the \emph{TTL}, or the fact that this data simply should not be cached at all?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Caching a JPA entity with lazy associations tends to fail. Explain the mechanism: what does the JSON serializer encounter when it walks a lazy field, and why does a purpose-built response DTO avoid the problem entirely?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The price that will not update}
+\textbf{Symptom.} An admin updates a product's price; the write succeeds and the database row is correct, but the public endpoint keeps returning the old price for several minutes.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[ProductService.java]
+@Cacheable(value = "products", key = "#id")
+public ProductResponse getProduct(Long id) { ... }
+
+// no cache annotation here
+public ProductResponse updateProduct(Long id, UpdateProductRequest req) {
+  Product p = repo.findById(id).orElseThrow();
+  p.applyUpdate(req);
+  return ProductResponse.from(repo.save(p));   // DB is correct...
+}
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{redis-cli GET products::42} still shows the old price; \code{TTL} is a large positive number.
+  \item \textbf{Hypothesise.} The write path never invalidates the cache, so reads keep hitting the stale entry until the TTL expires.
+  \item \textbf{Verify.} Update, then immediately \code{GET products::42} in \code{redis-cli}; the old value is still there --- eviction never ran.
+  \item \textbf{Fix.} Add \code{@CacheEvict(value = "products", key = "\#id")} to \code{updateProduct} (and \code{deleteProduct}).
+  \item \textbf{Prevent.} A test that updates then reads and asserts the fresh value; treat "every write path evicts" as a review checklist item.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The cache that never caches}
+\textbf{Symptom.} You added \code{@Cacheable} but \code{redis-cli KEYS 'products::*'} is always empty and the database is queried on every read.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[ProductService.java]
+public ProductResponse getProduct(Long id) {
+  return this.loadProduct(id);          // internal call on this
+}
+@Cacheable(value = "products", key = "#id")
+public ProductResponse loadProduct(Long id) { ... }
+\end{javabox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} No keys appear in Redis; enabling cache debug logging shows the advice never fires.
+  \item \textbf{Hypothesise.} \code{loadProduct} is called via \code{this}, so the call bypasses the proxy and the \code{@Cacheable} advice never runs (the Day 1 self-invocation trap).
+  \item \textbf{Verify.} Have the controller call \code{loadProduct} directly (an external call) and watch a key appear in Redis.
+  \item \textbf{Fix.} Make the cached method the external entry point, or move it to a separate bean injected as a collaborator.
+  \item \textbf{Prevent.} Remember: all Spring annotation magic --- \code{@Transactional}, \code{@Async}, \code{@Cacheable} --- is proxy-based and dies on self-invocation.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} See a hit and a miss with your own eyes.\\
+\textbf{Context.} A single \code{@Cacheable} read endpoint backed by Redis.\\
+\textbf{Requirements.} Log a line inside the method body; call the endpoint twice for the same id.\\
+\textbf{Hints.} On a hit the method body does not run --- so your log line prints only once, on the miss.\\
+\textbf{Expected outcome.} First call logs and is slow; second call is fast and silent; \code{redis-cli} shows the key.\\
+\textbf{Common pitfalls.} Forgetting \code{@EnableCaching}, so the annotation is inert and the body runs both times.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Prove eviction fixes staleness.\\
+\textbf{Context.} A read and an update path for the same product.\\
+\textbf{Requirements.} First reproduce stale data with no \code{@CacheEvict}; then add it and show the fix.\\
+\textbf{Hints.} Watch \code{redis-cli GET} before and after the update in each version.\\
+\textbf{Expected outcome.} Version one serves stale for the TTL; version two returns fresh immediately after update.\\
+\textbf{Common pitfalls.} Evicting with a different \code{key} expression than the read used, so the wrong entry is cleared.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Instrument and defend the cache like an on-call team would.\\
+\textbf{Context.} A read-heavy catalog endpoint under a simulated load loop.\\
+\textbf{Requirements.} Enable cache statistics; log \code{hits}, \code{misses}, and the hit ratio on a schedule; set \code{maxmemory} and \code{allkeys-lru}; confirm eviction happens under pressure instead of write failures.\\
+\textbf{Hints.} Read the \code{RedisCache} statistics; use \code{redis-cli INFO memory} to watch \code{used\_memory} approach \code{maxmemory}.\\
+\textbf{Expected outcome.} A steady hit-ratio log line and evictions (not errors) once memory fills.\\
+\textbf{Common pitfalls.} Leaving the default \code{noeviction} policy, so writes start failing under load instead of degrading.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager, not trivia.
+
+\begin{seniornote}
+Before adding any cache, a senior asks one question: "what is the invalidation story?" If the answer is "TTL only," the data had better tolerate up to a full TTL of staleness. If it must be fresh, the answer must include an explicit evict on every write path --- and if you cannot enumerate those paths, you are not ready to cache this data yet.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{"When would caching actually hurt performance?"} The answer that lands names the mechanism: on a low hit ratio, every read pays a Redis round-trip \emph{plus} the database query on each miss, so you have strictly added latency. Then give the four smells --- write-heavy data, unique-per-request keys, correctness-critical reads, and lazy-loaded entities.
+\end{interview}
+
+\begin{perfnote}
+Beware the \keyterm{thundering herd}: when a hot key expires, thousands of concurrent requests all miss at once and stampede the database to repopulate it. Mitigations include slightly randomised TTLs (jitter) so keys do not expire in lockstep, and request coalescing so only one caller does the expensive reload while the rest wait. On a truly hot key this matters more than the average latency.
+\end{perfnote}
+
+\begin{secwarn}[cache your caches, not your secrets]
+Redis in a default Compose setup is unauthenticated and unencrypted. Never cache secrets, tokens, or PII you would not want readable via \code{redis-cli}. And remember the cache is a shared surface --- a poisoned or attacker-influenced key can serve bad data to every reader until it expires. In production, set a Redis password, restrict network access, and think about what a compromised cache could leak.
+\end{secwarn}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+ShopFlow already runs as a Compose stack (Day 8) with Postgres and a Redis container available, layered services and JPA repositories from earlier days, and constructor injection throughout. Today you make its read-heavy catalog endpoint fast --- correctly.
+
+\begin{buildalong}[Day 09 --- cache the product catalog, evict on write]
+\begin{wbitem}
+  \item Add \code{spring-boot-starter-data-redis}; enable caching with \code{@EnableCaching} on a config class.
+  \item Put \code{@Cacheable(value = "products", key = "\#id")} on the catalog read, returning an immutable \code{ProductResponse} DTO (never the entity).
+  \item Add \code{@CacheEvict(value = "products", key = "\#id")} to both \code{updateProduct} and \code{deleteProduct} --- the correctness half.
+  \item Define a \code{RedisCacheManager} bean: 5-minute TTL, JSON value serialization, \code{disableCachingNullValues}, \code{enableStatistics}.
+  \item Configure Redis with \code{maxmemory} and \code{allkeys-lru} so it evicts under pressure instead of rejecting writes.
+  \item Add a scheduled log line reporting cache \code{hits}, \code{misses}, and the hit ratio, and prove it climbs under a read loop.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} the catalog read is served from Redis (verify with \code{redis-cli KEYS} and \code{TTL}), an update immediately reflects the new value (eviction works), and the hit-ratio log line shows a healthy ratio under load.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Caching is a bet that a read repeats before the data changes --- it trades a consistency problem for speed.
+  \item Cache-aside: the application checks the cache, and only a miss touches the database, then writes back with a TTL.
+  \item \code{@Cacheable}/\code{@CacheEvict}/\code{@CachePut} are proxy advice --- and die on self-invocation, exactly like \code{@Transactional}.
+  \item TTL (time-based) and eviction policy (memory-based) are two independent ways an entry leaves the cache.
+  \item The hit ratio is the number that proves a cache earns its keep; a low ratio means stop caching that read.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Every cache entry needs an explicit TTL; "forever" guarantees eventual staleness.
+  \item Every write path must evict; forgetting it is the single most common caching bug.
+  \item Set \code{allkeys-lru} and \code{maxmemory} deliberately --- never ship a cache on \code{noeviction}.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Missing \code{@CacheEvict} $\rightarrow$ stale reads for a full TTL. \quad$\bullet$\quad Self-call \code{@Cacheable} $\rightarrow$ never caches.
+  \item Caching lazy entities $\rightarrow$ serialization blow-ups. \quad$\bullet$\quad Low hit ratio $\rightarrow$ pure added latency.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Cache-aside}{app checks cache; miss $\rightarrow$ query DB $\rightarrow$ write back with TTL $\rightarrow$ return.}
+\cheatitem{@Cacheable}{run method only on a miss, store the result; key it explicitly with SpEL.}
+\cheatitem{@CacheEvict / @CachePut}{evict removes on write; put always runs and overwrites the entry.}
+\cheatitem{TTL vs eviction}{TTL = per-key timer; eviction = policy when \code{maxmemory} is hit (\code{allkeys-lru}).}
+\cheatitem{Proxy rule}{caching is proxy advice --- \code{this.method()} bypasses it and never caches.}
+\cheatitem{Hit ratio}{\code{hits/(hits+misses)}; low ratio = you are caching the wrong read.}
+\cheatitem{Don't cache}{write-heavy, unique-per-request, correctness-critical, or lazy-loaded entities.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Explain the cache-aside pattern --- who owns the logic, and what happens on a hit versus a miss?}
+\iq{What is the risk of caching without a TTL?}
+\iq{How do you keep a cache consistent with the database when a row is updated?}
+\iq{When would caching actually \emph{hurt} performance?}
+\iq{What is the difference between TTL expiry and a Redis eviction policy?}
+\iq{Why does a \code{@Cacheable} method called from within the same class not cache?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Spring Framework Reference} --- "Cache Abstraction," including SpEL key generation and conditional caching.
+  \item \emph{Redis documentation} --- "Key eviction" and the \code{maxmemory-policy} options.
+  \item \emph{AWS / caching literature} --- cache-aside vs read-through vs write-through, and the thundering-herd problem.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 10).} Caching absorbs reads; it does nothing for the slow, write-side work that makes a request wait --- sending email, generating invoices, calling third parties. Tomorrow you move that work off the request thread with a message queue, trading synchronous latency for asynchronous throughput.
+\end{keyidea}
+

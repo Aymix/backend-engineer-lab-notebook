@@ -1,0 +1,565 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 02 ============================
+\daychapter{02}{Data Layer}{Database Mastery}{SQL, transactions \& query performance --- the layer where real incidents are born}{8--9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Write joins by thinking in \emph{sets}, not loops --- and spot the \code{LEFT JOIN} that silently degrades into an \code{INNER JOIN}.
+  \item Reason about indexes like someone who has debugged a slow production query: what a B-Tree buys you, and the leftmost-prefix rule that decides whether your composite index is even used.
+  \item Choose an isolation level under pressure by naming the exact anomaly (dirty / non-repeatable / phantom) each level prevents --- and what it costs.
+  \item Read an \code{EXPLAIN ANALYZE} plan and locate the bottleneck: the sequential scan where you expected an index.
+  \item Design a normalized schema with real constraints, know when to deliberately denormalize, and paginate large lists without timing out at page 500.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} On Day 1 you learned that every component in a Spring Boot app is a bean living inside a container. Today you follow those beans down to where they finally touch reality: the database. This is the layer that separates engineers who \emph{use} a database from engineers who can \emph{explain why a query is slow at 3am}. The framework can hide the SQL behind a repository method, but it cannot hide a full-table scan, a lock held too long, or a schema that makes the right query impossible.
+
+\glabel{Why backend engineers need it.} Most severe production incidents are, at bottom, database incidents: a connection pool exhausted because a transaction stayed open across an HTTP call; a report endpoint that offset-paginates ten million rows and times out; a "unique" email that turns out to be duplicated because the uniqueness was only enforced in Java. You cannot fix what you cannot see, and the database is where the truth of your system's performance and correctness actually lives.
+
+\begin{keyidea}
+A database is not a bucket you throw objects into --- it is a \keyterm{set-oriented, concurrent, durable} engine with its own cost model. Three levers control almost everything: the \keyterm{schema} (what shapes are even representable), the \keyterm{indexes} (what the planner can do quickly), and the \keyterm{transaction boundary} (what stays consistent under concurrency). Master those three and the rest is detail.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} Your \code{@Repository} beans (Day 3) sit on top of a JDBC \code{DataSource} that sits on top of raw SQL that sits on top of the storage engine. Every abstraction above is only as good as your understanding of the layer below it. When JPA generates a surprising query on Day 3, or a cache goes stale on Day 9, the debugging always bottoms out in the SQL and the plan you learn to read today.
+
+\begin{wbfigure}{Fig 2.0 — Where today lives: your beans call repositories, but performance and correctness are decided in the SQL, indexes, and transaction boundary you design now.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   row/.style={wbbox, minimum width=58mm, minimum height=8.5mm, align=left, text width=52mm}]
+  \node[row, wbboxghost] (req) {\textbf{HTTP Request} \hfill \scriptsize Day 4};
+  \node[row, below=of req] (svc) {\textbf{Service (bean)} \hfill \scriptsize Day 1};
+  \node[row, below=of svc] (repo) {\textbf{Repository / JPA} \hfill \scriptsize Day 3};
+  \node[row, wbboxaccent, below=of repo] (sql) {\textbf{SQL · Indexes · Transactions} \hfill \scriptsize this chapter};
+  \node[wbcyl, below=7mm of sql, minimum width=30mm] (db) {Database};
+  \foreach \a/\b in {req/svc,svc/repo,repo/sql,sql/db}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=6mm of sql, text width=26mm, anchor=west] {every layer above is only as fast as this one};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1's \code{@Transactional} was introduced as a proxy-delivered concern --- today you learn \emph{what the proxy actually opens}: a database transaction with a concrete isolation level and lock footprint. The self-invocation trap you met yesterday matters precisely because the thing being skipped is a \code{BEGIN}/\code{COMMIT} around real writes.
+
+\glabel{Real company examples.} Stripe, GitHub and Twitter all switched their public list APIs to cursor-based pagination for the same reason you will learn today. Postgres powers Instagram and Datadog at enormous scale not because it is magic but because their engineers respect indexes, plans and vacuum. Every "we scaled the database" story is really a story about the four topics in this chapter.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture before the details. The data layer has four pillars: how you \emph{read} (joins), how you make reads \emph{fast} (indexes \& plans), how you keep data \emph{correct under concurrency} (transactions), and how you \emph{shape} it in the first place (schema \& constraints).
+
+\begin{wbfigure}{Fig 2.1 — The Day 2 concept map: four pillars sit on one engine. Reads and speed on the left, correctness and structure on the right.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 6mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, minimum width=34mm] (core) {\textbf{SQL Data Layer}\\\scriptsize set-oriented · concurrent · durable};
+  \node[wbbox, below=10mm of core, xshift=-42mm, text width=26mm] (join) {\textbf{Joins}\\\scriptsize INNER · LEFT\\think in sets};
+  \node[wbbox, below=10mm of core, xshift=-14mm, text width=26mm] (idx) {\textbf{Indexes \& Plans}\\\scriptsize B-Tree · prefix\\EXPLAIN};
+  \node[wbboxdb, below=10mm of core, xshift=14mm, text width=26mm] (tx) {\textbf{Transactions}\\\scriptsize ACID · isolation\\locks};
+  \node[wbbox, below=10mm of core, xshift=42mm, text width=26mm] (sch) {\textbf{Schema}\\\scriptsize constraints · 3NF\\denormalize};
+  \foreach \n in {join,idx,tx,sch}{\draw[wbarrow] (core)--(\n);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{JOIN} $\rightarrow$ \keyterm{Index} $\rightarrow$ \keyterm{Leftmost-Prefix} $\rightarrow$ \keyterm{Constraint} $\rightarrow$ \keyterm{Transaction} $\rightarrow$ \keyterm{Isolation Level} $\rightarrow$ \keyterm{Execution Plan} $\rightarrow$ \keyterm{Keyset Pagination}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Joins --- Think in Sets, Not Loops}
+
+\glabel{What is it?} A join combines rows from two tables on a matching condition. The junior mental model is a nested loop --- "for each user, find their orders." The correct mental model is \keyterm{set algebra}: an \code{INNER JOIN} is the intersection (only rows that match on both sides), a \code{LEFT JOIN} keeps every row from the left set and fills unmatched right-side columns with \code{NULL}, a \code{FULL OUTER JOIN} keeps unmatched rows from both sides.
+
+\glabel{Why does it exist?} Normalization (Section 3.6) deliberately splits data across tables to avoid duplication. Joins are how you put it back together at read time. The trade is intentional: cheaper, safer writes in exchange for slightly more work on reads.
+
+\glabel{How does it work internally?} The planner picks a physical join strategy --- \keyterm{nested loop} (great when one side is tiny and the other is indexed), \keyterm{hash join} (build a hash table on the smaller side, probe with the larger --- great for big unsorted sets), or \keyterm{merge join} (both inputs sorted, walk them in lockstep). You do not choose this directly; you \emph{enable} good choices by indexing the join columns.
+
+\begin{wbfigure}{Fig 2.2 — The LEFT JOIN trap. A filter on the right table in the WHERE clause runs \emph{after} the join and discards the NULL rows, silently turning your outer join back into an inner join.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=44mm] (top) {\textbf{LEFT JOIN orders ON o.user\_id = u.id}\\\scriptsize keeps ALL users; order columns are NULL for users with no orders};
+  \node[wbboxwarn, below=of top, xshift=-30mm, text width=38mm] (trap) {\textbf{... WHERE o.status = 'PAID'}\\\scriptsize NULL fails the test $\rightarrow$ user rows dropped};
+  \node[wbboxgood, below=of top, xshift=30mm, text width=38mm] (fix) {\textbf{... AND o.status = 'PAID' (in ON)}\\\scriptsize condition applied during the join};
+  \node[wbboxwarn, below=8mm of trap, text width=38mm] (rt) {\textbf{= silently an INNER JOIN}\\\scriptsize users with no PAID order vanish};
+  \node[wbboxgood, below=8mm of fix, text width=38mm] (rf) {\textbf{= a true LEFT JOIN}\\\scriptsize every user kept; unmatched $\rightarrow$ NULL};
+  \draw[wbarrow] (top)--(trap); \draw[wbarrow] (top)--(fix);
+  \draw[wbarrow] (trap)--(rt); \draw[wbarrow] (fix)--(rf);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{sqlbox}[the LEFT JOIN trap and its fix]
+-- TRAP: this silently behaves like an INNER JOIN
+SELECT u.id, u.name, o.id AS order_id
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id
+WHERE o.status = 'PAID';   -- drops users with no PAID order!
+
+-- FIX: push the condition into the ON clause
+SELECT u.id, u.name, o.id AS order_id
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id AND o.status = 'PAID';
+-- users with no PAID order still appear, with NULL order_id
+\end{sqlbox}
+
+\glabel{When should I use it?} \code{LEFT JOIN} whenever "rows on the left that have no match still matter" --- users with zero orders, products never sold. \code{INNER JOIN} when you only care about matched pairs. Teams standardize on \code{LEFT} over \code{RIGHT} for readability: the driving table reads first.
+
+\glabel{When should I \emph{not}?} Do not join to then throw the extra columns away, and do not fan out a one-to-many join and then \code{COUNT} in Java --- let the database aggregate. Beware the accidental cartesian product from a missing or wrong \code{ON} condition.
+
+\begin{misconception}
+"\code{LEFT JOIN} always keeps all left rows." It keeps them \emph{through the join} --- but a later \code{WHERE} on a right-table column is evaluated after the join and will delete the \code{NULL}-filled rows. The rule: filters that belong to the outer side go in the \code{ON} clause; filters that should apply to the final result go in \code{WHERE}.
+\end{misconception}
+
+\wbsub{3.2\quad Indexes \& the Leftmost-Prefix Rule --- the Highest-Leverage DB Skill}
+
+\glabel{What is it?} An \keyterm{index} is a separate, sorted data structure (almost always a \keyterm{B-Tree}) that maps column values to row locations, letting the engine jump straight to matching rows instead of scanning the whole table. It is the single highest-leverage skill in this chapter: one correct index routinely turns a 2-second query into a 2-millisecond one.
+
+\glabel{Why does it exist?} A table is stored roughly in insertion order (a "heap"). Finding \code{WHERE email = ?} in a heap means reading every row --- $O(n)$. A B-Tree keeps values sorted so lookups, range scans and ordered reads become $O(\log n)$. You are trading write cost and disk space for read speed.
+
+\glabel{How does it work internally?} A B-Tree is a shallow, balanced tree of sorted pages; even a billion-row table is only a handful of levels deep, so a lookup touches a few pages. Because the leaves are sorted, the same structure serves equality (\code{=}), ranges (\code{>}, \code{BETWEEN}), prefix \code{LIKE 'abc\%'}, and \code{ORDER BY} without a separate sort. This ordering is exactly why column order in a \emph{composite} index matters.
+
+\glabel{The leftmost-prefix rule.} A composite index on \code{(a, b, c)} is sorted by \code{a}, then \code{b} within equal \code{a}, then \code{c}. So it can satisfy lookups on \code{a}, on \code{a+b}, or on \code{a+b+c} --- but \emph{never} on \code{b} alone or \code{c} alone, because those values are scattered throughout the tree. Think of a phone book sorted by last name then first name: useless for finding everyone named "James."
+
+\begin{wbfigure}{Fig 2.3 — Leftmost-prefix in action. One composite index on (user\_id, status, created\_at) serves the left column and any left-anchored prefix, but not a lone trailing column.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\footnotesize},
+   q/.style={wbbox, minimum width=76mm, minimum height=7mm, align=left, text width=70mm}]
+  \node[wbboxaccent, minimum width=76mm, align=center] (idx) {\textbf{INDEX (user\_id, status, created\_at)}};
+  \node[q, wbboxgood, below=6mm of idx] (a) {WHERE user\_id = ?  \hfill \scriptsize uses index (leftmost)};
+  \node[q, wbboxgood, below=of a] (b) {WHERE user\_id = ? AND status = ?  \hfill \scriptsize uses index};
+  \node[q, wbboxgood, below=of b] (c) {WHERE user\_id=? AND status=? AND created\_at>?  \hfill \scriptsize full match};
+  \node[q, wbboxwarn, below=of c] (d) {WHERE status = ?  \hfill \scriptsize skips leftmost $\rightarrow$ cannot use};
+  \node[q, wbboxwarn, below=of d] (e) {WHERE created\_at > ?  \hfill \scriptsize trailing only $\rightarrow$ cannot use};
+  \foreach \a/\b in {idx/a,a/b,b/c,c/d,d/e}{\draw[wbarrowg] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{sqlbox}[a composite index matched to a real query]
+-- Planned query: "list this user's orders in a status, newest first"
+SELECT id, total_cents, created_at
+FROM orders
+WHERE user_id = 42 AND status = 'PAID'
+ORDER BY created_at DESC;
+
+-- One index serves the filter AND the sort:
+CREATE INDEX idx_orders_user_status_created
+  ON orders (user_id, status, created_at DESC);
+\end{sqlbox}
+
+\glabel{When should I use it?} Index the columns you \code{WHERE} on, \code{JOIN} on, and \code{ORDER BY} on --- especially every foreign key, which most databases do \emph{not} index automatically. Design the composite index to match your hottest query's predicate order.
+
+\glabel{When should I \emph{not}?} Do not index every column "just in case." Each index must be maintained on every \code{INSERT}, \code{UPDATE} and \code{DELETE}, and consumes storage and cache. Over-indexing silently taxes every write. Low-cardinality columns (a boolean \code{is\_active}) rarely benefit from a standalone index.
+
+\begin{dbinsight}
+An index only helps if the planner can use it \emph{as written}. Wrapping the indexed column in a function --- \code{WHERE LOWER(email) = ?} --- defeats a plain index on \code{email}, because the stored values are not lowercased. Fixes: store a normalized column, or create a matching \emph{expression index} \code{ON users (LOWER(email))}. The same trap hits implicit type casts and leading-wildcard \code{LIKE '\%abc'}.
+\end{dbinsight}
+
+\begin{perfnote}
+A \keyterm{covering index} includes every column a query needs, so the engine answers from the index alone --- an \emph{Index Only Scan} --- never touching the table heap. Adding the selected columns (via \code{INCLUDE} in Postgres, or as trailing key columns) can eliminate the random heap fetches that dominate the cost of an otherwise-indexed query.
+\end{perfnote}
+
+\wbsub{3.3\quad Constraints --- Push Correctness Into the Database}
+
+\glabel{What is it?} Constraints are rules the database enforces on every write, no matter which application, script, or human issued it: \code{PRIMARY KEY} (unique, non-null identity), \code{FOREIGN KEY} (this value must exist in another table), \code{UNIQUE}, \code{NOT NULL}, and \code{CHECK} (an arbitrary boolean predicate).
+
+\glabel{Why does it exist?} Application-layer validation is necessary but never sufficient: code has bugs, and sooner or later a second consumer --- a batch job, an admin console, a migration script --- writes to the table without going through your service. A constraint is the last line of defense that no code path can bypass. It converts "we hope this is true" into "the database guarantees this is true."
+
+\begin{sqlbox}[constraints move correctness into the schema]
+CREATE TABLE order_items (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  order_id    BIGINT NOT NULL REFERENCES orders(id)
+                ON DELETE CASCADE,
+  product_id  BIGINT NOT NULL REFERENCES products(id)
+                ON DELETE RESTRICT,
+  quantity    INT    NOT NULL CHECK (quantity > 0),
+  unit_cents  INT    NOT NULL CHECK (unit_cents >= 0),
+  UNIQUE (order_id, product_id)   -- a product appears once per order
+);
+CREATE INDEX idx_order_items_order   ON order_items(order_id);
+CREATE INDEX idx_order_items_product ON order_items(product_id);
+\end{sqlbox}
+
+\glabel{How does it work internally?} A \code{FOREIGN KEY} makes the database check the referenced row exists on insert/update, and controls what happens when the parent is deleted. \code{ON DELETE CASCADE} deletes the children automatically; \code{ON DELETE RESTRICT} (or the default \code{NO ACTION}) refuses the delete while children exist. This is a design decision, never a reflex: cascading from \code{orders} to \code{order\_items} is sensible (an order's lines have no life of their own), but cascading a product delete that wipes historical order lines would destroy your revenue history.
+
+\begin{secwarn}[uniqueness must live in the database]
+Enforcing "unique email" only with a \code{findByEmail} check in Java is a race condition, not a constraint: two concurrent signups both read "not found," both insert, and you now have duplicate accounts. Only a \code{UNIQUE} index makes it atomic --- the second \code{INSERT} fails. Validate in the app for a nice error message, but let the database be the source of truth.
+\end{secwarn}
+
+\begin{seniornote}
+Model foreign-key \emph{delete behaviour} deliberately, table by table. A good default for anything you might need for audit or history is \code{RESTRICT} plus a soft-delete flag, not \code{CASCADE}. "Convenient" cascades are how a single mistaken \code{DELETE} in a support tool erases a customer's entire order history in one statement.
+\end{seniornote}
+
+\wbsub{3.4\quad Transactions, ACID \& Isolation Levels}
+
+\glabel{What is it?} A \keyterm{transaction} groups statements so they succeed or fail as one unit. Its guarantees are \keyterm{ACID}: \keyterm{Atomicity} (all-or-nothing), \keyterm{Consistency} (a valid state maps to a valid state, respecting constraints), \keyterm{Isolation} (concurrent transactions do not corrupt each other's view), and \keyterm{Durability} (once committed, it survives a crash).
+
+\glabel{Why does it exist?} Because partial success is often worse than total failure. A money transfer that debits one account but fails to credit the other has \emph{destroyed} money. Wrapping both writes in one transaction means the system can only move between valid states.
+
+\begin{wbfigure}{Fig 2.4 — Atomicity: a transfer is two writes in one transaction. Either both commit or both roll back --- the account totals never disagree.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=66mm, minimum height=7.4mm, align=left, text width=60mm}]
+  \node[stg, wbboxghost] (b) {\textbf{BEGIN}};
+  \node[stg, below=of b] (d) {UPDATE accounts SET balance = balance - 100 WHERE id = 1};
+  \node[stg, below=of d] (c) {UPDATE accounts SET balance = balance + 100 WHERE id = 2};
+  \node[stg, wbboxaccent, below=of c] (end) {\textbf{COMMIT both}  \quad OR \quad  \textbf{ROLLBACK both}};
+  \foreach \a/\bb in {b/d,d/c,c/end}{\draw[wbarrow] (\a)--(\bb);}
+  \node[wbcap, right=6mm of c, text width=26mm, anchor=west] {one unit --- no state where money is missing};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} \keyterm{Isolation} is the subtle one. Perfect isolation (as if transactions ran one at a time) is expensive, so databases offer levels that trade correctness guarantees for concurrency. Each level is defined by which \emph{anomalies} it permits:
+
+\begin{wbitem}
+  \item \keyterm{Dirty read} --- you read another transaction's \emph{uncommitted} change, which may still roll back.
+  \item \keyterm{Non-repeatable read} --- you read a row twice in one transaction and get different values because another transaction committed an \code{UPDATE} in between.
+  \item \keyterm{Phantom read} --- you run the same \code{WHERE} twice and the second run returns \emph{new rows} another transaction inserted.
+\end{wbitem}
+
+\begin{center}\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{33mm} C{16mm} C{20mm} C{16mm} X@{}}
+\wbtablehead{Level} & \wbtablehead{Dirty read} & \wbtablehead{Non-repeatable} & \wbtablehead{Phantom} & \wbtablehead{Typical default}\\\midrule
+READ UNCOMMITTED & Possible  & Possible  & Possible   & rarely used\\
+READ COMMITTED   & Prevented & Possible  & Possible   & PostgreSQL default\\
+REPEATABLE READ  & Prevented & Prevented & Possible*  & MySQL / InnoDB default\\
+SERIALIZABLE     & Prevented & Prevented & Prevented  & strictest, lowest concurrency\\
+\end{tabularx}\end{center}
+
+{\footnotesize\itshape\color{cInk!70}*Postgres implements \code{REPEATABLE READ} as snapshot isolation, which also blocks most phantoms; the SQL standard merely permits them.}
+
+\glabel{When should I use each?} Default to \code{READ COMMITTED} --- it prevents the genuinely dangerous dirty read while keeping high concurrency. Reach for \code{REPEATABLE READ} or \code{SERIALIZABLE}, or explicit locking (Day 3's optimistic/pessimistic locking), only on specific hot paths where correctness demands it: inventory decrement, balance transfer, "book the last seat."
+
+\begin{javabox}[the boundary Spring opens for you]
+@Service
+public class TransferService {
+  // Day 1's proxy opens a real DB transaction around this method.
+  @Transactional  // default isolation = the datasource default
+  public void transfer(long from, long to, int cents) {
+    accounts.debit(from, cents);
+    accounts.credit(to, cents);   // if this throws, the debit
+  }                               // is rolled back too
+}
+\end{javabox}
+
+\begin{misconception}
+Higher isolation is not "just safer, use it everywhere." \code{SERIALIZABLE} makes the database detect conflicting transactions and \emph{abort} one with a serialization error your code must catch and retry. It trades silent corruption for explicit, throughput-reducing retries --- the right trade only where the data truly demands it.
+\end{misconception}
+
+\begin{perfnote}
+The most expensive mistake here is a \emph{long-running transaction}. A transaction holds its locks and its snapshot until it commits; keep one open across a slow external HTTP call and you block every other writer and bloat the database's version store. Rule: open transactions late, commit early, and never do network I/O inside one.
+\end{perfnote}
+
+\wbsub{3.5\quad Query Optimization \& Execution Plans}
+
+\glabel{What is it?} \code{EXPLAIN} shows the planner's chosen strategy for a query; \code{EXPLAIN ANALYZE} actually runs it and reports \emph{estimated vs actual} rows and time per step. It is the difference between guessing why a query is slow and knowing.
+
+\glabel{How does it work internally?} The planner uses table statistics (collected by \code{ANALYZE} / autovacuum) to estimate the cost of each possible plan and picks the cheapest. When statistics are stale, its estimates diverge from reality and it can choose a bad plan --- a large estimate/actual mismatch in the plan is your first clue.
+
+\begin{sqlbox}[reading a plan]
+EXPLAIN ANALYZE
+SELECT id, total_cents FROM orders
+WHERE user_id = 42 AND status = 'PAID';
+
+-- GOOD: Index Scan using idx_orders_user_status_created
+--       (actual rows=30  time=0.05..0.09)
+-- BAD:  Seq Scan on orders
+--       (actual rows=30  time=0.02..812.4  rows removed by filter: 4M)
+-- Seq Scan on a large table + big estimate/actual gap = investigate
+\end{sqlbox}
+
+\begin{wbfigure}{Fig 2.5 — The same query, two plans. Without a usable index the engine reads every row and filters; with one it jumps to the few matches.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxghost, text width=52mm, align=center] (q) {\textbf{WHERE user\_id = 42 AND status = 'PAID'}\\\scriptsize orders table: 4,000,000 rows};
+  \node[wbboxwarn, below=of q, xshift=-30mm, text width=38mm] (seq) {\textbf{Seq Scan}\\\scriptsize reads 4,000,000 rows, discards all but 30};
+  \node[wbboxgood, below=of q, xshift=30mm, text width=38mm] (ix) {\textbf{Index Scan}\\\scriptsize walks to $\sim$30 matching rows directly};
+  \node[wbboxwarn, below=7mm of seq, text width=38mm] (bad) {$\approx$ 800 ms};
+  \node[wbboxgood, below=7mm of ix, text width=38mm] (good) {$\approx$ 0.1 ms};
+  \draw[wbarrow] (q)--(seq); \draw[wbarrow] (q)--(ix);
+  \draw[wbarrow] (seq)--(bad); \draw[wbarrow] (ix)--(good);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} Before optimizing anything. The most common finding in a slow-query audit is a sequential scan where you expected an index --- caused by a missing index, a function on the indexed column, a type mismatch, or the table being small enough that a scan is genuinely cheaper. Always measure before you assume you need a bigger server.
+
+\begin{seniornote}
+A senior does not "add an index and hope." They capture the query, run \code{EXPLAIN ANALYZE}, read which node dominates the time, form one hypothesis, change one thing, and re-run the plan. Optimization is a measurement loop, not a guessing contest --- and the plan is the instrument.
+\end{seniornote}
+
+\wbsub{3.6\quad Pagination \& Schema Design}
+
+\glabel{Pagination --- why offset dies at depth.} Offset pagination (\code{LIMIT 20 OFFSET 10000}) makes the database generate, sort, and then \emph{throw away} the first 10{,}000 rows before returning 20. Cost grows with the offset, so page 500 times out even when page 1 is instant. \keyterm{Keyset (cursor) pagination} instead remembers the last row seen and asks for rows \emph{after} it, using the index directly --- so it stays fast at any depth.
+
+\begin{sqlbox}[offset vs keyset pagination]
+-- OFFSET: scans and discards 10,000 rows every time
+SELECT id, created_at FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 20 OFFSET 10000;              -- slow at high offsets
+
+-- KEYSET: seeks straight to the cursor via the index
+SELECT id, created_at FROM orders
+WHERE (created_at, id) < (:lastCreatedAt, :lastId)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;                           -- fast at any depth
+\end{sqlbox}
+
+\glabel{Schema design --- normalize by default.} \keyterm{Normalization} to third normal form (3NF) means: no repeating groups, no partial dependency on part of a composite key, and no transitive dependency (non-key columns depending on other non-key columns). The payoff is that every fact lives in exactly one place, so there are no \emph{update anomalies} --- you never have to change a customer's name in fourteen rows and miss one.
+
+\glabel{When to denormalize.} Deliberately, and only for a \emph{measured} read-heavy hot path. Storing an \code{order\_total} column instead of summing line items on every read is a classic, valid denormalization --- but you now own the job of keeping it correct on every write, and you should document why the trade was made. Denormalize as a considered optimization, never as a default shortcut.
+
+\begin{wbfigure}{Fig 2.6 — The normalized ShopFlow schema. Each arrow is a foreign key pointing from child to parent; every FK column gets its own index.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize},
+   tbl/.style={wbboxdb, align=left, text width=34mm}]
+  \node[tbl] (roles) {\textbf{roles}\\\scriptsize id PK\\name UNIQUE};
+  \node[tbl, below=of roles] (users) {\textbf{users}\\\scriptsize id PK\\email UNIQUE\\role\_id FK};
+  \node[tbl, below=of users] (orders) {\textbf{orders}\\\scriptsize id PK\\user\_id FK\\status, created\_at};
+  \node[tbl, below=of orders] (items) {\textbf{order\_items}\\\scriptsize id PK\\order\_id FK\\product\_id FK\\quantity, unit\_cents};
+  \node[tbl, right=of items] (products) {\textbf{products}\\\scriptsize id PK\\sku UNIQUE\\price\_cents};
+  \draw[wbarrow] (users)--(roles)  node[wbcap, midway, right=1mm] {role\_id};
+  \draw[wbarrow] (orders)--(users) node[wbcap, midway, right=1mm] {user\_id};
+  \draw[wbarrow] (items)--(orders) node[wbcap, midway, right=1mm] {order\_id};
+  \draw[wbarrow] (items)--(products) node[wbcap, midway, above] {product\_id};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Always index foreign-key columns --- most databases do not do it for you.
+  \item Run \code{EXPLAIN ANALYZE} before assuming a query needs a bigger server.
+  \item Prefer keyset pagination for any list endpoint that can grow past a few thousand rows.
+  \item Wrap multi-statement writes in one transaction, not "best-effort" sequential calls.
+  \item Let the database enforce uniqueness, references and ranges via constraints.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Adding indexes reactively to every column instead of matching them to real query patterns.
+  \item \code{SELECT *} in production, pulling columns nobody needs (and defeating covering indexes).
+  \item Not realising a long-running transaction holds locks and blocks other users.
+  \item Offset-paginating a table with millions of rows and wondering why page 500 times out.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Two diagrams above carry most of this chapter's judgment. Redraw them \emph{from memory} --- reproduction is what moves a diagram from "recognised" to "known."
+
+\begin{writespace}[Redraw: the leftmost-prefix rule --- which predicates the index (user\_id, status, created\_at) can and cannot serve]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the LEFT JOIN trap --- where the WHERE filter turns an outer join into an inner one, and the ON-clause fix]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Script the ShopFlow Schema}
+
+\textbf{Goal of this lab:} turn the abstract rules above into a real, repeatable migration for ShopFlow. By the end you will have a versioned SQL file that any teammate can run to build an identical, correctly-constrained database --- the foundation Day 3's JPA maps onto.
+
+\resetlab
+\labstep{Add Flyway to the ShopFlow module}
+Add \code{spring-boot-starter-data-jdbc} (or JPA) and the \code{flyway-core} dependency, and point \code{spring.flyway} at a Postgres datasource. Create the folder \code{src/main/resources/db/migration}.
+\labwhy{Flyway runs versioned SQL files on startup and records them in a \code{flyway\_schema\_history} table --- so "create the schema" becomes reproducible and auditable, not a one-off script someone ran once.}
+
+\labstep{Write V1: the reference tables (\code{roles}, \code{products})}
+In \code{V1\_\_create\_shopflow\_schema.sql}, create \code{roles} (\code{id} PK, \code{name} UNIQUE NOT NULL) and \code{products} (\code{id} PK, \code{sku} UNIQUE, \code{price\_cents} INT with \code{CHECK (price\_cents >= 0)}).
+\labwhy{Reference tables have no foreign keys of their own, so they must be created first --- FK targets must exist before the referencing table.}
+
+\labstep{Add \code{users} with a role foreign key}
+Create \code{users} (\code{id} PK, \code{email} UNIQUE NOT NULL, \code{role\_id} NOT NULL \code{REFERENCES roles(id)}). Add \code{CREATE INDEX} on \code{role\_id}.
+\labwhy{A foreign key guarantees every user points at a real role; indexing the FK column keeps the "users in this role" lookup and the referential-integrity check fast.}
+
+\labstep{Add \code{orders} and \code{order\_items} with CHECK constraints}
+Create \code{orders} (FK \code{user\_id}, \code{status} with \code{CHECK (status IN ('PENDING','PAID','SHIPPED','CANCELLED'))}, \code{created\_at}) and \code{order\_items} (FKs to \code{orders} and \code{products}, \code{quantity} \code{CHECK (quantity > 0)}, a \code{UNIQUE (order\_id, product\_id)}). Choose \code{ON DELETE CASCADE} for order lines, \code{RESTRICT} for products.
+\labwhy{You are encoding business rules --- valid statuses, positive quantities, one product per order line --- where no application bug can violate them.}
+
+\labstep{Create the composite index for the planned query}
+Add \code{CREATE INDEX idx\_orders\_user\_status\_created ON orders (user\_id, status, created\_at DESC)} plus standalone indexes on each remaining foreign key.
+\labwhy{This is the leftmost-prefix payoff: the same index serves "orders by user," "by user and status," and the sorted "by user and status, newest first" --- your planned list query.}
+
+\labstep{Verify with a fresh database and \code{EXPLAIN}}
+Drop and recreate the database, let Flyway rebuild it, seed a few rows, and run \code{EXPLAIN ANALYZE} on the list-orders query to confirm an \emph{Index Scan}, not a \emph{Seq Scan}.
+\labwhy{"Repeatable" only counts if you prove it from an empty database --- and the plan confirms your index is actually doing its job.}
+
+\begin{prodtip}
+Never edit a migration that has already run in any shared environment --- Flyway stores a checksum and will refuse to start if \code{V1} changed. Fix mistakes with a \emph{new} \code{V2} migration. This immutability is the whole point: the history of your schema becomes a replayable, verifiable log.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two to make your reasoning explicit.
+
+\begin{thinkbox}
+You have a composite index on \code{(user\_id, status, created\_at)}. A new feature needs "all orders created in the last hour, across all users," filtering on \code{created\_at} alone. Will the existing index help? What would you add, and what is the cost of adding it?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your team defaults to \code{READ COMMITTED}. For the "decrement inventory when an order is placed" path, what anomaly could let two orders oversell the last item, and which isolation level or locking strategy would you reach for --- accepting what cost?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A colleague proposes storing \code{order\_total} on the \code{orders} row instead of summing \code{order\_items} each read. What class of bug does this denormalization invite, and what would you put in place before approving it?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The report that gets slower every week}
+\textbf{Symptom.} An "orders history" endpoint was fast at launch. Six months later, deep pages (page 400+) time out, while page 1 is still instant.
+
+\smallskip\textbf{Evidence.}
+\begin{sqlbox}[the endpoint's query]
+SELECT id, created_at, total_cents FROM orders
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 8000;   -- page number x 20
+\end{sqlbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{EXPLAIN ANALYZE} shows the time growing with the offset; the plan sorts and discards thousands of rows before returning 20.
+  \item \textbf{Hypothesise.} Offset pagination re-scans and throws away all skipped rows; cost is proportional to \code{OFFSET}, which grows as the table grows.
+  \item \textbf{Verify.} Compare \code{OFFSET 0} vs \code{OFFSET 8000} timings --- the second is orders of magnitude slower for the same 20 returned rows.
+  \item \textbf{Fix.} Switch to keyset pagination: \code{WHERE (created\_at, id) < (:lastSeen, :lastId) ORDER BY created\_at DESC, id DESC LIMIT 20}, backed by an index on \code{(created\_at, id)}.
+  \item \textbf{Prevent.} Make cursor pagination the default for any growable list endpoint; treat deep \code{OFFSET} as a code-review smell.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The index that the planner ignores}
+\textbf{Symptom.} You added an index on \code{users(email)}, but login lookups still do a sequential scan and stay slow.
+
+\smallskip\textbf{Evidence.}
+\begin{sqlbox}[the login query]
+SELECT id, password_hash FROM users
+WHERE LOWER(email) = LOWER('Alice@Shop.io');
+\end{sqlbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{EXPLAIN} shows \code{Seq Scan on users}, even though \code{idx\_users\_email} exists.
+  \item \textbf{Hypothesise.} The index stores raw \code{email} values; \code{LOWER(email)} is a different expression, so the planner cannot match the query to the index.
+  \item \textbf{Verify.} Run the same query as \code{WHERE email = 'alice@shop.io'} --- the index is used, confirming the function was the blocker.
+  \item \textbf{Fix.} Create an expression index \code{ON users (LOWER(email))}, or store and query a normalized lowercase \code{email} column with a \code{UNIQUE} constraint.
+  \item \textbf{Prevent.} Never wrap an indexed column in a function in a hot \code{WHERE}; normalize on write instead of transforming on read.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~30 min}
+\textbf{Goal.} Feel the difference an index makes.\\
+\textbf{Context.} A single table you can seed with a million rows.\\
+\textbf{Requirements.} \code{INSERT} 1{,}000{,}000 rows via \code{generate\_series}; run \code{EXPLAIN ANALYZE} filtering on a non-indexed column, add an index, re-run.\\
+\textbf{Hints.} Watch the plan node change from \code{Seq Scan} to \code{Index Scan}, and compare actual times.\\
+\textbf{Expected outcome.} A dramatic drop in execution time and a visibly different plan.\\
+\textbf{Common pitfalls.} Forgetting to \code{ANALYZE} the table after bulk insert, so the planner has stale statistics and still avoids the index.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Reproduce and then prevent a non-repeatable read.\\
+\textbf{Context.} Two \code{psql} sessions acting as concurrent transactions on one row.\\
+\textbf{Requirements.} At \code{READ COMMITTED}, read a row in Tx A, commit an \code{UPDATE} in Tx B, re-read in Tx A --- observe the value change. Repeat at \code{REPEATABLE READ} and observe stability.\\
+\textbf{Hints.} \code{BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;} before the first read.\\
+\textbf{Expected outcome.} The anomaly appears at the lower level and vanishes at the higher one.\\
+\textbf{Common pitfalls.} Auto-commit on --- each statement becomes its own transaction, so there is no second read within one transaction to differ.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~60 min}
+\textbf{Goal.} Convert an offset endpoint to keyset and benchmark it.\\
+\textbf{Context.} A list endpoint over a large \code{orders} table.\\
+\textbf{Requirements.} Implement keyset pagination with a compound cursor \code{(created\_at, id)}, add the matching index, and benchmark page 1 vs page 1000 against the offset version.\\
+\textbf{Hints.} Return an opaque cursor token (base64 of the last row's sort key) so clients never send raw offsets.\\
+\textbf{Expected outcome.} Keyset page 1000 is roughly as fast as page 1; offset degrades sharply.\\
+\textbf{Common pitfalls.} Sorting by a non-unique column alone --- ties cause skipped or duplicated rows across pages; always include a unique tiebreaker (\code{id}) in both the \code{ORDER BY} and the cursor.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as reasoning, not trivia.
+
+\begin{seniornote}
+The cheapest performance win in most systems is not a faster server --- it is one correct composite index that matches the hottest query's predicate order. Before scaling hardware, capture the top few slow queries, read their plans, and index deliberately. Hardware hides the symptom; the index removes the cause.
+\end{seniornote}
+
+\begin{dbinsight}
+Foreign keys are not free at write time --- each insert into a child table checks the parent exists, and an unindexed FK makes a parent \code{DELETE} scan the whole child table to enforce the constraint. This is the concrete reason "always index your foreign keys" is a rule and not a preference.
+\end{dbinsight}
+
+\begin{interview}
+Expect: \emph{"Why is offset pagination slow at high page numbers?"} The answer that lands names the mechanism: the database must generate and discard every skipped row before returning the page, so cost grows with the offset --- while keyset pagination seeks straight to the cursor through the index and stays flat. Say \emph{scan-and-discard}, not just "it's slow."
+\end{interview}
+
+\begin{secwarn}[the ORM does not exempt you from SQL]
+On Day 3 an ORM will write your SQL for you, but it will happily generate an N+1 query storm, a cartesian join, or a full scan. The database does not know or care that a framework generated the statement. Everything you learned today about indexes, plans and transactions is exactly what you will use to diagnose the ORM's output.
+\end{secwarn}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+Day 1 gave ShopFlow a spine: a layered Spring Boot 3 / Java 21 module with typed configuration, \code{dev} and \code{prod} profiles, a bean-timing \code{BeanPostProcessor}, and a live \code{GET /api/v1/ping}. Today you give it a memory --- a real, constrained, versioned database.
+
+\begin{buildalong}[Day 02 --- the database foundation]
+\begin{wbitem}
+  \item Add Flyway and a Postgres datasource to the Day 1 module; create \code{src/main/resources/db/migration}.
+  \item Write \code{V1\_\_create\_shopflow\_schema.sql} with tables \code{users}, \code{roles}, \code{products}, \code{orders}, \code{order\_items}.
+  \item Add every constraint: \code{PRIMARY KEY}s, \code{FOREIGN KEY}s (with deliberate \code{ON DELETE} behaviour), \code{UNIQUE} on \code{users.email}, \code{roles.name}, \code{products.sku}, and \code{CHECK}s for status, price and quantity.
+  \item Index \emph{every} foreign-key column, and add the composite index \code{(user\_id, status, created\_at DESC)} that matches the planned "list orders by user and status, newest first" query via leftmost-prefix.
+  \item Prove repeatability: drop the database, let Flyway rebuild it on startup, seed rows, and run \code{EXPLAIN ANALYZE} on the list-orders query to confirm an Index Scan.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} the app boots, Flyway applies \code{V1} into a clean database and records it in \code{flyway\_schema\_history}, every constraint rejects bad data, and the planned list-orders query uses the composite index (Index Scan, not Seq Scan). Day 3 maps JPA entities onto exactly this schema.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Think in sets: a \code{WHERE} on the right table silently turns a \code{LEFT JOIN} into an \code{INNER JOIN}.
+  \item A composite index is usable only from its leftmost column inward --- order the columns to match your hottest query.
+  \item Constraints put correctness where no code path can bypass it; uniqueness in particular must live in the database.
+  \item Default to \code{READ COMMITTED}; raise isolation or lock only on specific hot paths, and never hold a transaction across network I/O.
+  \item \code{EXPLAIN ANALYZE} is the instrument --- a \code{Seq Scan} on a large table, or a big estimate/actual gap, is where you start.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Index every foreign key --- databases rarely do it for you, and unindexed FKs make parent deletes scan the child table.
+  \item Keyset pagination stays flat at any depth; offset pagination scans and discards everything it skips.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Function on an indexed column ($\rightarrow$ Seq Scan). \quad$\bullet$\quad \code{SELECT *} in hot paths ($\rightarrow$ no covering index).
+  \item Enforcing uniqueness only in Java ($\rightarrow$ race-condition duplicates). \quad$\bullet$\quad Long transactions ($\rightarrow$ blocked writers).
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{INNER vs LEFT}{INNER = intersection; LEFT keeps all left rows, right filter belongs in \code{ON}, not \code{WHERE}.}
+\cheatitem{Leftmost-prefix}{index \code{(a,b,c)} serves \code{a}, \code{a+b}, \code{a+b+c} --- never \code{b} or \code{c} alone.}
+\cheatitem{FK indexes}{always index foreign-key columns; unindexed FK $\rightarrow$ slow parent deletes.}
+\cheatitem{Isolation}{dirty $<$ non-repeatable $<$ phantom; default \code{READ COMMITTED}, raise only on hot paths.}
+\cheatitem{Plans}{\code{EXPLAIN ANALYZE}; \code{Seq Scan} on big table or estimate$\neq$actual = investigate.}
+\cheatitem{Pagination}{keyset (\code{WHERE (k) < (:cursor)}) over offset for any growable list.}
+\cheatitem{Denormalize}{only for a measured read hot path, and own the write-time cost of keeping it correct.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Explain the difference between \code{INNER}, \code{LEFT}, and \code{FULL OUTER JOIN} with an example.}
+\iq{What is the leftmost-prefix rule for composite indexes?}
+\iq{What is the difference between a dirty read, a non-repeatable read, and a phantom read?}
+\iq{Why would you choose \code{READ COMMITTED} over \code{SERIALIZABLE}?}
+\iq{How would you diagnose a slow query in production?}
+\iq{Why is offset pagination slow at high page numbers, and what replaces it?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Use The Index, Luke!} --- Markus Winand's field guide to B-Tree indexing and the leftmost-prefix rule.
+  \item \emph{PostgreSQL Documentation} --- "Using EXPLAIN" and "Transaction Isolation."
+  \item \emph{Designing Data-Intensive Applications} (Kleppmann), ch. 7 --- transactions and isolation in depth.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 3).} You now have a correct, indexed schema. Tomorrow you put an ORM on top of it: JPA and Hibernate map the beans of Day 1 onto the tables of Day 2 --- and you will watch it generate the N+1 queries, lazy-loading surprises and lock strategies that only make sense once you can already read the SQL underneath.
+\end{keyidea}

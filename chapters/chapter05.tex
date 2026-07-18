@@ -1,0 +1,591 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 05 ============================
+\daychapter{05}{Security}{Spring Security}{Authentication, authorization \& JWT --- the filter chain, end to end}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain the Security Filter Chain as an ordered pipeline of servlet filters, and say exactly \emph{where} authentication and authorization each happen.
+  \item Implement stateless JWT authentication end to end: registration, BCrypt storage, login, a custom validating filter, and protected routes.
+  \item Configure modern Spring Security 6 the component way --- a \code{SecurityFilterChain} bean, not the deprecated \code{WebSecurityConfigurerAdapter}.
+  \item Apply role- and authority-based authorization deliberately, so a \code{CUSTOMER} sees only their own orders and an \code{ADMIN} manages everything.
+  \item Reason about CORS and CSRF as \emph{different} problems, and disable CSRF for a stateless JWT API as a decision, not a reflex.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} After Day 4 you have a working, documented Order API: clients can create orders, list them, fetch one by id. There is exactly one problem --- \emph{anyone on the internet can do all of that}. There is no notion of \emph{who} is calling, and no rule about \emph{what} they are allowed to touch. Today you close that gap. By the end, a request without a valid token gets \code{401}, a request from the wrong user gets \code{403}, and every protected handler runs only for an identity Spring has already proven.
+
+\glabel{Why backend engineers need it.} Security is the one layer where a single missing check becomes a breach, a headline, and a regulatory fine. Yet most beginners treat Spring Security as an incantation --- copy a config until the red errors stop, disable everything that complains. That approach ships holes. The engineers who are trusted with production are the ones who can \emph{name} which filter authenticated the request, why CSRF is off, and what \code{hasRole('ADMIN')} actually compares against. This day builds that mental model.
+
+\glabel{Where it fits in a Spring Boot application.} Recall Day 1: filters run \emph{outside} the Spring MVC context, before \code{DispatcherServlet} ever sees the request. Spring Security is precisely a chain of those filters, inserted at the very front of the pipeline. Nothing in your controllers changes --- the security chain runs first, establishes (or rejects) an identity, and only then hands the request onward to the Day 4 code you already wrote.
+
+\glabel{How it connects to previous chapters.} You are wrapping, not rewriting. The controllers, services, and repositories from Days 2--4 stay exactly as they are; you add a filter in front and a few annotations on top. The \code{User} you authenticate becomes a JPA entity (Day 2--3), stored with a hashed password, and the login endpoint is just another controller returning JSON (Day 4).
+
+\begin{wbfigure}{Fig 5.1 — Where it fits: the security filter chain wraps the untrusted internet around the Day 4 API you already built. Your controllers do not change.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\footnotesize},
+   band/.style={wbbox, minimum width=74mm, minimum height=9mm, align=center, text width=68mm}]
+  \node[band, wbboxghost] (net) {\textbf{Untrusted client}\\\scriptsize browser / mobile / curl --- may be anyone};
+  \node[band, wbboxwarn, below=of net] (chain) {\textbf{Security Filter Chain}\ \emph{(this chapter)}\\\scriptsize authenticate + authorize before MVC runs};
+  \node[band, below=of chain] (mvc) {\textbf{DispatcherServlet + Controllers}\\\scriptsize Day 4 Order API --- unchanged};
+  \node[band, wbboxgood, below=of mvc] (svc) {\textbf{Services + Repositories}\\\scriptsize Day 2--3 persistence --- unchanged};
+  \draw[wbarrow] (net)--(chain); \draw[wbarrow] (chain)--(mvc); \draw[wbarrow] (mvc)--(svc);
+  \node[wbboxaccent, right=7mm of chain, text width=27mm] (ctx) {SecurityContext\\\scriptsize holds the proven identity};
+  \draw[wbarrowg] (chain)--(ctx);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Real company examples.} Every bank, every marketplace, every SaaS built on the JVM runs some form of this chain. Netflix's Zuul edge gateways authenticate at the boundary; Auth0, Okta, and Keycloak exist to issue exactly the tokens you will validate today. When you read "sign in with Google" it is OAuth2 delegation --- a cousin of what you build, covered in one paragraph in Part 3.
+
+\begin{keyidea}
+Spring Security is not a wall you switch on. It is a \keyterm{chain of filters} that answers two questions in order: \emph{who are you?} (authentication) and \emph{are you allowed?} (authorization). Everything today --- JWT, BCrypt, roles, CORS --- is a way of answering one of those two questions well. Hold the two questions apart and the whole framework snaps into focus.
+\end{keyidea}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Read the map as two lanes. The top lane is \emph{authentication} --- turning credentials into a token. The bottom lane is \emph{authorization} --- turning a token back into a proven identity and a yes/no decision on each request.
+
+\begin{wbfigure}{Fig 5.2 — The Day 5 concept map. Top lane: login issues a token. Bottom lane: every later request re-proves identity and is checked against the rules.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 7mm, every node/.style={font=\sffamily\footnotesize}]
+  % authentication lane
+  \node[wbbox, text width=24mm] (cred) {\textbf{Credentials}\\\scriptsize email + password};
+  \node[wbbox, right=of cred, text width=25mm] (am) {\textbf{Authentication\\Manager}\\\scriptsize verifies};
+  \node[wbboxdb, right=of am, text width=25mm] (bc) {\textbf{Password\\Encoder}\\\scriptsize BCrypt match};
+  \node[wbboxgood, right=of bc, text width=24mm] (jwt) {\textbf{Signed JWT}\\\scriptsize issued};
+  \draw[wbarrow] (cred)--(am); \draw[wbarrow] (am)--(bc); \draw[wbarrow] (bc)--(jwt);
+  % authorization lane
+  \node[wbbox, below=10mm of cred, text width=24mm] (bearer) {\textbf{Bearer token}\\\scriptsize on next request};
+  \node[wbboxaccent, right=of bearer, text width=25mm] (filter) {\textbf{JwtAuthFilter}\\\scriptsize sig + expiry};
+  \node[wbbox, right=of filter, text width=25mm] (sc) {\textbf{Security\\Context}\\\scriptsize identity set};
+  \node[wbboxwarn, right=of sc, text width=24mm] (authz) {\textbf{Authorization}\\\scriptsize allow / deny};
+  \draw[wbarrow] (bearer)--(filter); \draw[wbarrow] (filter)--(sc); \draw[wbarrow] (sc)--(authz);
+  \draw[wbarrowg] (jwt) to[out=270,in=90] (bearer);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Filter Chain} $\rightarrow$ \keyterm{AuthenticationManager} $\rightarrow$ \keyterm{Authentication} $\rightarrow$ \keyterm{SecurityContext} $\rightarrow$ \keyterm{GrantedAuthority} $\rightarrow$ \keyterm{AuthorizationFilter} $\rightarrow$ \keyterm{AccessDecision}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Authentication vs Authorization}
+
+\glabel{What is it?} Two distinct questions the framework keeps deliberately separate. \keyterm{Authentication} answers \emph{"who are you?"} --- it verifies a claimed identity against evidence (a password, a signed token). \keyterm{Authorization} answers \emph{"what are you allowed to do?"} --- it checks, \emph{once identity is known}, whether that identity may perform this action.
+
+\glabel{Why does it exist?} Collapsing the two is the classic beginner bug: a controller that checks \code{if (user.isAdmin())} by hand, scattered across dozens of methods, with no single place that establishes \emph{who the user even is}. Spring splits the concerns: an \code{AuthenticationManager} (and its \code{AuthenticationProvider}s) does the first job; declarative rules --- \code{authorizeHttpRequests} and \code{@PreAuthorize} --- do the second.
+
+\glabel{How does it work internally?} A successful authentication produces an \code{Authentication} object holding the \keyterm{principal} (the user), their \keyterm{credentials}, and a set of \code{GrantedAuthority} values (roles and permissions). That object is stored in the \code{SecurityContext}, which is bound to the current thread for the life of the request. Every later authorization check simply reads it --- it never re-verifies the password.
+
+\begin{misconception}
+"Authentication and authorization are basically the same check." They are not, and conflating them causes real holes. A valid token proves \emph{who} you are; it says nothing about whether you may delete product \code{42}. A system can authenticate you perfectly and still --- correctly --- return \code{403} because you lack the authority. \code{401} means "I don't know who you are"; \code{403} means "I know exactly who you are, and the answer is no."
+\end{misconception}
+
+\wbsub{3.2\quad The Security Filter Chain}
+
+\glabel{What is it?} Spring Security is implemented as an ordered list of servlet \code{Filter}s, inserted ahead of \code{DispatcherServlet} by a single \code{FilterChainProxy}. Each filter has one job; the request falls through them in a fixed order until one either rejects it or lets it reach your controller.
+
+\glabel{Why does it exist?} Because security is cross-cutting. You do not want every controller to remember to check a token, translate exceptions to \code{401}, and enforce CORS. A pipeline does each concern exactly once, in a known order, for every request --- including requests to endpoints you forgot existed.
+
+\glabel{How does it work internally?} The chain runs before your code. For a token-based API the filters that matter are: an entry \code{CorsFilter} (handles the browser's preflight and origin rules), \emph{your} custom JWT filter (validates the \code{Authorization} header and populates the \code{SecurityContext}), the built-in \code{UsernamePasswordAuthenticationFilter} (form login --- present but unused here), the \code{ExceptionTranslationFilter} (turns an authentication failure into \code{401} and an access-denied into \code{403}), and finally the \code{AuthorizationFilter} (the last gate that enforces your URL rules). You insert your JWT filter \emph{before} \code{UsernamePasswordAuthenticationFilter} with \code{addFilterBefore}.
+
+\begin{wbfigure}{Fig 5.3 — The filter chain as a vertical pipeline. Your custom JWT filter runs early and sets the identity; the AuthorizationFilter is the final gate before the controller.}
+\wbscale{\begin{tikzpicture}[node distance=3.6mm, every node/.style={font=\sffamily\footnotesize},
+   stage/.style={wbbox, minimum width=80mm, minimum height=8.5mm, align=left, text width=74mm}]
+  \node[stage, wbboxghost] (req) {\textbf{HTTP request}\\\scriptsize header: Authorization: Bearer <jwt>};
+  \node[stage, below=of req] (cors) {\textbf{CorsFilter}\\\scriptsize answers preflight, checks the Origin};
+  \node[stage, wbboxaccent, below=of cors] (jwt) {\textbf{JwtAuthFilter} \emph{(you write this)}\\\scriptsize verify signature + expiry, set SecurityContext};
+  \node[stage, below=of jwt] (upf) {\textbf{UsernamePasswordAuthenticationFilter}\\\scriptsize built-in form login --- inert for a JWT API};
+  \node[stage, below=of upf] (exc) {\textbf{ExceptionTranslationFilter}\\\scriptsize no identity $\rightarrow$ 401 \quad denied $\rightarrow$ 403};
+  \node[stage, wbboxwarn, below=of exc] (authz) {\textbf{AuthorizationFilter}\\\scriptsize final URL-rule gate (allow / deny)};
+  \node[stage, wbboxgood, below=of authz] (ctrl) {\textbf{Controller}\\\scriptsize plus method-level @PreAuthorize checks};
+  \foreach \a/\b in {req/cors,cors/jwt,jwt/upf,upf/exc,exc/authz,authz/ctrl}{\draw[wbarrow] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+There is not one global filter chain but a \emph{list} of them, each guarded by a request matcher; \code{FilterChainProxy} picks the first whose matcher fits the URL. That is how you can have one relaxed chain for \code{/actuator/health} and a strict one for \code{/api/**}. For this workbook a single chain is enough --- but knowing there can be several explains why a rule "that should apply" sometimes does not: a different chain matched first.
+\end{behind}
+
+\begin{seniornote}
+When a request behaves unexpectedly, a senior enables \code{logging.level.org.springframework.security=DEBUG} and reads the printed chain: every filter that ran, in order, and the exact point a request was rejected. "Security is a black box" almost always means "I have not turned on the log that narrates it."
+\end{seniornote}
+
+\wbsub{3.3\quad Password Hashing with BCrypt}
+
+\glabel{What is it?} \keyterm{BCrypt} is a deliberately slow, salted, adaptive hash function purpose-built for passwords. You never store a password --- you store its BCrypt hash, and at login you \emph{compare} hashes.
+
+\glabel{Why does it exist?} Plaintext passwords leak in every database breach; fast hashes like MD5 or SHA-256 are only marginally better, because an attacker can compute billions of guesses per second and precompute \keyterm{rainbow tables}. BCrypt defeats both: a per-password random \keyterm{salt} (embedded in the hash itself) makes rainbow tables useless, and a tunable \keyterm{work factor} (cost) makes each guess expensive enough that brute force stops being economical.
+
+\glabel{How does it work internally?} A BCrypt hash string encodes everything needed to verify it: the algorithm version, the cost, the 128-bit salt, and the derived hash --- e.g. \code{\$2b\$12\$R9h...}. Because the salt is random, hashing the same password twice yields two different strings, so you cannot compare by equality. You call \code{PasswordEncoder.matches(raw, stored)}, which re-extracts the salt and cost from \code{stored}, re-hashes \code{raw} the same way, and compares in constant time.
+
+\begin{javabox}[SecurityConfig.java --- the encoder bean]
+@Bean
+PasswordEncoder passwordEncoder() {
+  // cost 12: ~250ms per hash on modern hardware.
+  // Higher = safer but slower; tune to your login throughput.
+  return new BCryptPasswordEncoder(12);
+}
+\end{javabox}
+
+\begin{javabox}[AuthService.java --- register and verify]
+@Service
+public class AuthService {
+  private final UserRepository users;
+  private final PasswordEncoder encoder;
+
+  public AuthService(UserRepository users, PasswordEncoder encoder) {
+    this.users = users;
+    this.encoder = encoder;
+  }
+
+  public void register(RegisterRequest req) {
+    if (users.existsByEmail(req.email()))
+      throw new EmailAlreadyUsedException(req.email());
+    // store the HASH, never the raw password
+    var user = new User(req.email(),
+                        encoder.encode(req.password()),
+                        Role.CUSTOMER);
+    users.save(user);
+  }
+}
+\end{javabox}
+
+\begin{secwarn}[never invent your own hashing]
+Do not reach for \code{MessageDigest}, do not concatenate a "secret pepper" and SHA-256, do not roll a clever scheme. Password hashing is a solved problem with sharp edges, and every home-grown variant loses to it. Use \code{BCryptPasswordEncoder} (or Argon2 via \code{Argon2PasswordEncoder}) and let it own the salt, the cost, and the constant-time compare.
+\end{secwarn}
+
+\begin{perfnote}
+Cost is a dial, not a constant. BCrypt cost 12 is roughly 4$\times$ slower than cost 10. That slowness is the point at rest, but on a hot login path it caps throughput --- a synchronous cost-14 encoder can bottleneck a login storm. Pick the highest cost your p99 login latency budget tolerates, and revisit it as hardware gets faster (the whole point of an \emph{adaptive} hash).
+\end{perfnote}
+
+\wbsub{3.4\quad JWT Authentication, End to End}
+
+\glabel{What is it?} A \keyterm{JWT} (JSON Web Token) is a signed, self-contained credential. It has three Base64url parts joined by dots --- \code{header.payload.signature} --- where the payload carries \keyterm{claims} (subject, roles, issued-at, expiry) and the signature proves the token was minted by your server and not tampered with.
+
+\glabel{Why does it exist?} Traditional auth keeps a session in server memory or a shared store; every request costs a lookup, and scaling horizontally means sharing that session state across nodes. A JWT is \keyterm{stateless}: the server verifies the signature and expiry with a key it already holds, learning who the user is \emph{without any database or session lookup}. Any node can serve any request. That property is what makes JWT the default for horizontally scaled APIs.
+
+\glabel{How does it work internally?} At login the server verifies the BCrypt hash, then signs a token (HMAC with a shared secret, or RSA/EC with a private key) and returns it. On every subsequent request the client sends \code{Authorization: Bearer <jwt>}; your filter verifies the signature with the same key, checks the expiry, reads the subject and roles, and builds an \code{Authentication} to place in the \code{SecurityContext}. No server-side state is consulted.
+
+\begin{wbfigure}{Fig 5.4 — Stateless JWT auth. Login (top) issues a signed token; every later request (bottom) re-proves identity from the token alone --- no session, no lookup.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\footnotesize},
+   stg/.style={wbbox, minimum width=78mm, minimum height=8.5mm, align=left, text width=72mm}]
+  \node[stg, wbboxghost] (l1) {\textbf{1 · POST /auth/login}\\\scriptsize body: email + password};
+  \node[stg, wbboxdb, below=of l1] (l2) {\textbf{2 · Verify BCrypt hash}\\\scriptsize PasswordEncoder.matches(raw, stored)};
+  \node[stg, wbboxgood, below=of l2] (l3) {\textbf{3 · Sign \& return JWT}\\\scriptsize accessToken (minutes) + refreshToken (days)};
+  \node[stg, below=6.5mm of l3] (r1) {\textbf{4 · GET /orders/42}\\\scriptsize header: Authorization: Bearer <jwt>};
+  \node[stg, wbboxaccent, below=of r1] (r2) {\textbf{5 · JwtAuthFilter validates}\\\scriptsize signature + expiry $\rightarrow$ set SecurityContext};
+  \node[stg, wbboxgood, below=of r2] (r3) {\textbf{6 · Controller runs as the user}\\\scriptsize authorization rules apply, data returned};
+  \foreach \a/\b in {l1/l2,l2/l3,r1/r2,r2/r3}{\draw[wbarrow] (\a)--(\b);}
+  \draw[wbarrowg] (l3) -- node[wbcap, right=1mm]{token stored by client} (r1);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{javabox}[JwtService.java --- issue and parse (jjwt 0.12 API)]
+@Service
+public class JwtService {
+  private final SecretKey key;      // >= 256-bit secret, from config
+  private final long accessTtlMs;   // e.g. 15 minutes
+
+  public String issue(User user) {
+    Instant now = Instant.now();
+    return Jwts.builder()
+      .subject(user.getEmail())
+      .claim("roles", List.of(user.getRole().name()))
+      .issuedAt(Date.from(now))
+      .expiration(Date.from(now.plusMillis(accessTtlMs)))
+      .signWith(key)
+      .compact();
+  }
+
+  public Jws<Claims> parse(String token) {
+    // throws JwtException on bad signature OR expiry
+    return Jwts.parser().verifyWith(key).build()
+               .parseSignedClaims(token);
+  }
+}
+\end{javabox}
+
+\begin{javabox}[JwtAuthFilter.java --- runs once per request]
+public class JwtAuthFilter extends OncePerRequestFilter {
+  private final JwtService jwt;
+  private final UserDetailsService users;
+  // constructor omitted
+
+  @Override
+  protected void doFilterInternal(HttpServletRequest req,
+      HttpServletResponse res, FilterChain chain)
+      throws ServletException, IOException {
+    String header = req.getHeader("Authorization");
+    if (header == null || !header.startsWith("Bearer ")) {
+      chain.doFilter(req, res);   // no token: let the rules decide
+      return;
+    }
+    try {
+      var claims = jwt.parse(header.substring(7)).getPayload();
+      var user = users.loadUserByUsername(claims.getSubject());
+      var auth = new UsernamePasswordAuthenticationToken(
+          user, null, user.getAuthorities());
+      SecurityContextHolder.getContext().setAuthentication(auth);
+    } catch (JwtException ex) {
+      // invalid/expired: leave context empty -> 401 downstream
+    }
+    chain.doFilter(req, res);
+  }
+}
+\end{javabox}
+
+\begin{misconception}
+"A JWT is encrypted, so it is safe to put secrets in it." It is \emph{signed}, not encrypted. The payload is Base64url --- anyone holding the token can decode and read every claim in one line of code. The signature guarantees \emph{integrity} (nobody altered it), never \emph{confidentiality}. Never put a password, a full credit-card number, or sensitive PII in a JWT.
+\end{misconception}
+
+\begin{secwarn}[the revocation trade-off]
+The same statelessness that makes JWTs scale means you \emph{cannot} easily revoke one before it expires --- there is no server record to delete. If a token is stolen, it is valid until expiry. Mitigations: keep the access token short-lived (minutes) and pair it with a longer-lived \keyterm{refresh token}; for the rare forced-logout, maintain a small server-side blocklist of token ids (\code{jti}) checked on each request. Choosing "short expiry + refresh" over "look up every token" is the whole design bargain.
+\end{secwarn}
+
+\wbsub{3.5\quad Modern Configuration (Spring Security 6+)}
+
+\glabel{What is it?} In Spring Security 6 you configure the chain by declaring a \code{SecurityFilterChain} \code{@Bean}. The old \code{WebSecurityConfigurerAdapter} base class is \emph{removed} --- code that extends it will not compile against Spring Boot 3.
+
+\glabel{Why does it exist?} The component-based style is composable and testable: the chain is just a bean you can inspect, and configuration reads as data (a fluent builder) rather than a set of overridden template methods. It also makes multiple chains natural --- each is another bean.
+
+\glabel{How does it work internally?} \code{HttpSecurity} is a builder; each lambda configures one aspect (CSRF, CORS, session policy, URL rules) and \code{.build()} produces the immutable filter chain. \code{addFilterBefore} splices your JWT filter into the fixed position ahead of form login.
+
+\begin{javabox}[SecurityConfig.java --- the whole chain in one bean]
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity            // turns on @PreAuthorize
+public class SecurityConfig {
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http,
+      JwtAuthFilter jwtFilter) throws Exception {
+    return http
+      .csrf(csrf -> csrf.disable())               // stateless: see 3.6
+      .cors(Customizer.withDefaults())            // use the CORS bean
+      .sessionManagement(sm -> sm
+          .sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+      .authorizeHttpRequests(auth -> auth
+          .requestMatchers("/api/v1/auth/**").permitAll()
+          .requestMatchers(HttpMethod.GET, "/api/v1/products/**")
+              .permitAll()
+          .requestMatchers("/api/v1/products/**").hasRole("ADMIN")
+          .requestMatchers("/api/v1/orders/**").authenticated()
+          .anyRequest().authenticated())
+      .addFilterBefore(jwtFilter,
+          UsernamePasswordAuthenticationFilter.class)
+      .build();
+  }
+}
+\end{javabox}
+
+\glabel{Why order matters in the rules.} \code{authorizeHttpRequests} evaluates matchers top-to-bottom and the \emph{first} match wins. The \code{GET /products} rule must come \emph{before} the broader \code{/products/**} admin rule, or reads would demand \code{ADMIN} too. Put specific rules above general ones, and end with \code{anyRequest().authenticated()} so nothing is accidentally public.
+
+\begin{prodtip}
+Default to closed. \code{anyRequest().authenticated()} as the last rule means a new endpoint you add next month is protected \emph{by default} --- you must consciously open it with \code{permitAll()}. The opposite habit (default open, lock down individually) guarantees that one forgotten endpoint eventually ships wide open.
+\end{prodtip}
+
+\wbsub{3.6\quad Authorization: Roles, Authorities, CORS \& CSRF}
+
+\glabel{Roles vs authorities.} A \keyterm{role} is a coarse label (\code{ADMIN}, \code{CUSTOMER}); an \keyterm{authority} (permission) is fine-grained (\code{ORDER\_REFUND}). \code{hasRole('ADMIN')} is sugar for \code{hasAuthority('ROLE\_ADMIN')} --- Spring silently prepends \code{ROLE\_}. Production systems bundle authorities into roles rather than sprinkling role checks everywhere.
+
+\begin{javabox}[Method-level authorization on controllers]
+@PreAuthorize("hasRole('ADMIN')")
+@DeleteMapping("/api/v1/products/{id}")
+public void delete(@PathVariable Long id) { /* admin only */ }
+
+@PreAuthorize("hasAuthority('ORDER_REFUND')")
+@PostMapping("/api/v1/orders/{id}/refund")
+public void refund(@PathVariable Long id) { /* fine-grained */ }
+
+// CUSTOMER may read only their OWN order; ADMIN reads any
+@PreAuthorize("hasRole('ADMIN') or @orderGuard.owns(#id, authentication)")
+@GetMapping("/api/v1/orders/{id}")
+public OrderView getOrder(@PathVariable Long id) { ... }
+\end{javabox}
+
+\glabel{CORS --- a browser rule, not a firewall.} \keyterm{CORS} (Cross-Origin Resource Sharing) is enforced by the \emph{browser}: it decides whether JavaScript loaded from \code{https://app.shopflow.com} may read a response from your API on a different origin. You configure which origins are trusted; you do not "fix" a CORS error by disabling it. A non-browser client (curl, Postman, your mobile app) ignores CORS entirely --- so CORS is never your access control, only your browser policy.
+
+\begin{javabox}[CorsConfig.java --- one trusted frontend origin]
+@Bean
+CorsConfigurationSource corsConfigurationSource() {
+  var cfg = new CorsConfiguration();
+  cfg.setAllowedOrigins(List.of("https://app.shopflow.com"));
+  cfg.setAllowedMethods(
+      List.of("GET", "POST", "PUT", "PATCH", "DELETE"));
+  cfg.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+  cfg.setAllowCredentials(true);   // NEVER combine with origin "*"
+  cfg.setMaxAge(3600L);            // cache preflight for 1 hour
+  var src = new UrlBasedCorsConfigurationSource();
+  src.registerCorsConfiguration("/**", cfg);
+  return src;
+}
+\end{javabox}
+
+\glabel{CSRF --- and why a JWT API disables it deliberately.} \keyterm{CSRF} (Cross-Site Request Forgery) attacks abuse an \emph{ambient credential} the browser attaches automatically --- classically a session cookie. A malicious page makes your browser fire a request to your bank; the browser helpfully includes the session cookie, and the bank cannot tell it was not you. CSRF tokens defend against that. But a JWT lives in the \code{Authorization} header and is attached by \emph{your} JavaScript explicitly, never automatically by the browser. There is no ambient credential to forge, so CSRF protection guards nothing --- which is why a stateless, header-token API turns it off on purpose. Disable CSRF because your auth is header-based and stateless, not because it was throwing errors.
+
+\begin{interview}
+Expect: \emph{"Why do JWT APIs disable CSRF?"} The answer that lands names the mechanism: "CSRF exploits credentials the browser sends \emph{automatically}, like cookies. A JWT is sent \emph{explicitly} in a header by our own code, so there is no ambient credential for another site to ride on --- CSRF protection would defend against an attack that cannot happen here." Then add the caveat: "the moment we store the JWT in a cookie, CSRF is back on the table."
+\end{interview}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Keep access-token expiry short (minutes); use refresh tokens for longer sessions.
+  \item Store the signing key outside source control --- environment variable or a secrets manager.
+  \item Whitelist CORS origins explicitly; never pair \code{allowCredentials(true)} with origin \code{*}.
+  \item Validate the token on \emph{every} request, not just at login --- assume replay and theft.
+  \item End URL rules with \code{anyRequest().authenticated()} so new endpoints are closed by default.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Disabling CSRF \emph{and} CORS "to make it work" without knowing what each protects.
+  \item Storing JWTs in \code{localStorage} and being surprised when XSS steals them.
+  \item Putting passwords or full PII in the JWT payload --- it is Base64, not encryption.
+  \item Never rotating the signing key, or issuing tokens with no expiry at all.
+  \item Storing \code{ADMIN} but writing \code{hasRole('ADMIN')} and wondering why every check fails.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have met four diagrams. Redraw two of them \emph{from memory} below --- reproducing them is what moves a diagram from "recognised" to "owned."
+
+\begin{writespace}[Redraw: the filter chain, in order, marking where your JWT filter sits and where 401 vs 403 is decided]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the two-phase JWT flow --- login issues a token, later requests re-prove identity]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab — Secure the Order API}
+
+\textbf{Goal of this lab:} take the wide-open Day 4 Order API and lock it down --- registration, login issuing a JWT, a custom validating filter, role rules, and CORS for one origin. Build it step by step; do not paste a finished project.
+
+\resetlab
+\labstep{Model the User and Role}
+Create a \code{User} JPA entity (\code{id}, \code{email} unique, \code{passwordHash}, \code{role}) and a \code{Role} enum (\code{CUSTOMER}, \code{ADMIN}). Implement \code{UserDetailsService} to load a user by email and map the role to \code{ROLE\_} authorities.
+\labwhy{Spring Security needs a \code{UserDetails} view of your user; wiring it now lets the framework do authentication instead of you hand-rolling it.}
+
+\labstep{Add the BCrypt encoder and a register endpoint}
+Expose \code{POST /api/v1/auth/register}. Hash with \code{PasswordEncoder.encode} before saving; reject duplicate emails with \code{409}.
+\labwhy{The password must be a hash the moment it touches the database --- proving the "never store plaintext" rule in code, not just in a slide.}
+
+\labstep{Issue a JWT at login}
+Add \code{POST /api/v1/auth/login}: verify with \code{matches}, and on success return an access token (short TTL) and a refresh token. Load the signing secret from configuration, never a literal.
+\labwhy{This is the authentication half --- turning verified credentials into a portable, signed identity the rest of the system trusts.}
+
+\labstep{Write the JwtAuthFilter}
+Extend \code{OncePerRequestFilter}. Read the \code{Authorization} header, verify the token, and on success set an \code{Authentication} in the \code{SecurityContext}. On failure, leave the context empty and continue --- do not throw.
+\labwhy{Leaving the context empty (rather than throwing) lets the chain's \code{ExceptionTranslationFilter} produce a clean \code{401}, keeping error handling in one place.}
+
+\labstep{Declare the SecurityFilterChain}
+Write the \code{SecurityConfig} bean: disable CSRF, enable CORS, set \code{STATELESS} sessions, add your filter before \code{UsernamePasswordAuthenticationFilter}, and write URL rules --- \code{/auth/**} public, \code{GET /products} public, other \code{/products/**} admin, \code{/orders/**} authenticated.
+\labwhy{This is the single source of truth for who may hit which URL; getting the rule \emph{order} right is the lab's real lesson.}
+
+\labstep{Add method-level ownership rules}
+Turn on \code{@EnableMethodSecurity}. Annotate the "view one order" handler so a \code{CUSTOMER} sees only their own order and an \code{ADMIN} sees any, via a small \code{@orderGuard.owns(...)} bean.
+\labwhy{URL rules are coarse; real apps need "this row belongs to this user" checks, and method security is where that lives.}
+
+\labstep{Lock down CORS and prove it}
+Register the \code{CorsConfigurationSource} for one origin. From a disallowed origin, confirm the browser blocks the response; from the trusted origin, confirm it succeeds.
+\labwhy{Configuring CORS is easy; \emph{proving} a bad origin is actually rejected is what turns "I think it works" into "I verified it."}
+
+\begin{prodtip}
+Test the whole flow with real HTTP before you trust it: register, login, copy the token, and call \code{GET /orders} with and without the \code{Authorization} header. Watch the status codes --- \code{200} with a valid token, \code{401} without, \code{403} for the wrong user. Reading those three codes back is your end-to-end proof the chain works.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Reflection prompts, not quiz questions. Write a sentence or two --- the goal is to make your reasoning explicit.
+
+\begin{thinkbox}
+A stolen JWT is valid until it expires, because there is no server-side record to delete. Given that, argue for a specific access-token lifetime for ShopFlow. What does making it \emph{shorter} cost, and what does making it \emph{longer} risk?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your teammate stores the JWT in \code{localStorage} "because it is convenient." Explain the concrete attack that makes this dangerous, and the trade-off of the \code{httpOnly} cookie alternative --- including what it drags back into scope (hint: revisit CSRF).
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+The URL rule \code{/orders/**} requires only \code{authenticated()}, yet a customer must not read another customer's order. Why is the URL rule insufficient here, and what layer must enforce the "own order" constraint instead?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{A valid token, the right role, and still 403}
+\textbf{Symptom.} A user with role \code{ADMIN} logs in successfully, sends a valid token to \code{DELETE /products/9}, and gets \code{403 Forbidden}. Authentication clearly worked; authorization refuses.
+
+\smallskip\textbf{Evidence.}
+\begin{javabox}[how the authority was built]
+// in UserDetailsService
+var authorities = List.of(new SimpleGrantedAuthority("ADMIN"));
+// on the controller
+@PreAuthorize("hasRole('ADMIN')")   // expects "ROLE_ADMIN"
+public void delete(@PathVariable Long id) { ... }
+\end{javabox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The \code{401} vs \code{403} split proves identity is fine; the failure is in the authority comparison.
+  \item \textbf{Hypothesise.} \code{hasRole('ADMIN')} checks for the authority \code{ROLE\_ADMIN}, but the user was granted the bare authority \code{ADMIN} --- they never match.
+  \item \textbf{Verify.} Log the principal's authorities; you see \code{[ADMIN]}, not \code{[ROLE\_ADMIN]}.
+  \item \textbf{Fix.} Grant \code{new SimpleGrantedAuthority("ROLE\_ADMIN")} (or use \code{hasAuthority('ADMIN')} consistently). Pick one convention and hold it.
+  \item \textbf{Prevent.} Centralise the role$\rightarrow$authority mapping in one method and add a test asserting an \code{ADMIN} principal carries \code{ROLE\_ADMIN}.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Works in Postman, blocked in the browser}
+\textbf{Symptom.} The frontend at \code{https://app.shopflow.com} cannot call the API --- the console shows a CORS error --- yet the identical request from Postman returns \code{200}.
+
+\smallskip\textbf{Evidence.}
+\begin{bashbox}[browser console]
+Access to fetch at 'https://api.shopflow.com/api/v1/orders'
+from origin 'https://app.shopflow.com' has been blocked by CORS
+policy: No 'Access-Control-Allow-Origin' header is present.
+\end{bashbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Postman is not a browser, so it ignores CORS; the browser enforces it. The difference tells you this is a CORS config issue, not an auth issue.
+  \item \textbf{Hypothesise.} Either no \code{CorsConfigurationSource} is registered, or the browser's preflight \code{OPTIONS} request is being rejected by the security chain before CORS can answer it.
+  \item \textbf{Verify.} Watch the network tab for a failing \code{OPTIONS} preflight, and confirm whether \code{.cors(Customizer.withDefaults())} is present in the chain.
+  \item \textbf{Fix.} Register the \code{CorsConfigurationSource} bean with the trusted origin and enable \code{.cors(...)} so preflight is answered before authorization runs.
+  \item \textbf{Prevent.} Add an integration test that sends an \code{OPTIONS} preflight from the allowed origin and asserts the \code{Access-Control-Allow-Origin} header comes back.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} See BCrypt's salt with your own eyes.\\
+\textbf{Context.} You want proof that identical passwords hash to different strings, yet still verify.\\
+\textbf{Requirements.} Encode the same password twice; print both hashes; call \code{matches(raw, hash)} on each.\\
+\textbf{Hints.} Use \code{new BCryptPasswordEncoder(12)}; note the \code{\$2b\$12\$} prefix encodes version and cost.\\
+\textbf{Expected outcome.} Two different hash strings, both returning \code{true} from \code{matches}.\\
+\textbf{Common pitfalls.} Comparing hashes with \code{equals} and concluding BCrypt is broken --- that is the lesson: you must use \code{matches}.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Enforce role-based access on three endpoints and prove the boundary.\\
+\textbf{Context.} A \code{CUSTOMER} must be denied admin actions; an \code{ADMIN} allowed.\\
+\textbf{Requirements.} Add \code{@PreAuthorize} to create-product (ADMIN), delete-product (ADMIN), and list-my-orders (any authenticated). Log in as each role and hit all three.\\
+\textbf{Hints.} Enable \code{@EnableMethodSecurity}; remember \code{hasRole('ADMIN')} looks for \code{ROLE\_ADMIN}.\\
+\textbf{Expected outcome.} A \code{403} for the customer on admin routes, \code{200} for the admin, \code{200} for both on their own orders.\\
+\textbf{Common pitfalls.} Forgetting \code{@EnableMethodSecurity}, so the annotations are silently ignored and everything is allowed.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~70 min}
+\textbf{Goal.} Implement refresh-token rotation with reuse detection.\\
+\textbf{Context.} Access tokens expire in minutes; a refresh endpoint issues a new pair without re-login.\\
+\textbf{Requirements.} \code{POST /auth/refresh} validates the refresh token, issues a new access \emph{and} a new refresh token, and invalidates the old refresh token. If an already-used refresh token is presented, revoke the whole family (theft signal).\\
+\textbf{Hints.} Persist refresh tokens (id + user + used flag); rotation means each refresh is single-use.\\
+\textbf{Expected outcome.} A seamless renew for honest clients; a replayed refresh token forces re-login for everyone in that chain.\\
+\textbf{Common pitfalls.} Making refresh tokens as long-lived and unrotated as a password --- a stolen one then never expires in practice.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+Judgment from engineers who have carried a pager. Read these as reasoning, not trivia.
+
+\begin{seniornote}
+Return \code{404} instead of \code{403} for resources a user may not even know exist. Telling an attacker "that order exists, you just can't see it" (\code{403}) leaks structure; "no such order" (\code{404}) leaks nothing. Distinguish \emph{"forbidden and I'll admit it exists"} from \emph{"forbidden, and I won't confirm it"} per resource --- it is a deliberate design call, not an accident.
+\end{seniornote}
+
+\begin{secwarn}[secrets never live in the jar]
+The signing key is the master credential of your whole auth system --- anyone holding it can mint valid tokens for any user. It belongs in an environment variable or secrets manager injected at deploy time (Day 8 Compose, Day 12 CI), never in \code{application.yml} in git. A key committed to history is compromised even after you delete it.
+\end{secwarn}
+
+\begin{interview}
+Expect: \emph{"How does the Spring Security filter chain process a request?"} Do not list class names blindly. Narrate the journey: CORS answers preflight, your JWT filter reads the header and sets the \code{SecurityContext}, \code{ExceptionTranslationFilter} maps failures to \code{401}/\code{403}, and \code{AuthorizationFilter} is the final gate. Naming the \emph{order} and \emph{each filter's one job} is what signals depth.
+\end{interview}
+
+\begin{perfnote}
+Stateless JWT auth removes a per-request session lookup --- that is its performance gift. But if your JWT filter reloads the full \code{UserDetails} from the database on every request, you have quietly reintroduced the lookup you were avoiding. For hot paths, trust the roles embedded in the token (they were signed) rather than re-querying, and accept the small staleness window as the cost of the stateless bargain.
+\end{perfnote}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — ShopFlow}
+
+By Day 4, ShopFlow had a working, documented Order API --- but wide open: any caller could create, read, and manage every order. Today you put a lock on the door without touching the rooms behind it.
+
+\begin{buildalong}[Day 05 — securing the Order API with JWT]
+\begin{wbitem}
+  \item Add a \code{User} entity + \code{Role} enum (\code{CUSTOMER}, \code{ADMIN}) and a \code{UserDetailsService}; store passwords with \code{BCryptPasswordEncoder}.
+  \item Build \code{POST /api/v1/auth/register}, \code{/login}, and \code{/refresh}: register hashes the password, login issues a short-lived access token plus a refresh token, refresh rotates them.
+  \item Write a \code{JwtAuthFilter extends OncePerRequestFilter} that validates the \code{Bearer} token and populates the \code{SecurityContext}; add it \emph{before} \code{UsernamePasswordAuthenticationFilter}.
+  \item Declare a component-based \code{SecurityFilterChain} (Spring Security 6, \emph{not} \code{WebSecurityConfigurerAdapter}): CSRF disabled, CORS enabled, \code{STATELESS} sessions.
+  \item Enforce role rules: \code{CUSTOMER} views only their own orders; \code{ADMIN} manages products and views all orders (URL rules + \code{@PreAuthorize} ownership check).
+  \item Lock CORS to the single trusted origin \code{https://app.shopflow.com} with explicit methods and headers; keep the signing secret in an environment variable.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} an unauthenticated call to \code{/api/v1/orders} returns \code{401}; a \code{CUSTOMER} reading another customer's order returns \code{403}; a \code{CUSTOMER} reading their own order and an \code{ADMIN} reading any order return \code{200}; and a request from a disallowed origin is blocked by CORS while the trusted origin succeeds.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Security is a \emph{chain of filters} run before MVC; it answers "who are you?" then "are you allowed?".
+  \item Authentication produces an \code{Authentication} in the \code{SecurityContext}; authorization only reads it.
+  \item BCrypt is salted and adaptive --- store the hash, verify with \code{matches}, never store plaintext.
+  \item A JWT is \emph{signed, not encrypted}; it scales because it is stateless, and it is hard to revoke for the same reason.
+  \item Configure Spring Security 6 with a \code{SecurityFilterChain} bean; add your JWT filter before \code{UsernamePasswordAuthenticationFilter}.
+  \item CORS is a browser rule; CSRF targets ambient cookies --- a header-token API disables CSRF deliberately.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{hasRole('ADMIN')} matches the authority \code{ROLE\_ADMIN} --- the prefix is added for you.
+  \item \code{401} = "I don't know who you are"; \code{403} = "I know exactly who you are, and no."
+  \item Order your URL rules specific-first, and finish with \code{anyRequest().authenticated()}.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item JWT in \code{localStorage} $\rightarrow$ XSS token theft. \quad$\bullet$\quad Secrets in \code{application.yml} $\rightarrow$ compromised for good.
+  \item Disabling CSRF and CORS blindly $\rightarrow$ no idea what you turned off. \quad$\bullet$\quad No expiry $\rightarrow$ tokens valid forever.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Authn vs Authz}{authentication = who you are (verify credentials); authorization = what you may do (check authorities).}
+\cheatitem{Filter chain}{CORS $\rightarrow$ JwtAuthFilter $\rightarrow$ UsernamePasswordAuthenticationFilter $\rightarrow$ ExceptionTranslation $\rightarrow$ AuthorizationFilter $\rightarrow$ controller.}
+\cheatitem{BCrypt}{salted + adaptive; store hash; verify with \code{matches}; cost is a tunable dial.}
+\cheatitem{JWT}{header.payload.signature; signed not encrypted; stateless, short-lived, refresh for longevity.}
+\cheatitem{Config}{\code{SecurityFilterChain} bean; \code{addFilterBefore}; STATELESS; specific rules before general.}
+\cheatitem{hasRole vs hasAuthority}{\code{hasRole('X')} = \code{hasAuthority('ROLE\_X')}; pick one convention and hold it.}
+\cheatitem{CORS vs CSRF}{CORS = browser origin policy you whitelist; CSRF = ambient-cookie attack, off for header-token APIs.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{How does the Spring Security Filter Chain process a request?}
+\iq{What problem does JWT solve that session cookies don't, and what does it give up?}
+\iq{Explain CORS vs CSRF, and why JWT APIs often disable CSRF.}
+\iq{How would you revoke a JWT before it expires?}
+\iq{What is the difference between authentication and authorization?}
+\iq{How does BCrypt protect against rainbow-table attacks?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Spring Security Reference} --- "Architecture" (the filter chain) and "Authorization."
+  \item RFC 7519 (JWT) and RFC 6749 (OAuth2) --- read the introductions, at least.
+  \item OWASP: the \emph{Authentication} and \emph{JWT} cheat sheets --- concise, practical, current.
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 6).} Your API is now authenticated, authorized, and documented --- but is it \emph{correct}? Tomorrow you prove it with tests: unit tests for services, slice tests for controllers, and \code{@SpringBootTest} with a real database via Testcontainers --- including how to authenticate a test request so your new security rules do not turn every test red.
+\end{keyidea}

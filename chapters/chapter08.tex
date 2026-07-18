@@ -1,0 +1,531 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 08 ============================
+\daychapter{08}{Infrastructure}{Docker}{Containerizing the backend --- images, multi-stage builds, Compose \& networking}{7--8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what a container actually \emph{is} at the kernel level --- and why it is not a lightweight virtual machine.
+  \item Reason about images as stacked, cached layers, and order a \code{Dockerfile} so rebuilds are fast.
+  \item Write a production-grade \emph{multi-stage} Dockerfile for a Spring Boot app: a JDK build stage, a slim JRE runtime, a non-root user.
+  \item Bring up the app plus PostgreSQL and Redis with one \code{docker compose up}, wired by \emph{service name}, not \code{localhost}.
+  \item Configure the same image for every environment through environment variables, and persist data with named volumes.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What this day solves.} For seven days your app has run one way: \code{./mvnw spring-boot:run} on your laptop, against a database you installed by hand. That works until it has to run somewhere else --- a teammate's machine, a CI runner, a staging server, production. Every one of those has a different JDK patch level, a different libc, a different Postgres, a different set of ports already taken. The phrase \emph{``but it works on my machine''} is the sound of that gap. Today you close it: you package ShopFlow --- app plus its exact runtime --- into an image that runs \emph{identically} everywhere.
+
+\glabel{Why backend engineers need it.} Containers are the unit of deployment for modern backends. CI builds one, a registry stores it, Kubernetes or ECS schedules it, autoscaling replicates it. If you cannot write a correct Dockerfile you cannot ship; if you write a careless one you ship a 900\,MB image running as root with your build tools and, occasionally, your secrets baked in. The difference between those two outcomes is entirely today's material.
+
+\begin{keyidea}
+A container is not a small virtual machine. It is one or more ordinary Linux processes that the kernel has been told to \keyterm{isolate} --- given their own view of the filesystem, network, and process table --- while still sharing the \emph{host's} kernel. That single fact explains everything else: why containers start in milliseconds, why an image is just a stack of files, and why ``it runs the same everywhere'' as long as the kernel is Linux.
+\end{keyidea}
+
+\glabel{Where it fits in a Spring Boot application.} Nothing about your Java code changes today. The layered app from Days 1--4, the persistence from Days 2--3, the security from Day 5, the tests from Day 7 --- all of it stays exactly as written. What changes is the \emph{boundary around} the app: how it is built into an artifact, how it finds its database, how it reads its configuration. Docker sits underneath everything and becomes the substrate for CI/CD (Day 12) and any orchestration that follows.
+
+\begin{wbfigure}{Fig 8.1 --- The same immutable image, built once, promoted unchanged across every environment; only the injected configuration differs.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=30mm] (img) {\textbf{ShopFlow image}\\\scriptsize built once from Dockerfile};
+  \node[wbbox, above right=6mm and 16mm of img, text width=26mm] (dev) {\textbf{Local dev}\\\scriptsize Compose + Postgres};
+  \node[wbbox, right=16mm of img, text width=26mm] (ci) {\textbf{CI / staging}\\\scriptsize same image, test DB};
+  \node[wbboxgood, below right=6mm and 16mm of img, text width=26mm] (prod) {\textbf{Production}\\\scriptsize same image, real DB};
+  \draw[wbarrow] (img)--(dev); \draw[wbarrow] (img)--(ci); \draw[wbarrow] (img)--(prod);
+  \node[wbcap, below=5mm of img, text width=34mm] {config injected per env\\(env vars, not rebuilds)};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Real company examples.} Google runs everything in containers and generates billions of container starts a week; the ideas in Docker descend directly from Google's internal \emph{Borg}. Netflix bakes images in CI and promotes the exact bytes to production. Every managed platform you will meet --- AWS ECS/Fargate, Google Cloud Run, Fly.io, Heroku's newer stack --- takes an image as its input. Learn the image and you can deploy anywhere.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+Hold the whole territory in one picture. A \keyterm{Dockerfile} is a recipe; building it produces an \keyterm{image} (a stack of read-only layers); running the image produces a \keyterm{container} (a live process with a thin writable layer on top); \keyterm{Compose} runs several containers together on a private network.
+
+\begin{wbfigure}{Fig 8.2 --- The Day 8 concept map: recipe becomes image becomes container; Compose orchestrates several on one network.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=26mm] (df) {\textbf{Dockerfile}\\\scriptsize build recipe};
+  \node[wbboxaccent, right=of df, text width=26mm] (img) {\textbf{Image}\\\scriptsize stacked read-only layers};
+  \node[wbboxgood, right=of img, text width=26mm] (ct) {\textbf{Container}\\\scriptsize running process\\+ writable layer};
+  \draw[wbarrow] (df)--(img) node[midway,above,wbcap]{build}; \draw[wbarrow] (img)--(ct) node[midway,above,wbcap]{run};
+  \node[wbboxdb, below=9mm of img, text width=30mm] (comp) {\textbf{docker-compose.yml}\\\scriptsize declares many services\\on one private network};
+  \draw[wbarrowg] (comp)--(ct);
+  \node[wbboxghost, left=10mm of comp, text width=22mm] (reg) {\textbf{Registry}\\\scriptsize push / pull images};
+  \draw[wbarrowg] (img) to[out=200,in=90] (reg);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Dockerfile} $\rightarrow$ \keyterm{layer} $\rightarrow$ \keyterm{image} $\rightarrow$ \keyterm{registry} $\rightarrow$ \keyterm{container} $\rightarrow$ \keyterm{volume} $\rightarrow$ \keyterm{Compose service} $\rightarrow$ \keyterm{user-defined network}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad What a Container Actually Is (and Why It Is Not a VM)}
+
+\glabel{What is it?} A \keyterm{container} is a normal process --- your \code{java -jar app.jar} --- that the Linux kernel runs with a restricted, private view of the system. It sees its own root filesystem, its own network interface, its own process IDs, but it is scheduled by the same kernel as every other process on the host.
+
+\glabel{Why does it exist?} We wanted the isolation and reproducibility of a virtual machine without paying for a whole guest operating system per app. A VM virtualises \emph{hardware} and boots a full guest kernel; that costs gigabytes of RAM and tens of seconds to start. A container virtualises the \emph{operating-system interface} instead, so ten containers share one kernel and start in milliseconds.
+
+\glabel{How does it work internally?} Two Linux kernel features do the heavy lifting. \keyterm{Namespaces} give a process a private view of a resource --- there are namespaces for the filesystem mount table, the network stack, process IDs, users, and more. \keyterm{Control groups (cgroups)} limit and account for how much CPU, memory, and I/O a process may consume. Docker is, at heart, a friendly way to launch a process wrapped in the right set of namespaces and cgroups, using an image as its root filesystem.
+
+\begin{wbfigure}{Fig 8.3 --- VM versus container: the VM ships a whole guest OS per app; containers share the host kernel and isolate only the process.}
+\wbscale{\begin{tikzpicture}[node distance=3.4mm, every node/.style={font=\sffamily\footnotesize},
+   band/.style={wbbox, minimum width=40mm, minimum height=7mm, align=center}]
+  % VM stack
+  \node[band, wbboxghost] (vhw) {Physical host + kernel};
+  \node[band, above=of vhw] (vhyp) {Hypervisor};
+  \node[band, wbboxwarn, above=of vhyp] (vg1) {Guest OS + kernel \;·\; App A};
+  \node[band, wbboxwarn, above=of vg1] (vg2) {Guest OS + kernel \;·\; App B};
+  \node[wbcap, above=2mm of vg2] {Virtual machines --- heavy};
+  % Container stack
+  \node[band, wbboxghost, right=22mm of vhw] (chw) {Physical host};
+  \node[band, above=of chw] (ck) {\textbf{Shared host kernel}};
+  \node[band, above=of ck] (ce) {Container engine (Docker)};
+  \node[band, wbboxgood, above=of ce] (cc1) {App A (isolated process)};
+  \node[band, wbboxgood, above=of cc1] (cc2) {App B (isolated process)};
+  \node[wbcap, above=2mm of cc2] {Containers --- light};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} For essentially every backend service you deploy. Uniform build, uniform run, trivial local parity, and it is what every orchestrator expects.
+
+\glabel{When should I \emph{not}?} When you genuinely need a \emph{different kernel} (a Windows app on a Linux host), or hard security isolation between mutually hostile tenants --- containers share the kernel, so a kernel exploit escapes them. Those cases want VMs or micro-VM sandboxes (Firecracker, gVisor).
+
+\begin{misconception}
+``Alpine images are tiny because Alpine is a lightweight kernel.'' There is no Alpine kernel in the image at all --- \emph{every} container uses the host's kernel. Alpine is small because its \emph{userland} (its libc and base tools) is small. In fact Alpine uses \code{musl} libc rather than \code{glibc}, which occasionally breaks native libraries; a common gotcha with certain JVM or DNS behaviours.
+\end{misconception}
+
+\wbsub{3.2\quad Images, Layers \& the Build Cache}
+
+\glabel{What is it?} An \keyterm{image} is a stack of read-only \keyterm{layers}. Each instruction in a Dockerfile that changes the filesystem (\code{COPY}, \code{RUN}, \code{ADD}) produces one new layer --- a diff on top of the layers below it. The image is those diffs stacked by a union filesystem; a running container adds one thin \emph{writable} layer on top.
+
+\glabel{Why does it exist?} Layers are shared and cached. If two images start \code{FROM eclipse-temurin:21-jre-alpine}, that base layer is stored once on disk and downloaded once over the network. And during a build, Docker reuses a layer's cached result if its instruction and inputs are unchanged --- so a rebuild after a one-line code change can skip re-downloading every dependency.
+
+\glabel{How does it work internally?} The build cache is keyed, in order, on each instruction and the content it touches. Docker walks the Dockerfile top to bottom; for each step it checks whether it has a cached layer for ``this instruction, applied to this parent, over these input files.'' The moment one step misses, \emph{every step after it is rebuilt} --- the cache invalidates forward. This is the single most important thing to understand about writing a fast Dockerfile.
+
+\begin{wbfigure}{Fig 8.4 --- Layer cache invalidation flows downward: copy rarely-changing dependencies before frequently-changing source so the expensive step stays cached.}
+\wbscale{\begin{tikzpicture}[node distance=3.6mm, every node/.style={font=\sffamily\footnotesize},
+   L/.style={wbbox, minimum width=62mm, minimum height=7mm, align=left, text width=57mm}]
+  \node[L, wbboxghost] (l1) {\textbf{FROM} base image \hfill \scriptsize cached, shared};
+  \node[L, below=of l1] (l2) {\textbf{COPY} pom.xml \hfill \scriptsize changes rarely};
+  \node[L, wbboxgood, below=of l2] (l3) {\textbf{RUN} download dependencies \hfill \scriptsize expensive --- stays cached};
+  \node[L, wbboxaccent, below=of l3] (l4) {\textbf{COPY} src/ \hfill \scriptsize changes every commit};
+  \node[L, wbboxaccent, below=of l4] (l5) {\textbf{RUN} package the jar \hfill \scriptsize cheap, always reruns};
+  \foreach \a/\b in {l1/l2,l2/l3,l3/l4,l4/l5}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=5mm of l4, text width=24mm, anchor=west] {cache breaks here on a code change};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} Always order instructions \emph{stable-to-volatile}: base image, then dependency manifests, then the dependency download, then application source last. That way an edit to a controller invalidates only the last two cheap layers, not the multi-minute dependency resolution.
+
+\begin{perfnote}
+Each \code{RUN} makes a layer, and a layer's size is the \emph{net} of files it added --- deleting a file in a \emph{later} \code{RUN} does not shrink the earlier layer, it just hides the file. That is why ``\code{RUN apt-get install} \dots'' and its cleanup must live in the \emph{same} \code{RUN}, joined with \code{\&\&}. In multi-stage builds (next topic) this matters far less, because you copy only the finished jar into a fresh final stage.
+\end{perfnote}
+
+\wbsub{3.3\quad The Multi-Stage Dockerfile}
+
+\glabel{What is it?} A \keyterm{multi-stage build} writes several \code{FROM} sections in one Dockerfile. Earlier stages do work you need but do not want to ship (compiling, running Maven); a final stage starts from a clean, minimal base and copies \emph{only the finished artifact} out of an earlier stage with \code{COPY --from=}.
+
+\glabel{Why does it exist?} To build with a fat toolchain and run with a lean one. Compiling a Spring Boot app needs a full JDK plus Maven plus your entire dependency cache --- hundreds of megabytes you must never ship to production. The runtime needs only a JRE and one jar. Before multi-stage builds people maintained two Dockerfiles or brittle shell scripts; now it is one file, and the toolchain simply never reaches the final image.
+
+\begin{dockerbox}[Dockerfile --- ShopFlow, production-grade]
+# ---------- Stage 1: build ----------
+FROM eclipse-temurin:21-jdk AS build
+WORKDIR /app
+
+# copy only what the dependency resolution needs, first
+COPY .mvn/ .mvn
+COPY mvnw pom.xml ./
+RUN ./mvnw dependency:go-offline -B
+
+# now the source; edits here don't bust the dependency layer
+COPY src ./src
+RUN ./mvnw clean package -DskipTests -B
+
+# ---------- Stage 2: runtime ----------
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+
+# create and switch to an unprivileged user
+RUN addgroup -S spring && adduser -S spring -G spring
+USER spring
+
+# copy ONLY the finished jar out of the build stage
+COPY --from=build /app/target/*.jar app.jar
+
+EXPOSE 8080
+ENTRYPOINT ["java","-jar","/app/app.jar"]
+\end{dockerbox}
+
+\glabel{How does it work internally?} Each stage is an independent image built in the same pass. \code{COPY --from=build} reaches into the \emph{build} stage's filesystem and lifts out the path you name. When the build finishes, Docker tags and keeps only the \emph{last} stage; the JDK/Maven stage is discarded (though its layers stay in the build cache for next time). The final image is essentially: Alpine JRE base $+$ one jar.
+
+\begin{seniornote}
+Notice \code{USER spring} sits \emph{before} the \code{COPY} and \code{ENTRYPOINT}. Running as a non-root user is not decoration --- if an attacker achieves remote code execution inside the container, a root process can attempt to exploit the kernel from a much stronger position than an unprivileged one can. Many platforms (OpenShift, hardened Kubernetes) will \emph{refuse} to run a container that declares no non-root user. Set it once, here, forever.
+\end{seniornote}
+
+\glabel{When should I use it?} For every compiled-language service. It is the default, not an optimisation.
+
+\glabel{When should I \emph{not}?} Rarely --- but if you already produce the jar in CI \emph{before} the Docker build, your final Dockerfile can be a single stage that just copies that pre-built jar in. The principle survives: the runtime image contains only the JRE and the jar.
+
+\begin{behind}
+Spring Boot supports \keyterm{layered jars}: the fat jar is internally split into dependencies, snapshot dependencies, and your application classes, so Docker can cache the (large, stable) dependency layer separately from the (small, volatile) application layer. Extract with \code{java -Djarmode=layertools -jar app.jar extract} in the build stage and \code{COPY} each layer in order. For a first production image the simple single-jar copy above is completely fine; reach for layered jars when image push time becomes a bottleneck.
+\end{behind}
+
+\wbsub{3.4\quad Docker Compose \& Service-Name Networking}
+
+\glabel{What is it?} \keyterm{Docker Compose} declares a set of containers --- ``services'' --- and their wiring in one \code{docker-compose.yml}, brought up together with \code{docker compose up}. For local development it is how you run ShopFlow's whole world (app, database, cache) with one command.
+
+\glabel{Why does it exist?} A real backend is never one container. You need Postgres and Redis alongside the app, on a network where they can find each other, with volumes for data and a repeatable teardown. Doing that by hand with \code{docker run} flags is error-prone; Compose makes it a file you commit.
+
+\begin{yamlbox}[docker-compose.yml]
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/shopflow
+      SPRING_DATASOURCE_USERNAME: shopflow
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_PROFILES_ACTIVE: docker
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: shopflow
+      POSTGRES_USER: shopflow
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+
+volumes:
+  pgdata:
+\end{yamlbox}
+
+\glabel{How does it work internally?} Compose creates a \keyterm{user-defined bridge network} for the project and attaches every service to it. On that network Docker runs an embedded DNS server, and \emph{each service is reachable by its service name}. So the app reaches Postgres at the host \code{db} and Redis at \code{redis} --- those names resolve to the containers' current internal IPs. This is why the datasource URL is \code{jdbc:postgresql://db:5432/...} and never \code{localhost}.
+
+\begin{wbfigure}{Fig 8.5 --- Inside the Compose network each service is a DNS name. The app dials \code{db} and \code{redis}; only port 8080 is published to the host.}
+\wbscale{\begin{tikzpicture}[node distance=8mm and 14mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbboxaccent, text width=34mm] (app) {\textbf{app}\\\scriptsize Spring Boot :8080\\resolves \code{db}, \code{redis} by name};
+  \node[wbboxdb, below left=12mm and 6mm of app, text width=30mm] (db) {\textbf{db}\\\scriptsize postgres:16 :5432\\volume: pgdata};
+  \node[wbboxdb, below right=12mm and 6mm of app, text width=30mm] (redis) {\textbf{redis}\\\scriptsize redis:7 :6379\\cache layer};
+  \draw[wbarrow] (app) to[out=250,in=60] node[midway,left,wbcap]{db:5432} (db);
+  \draw[wbarrow] (app) to[out=290,in=120] node[midway,right,wbcap]{redis:6379} (redis);
+  \node[wbboxghost, above=9mm of app, text width=30mm] (host) {\textbf{Host machine}\\\scriptsize browser $\rightarrow$ localhost:8080};
+  \draw[wbarrowg] (host)--(app) node[midway,right,wbcap]{published port};
+  \begin{scope}[on background layer]
+    \node[draw=cRule, line width=0.8pt, rounded corners=2mm, fill=cBrand!4,
+          fit=(app)(db)(redis), inner sep=5mm] (net) {};
+  \end{scope}
+  \node[wbcap, below=1mm of net.north east, anchor=north east, xshift=-2mm] {network: shopflow\_default};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Why \code{depends\_on} with a condition?} Plain \code{depends\_on} only controls \emph{start order} --- it starts the DB container first, but does not wait for Postgres to be \emph{ready to accept connections}. Postgres takes a second or two to initialise; the app can win the race and crash on ``connection refused.'' A \code{healthcheck} plus \code{condition: service\_healthy} makes Compose wait until \code{pg\_isready} passes before starting the app.
+
+\begin{prodtip}
+\code{depends\_on} is a \emph{local-development} convenience, not a production guarantee. In Kubernetes there is no \code{depends\_on}; the platform restarts your pod until its dependencies are reachable. So even with a healthcheck, your app must still tolerate its database being briefly unavailable --- connection-pool retries and a readiness probe are the real fix. Compose ordering just makes local runs pleasant.
+\end{prodtip}
+
+\wbsub{3.5\quad Environment Configuration, Secrets \& Named Volumes}
+
+\glabel{What is it?} The same image must behave differently per environment without being rebuilt. Docker's answer is \keyterm{environment variables}: values injected at \code{run} time, read by the process at startup. Spring Boot maps them onto its properties automatically.
+
+\glabel{How does it work internally?} Spring Boot's \keyterm{relaxed binding} turns an environment variable like \code{SPRING\_DATASOURCE\_URL} into the property \code{spring.datasource.url}: uppercase, dots and dashes become underscores. So you never edit \code{application.yml} to point at the containerised database --- you set \code{SPRING\_DATASOURCE\_URL} in Compose and Spring picks it up, overriding the file. This is the exact mechanism behind Day 1's ``one artifact, many environments'' promise.
+
+\begin{propsbox}[.env --- git-ignored, local only]
+# Read automatically by docker compose for ${...} substitution.
+# NEVER commit this file. Commit a .env.example with blanks instead.
+DB_PASSWORD=local-dev-only-password
+\end{propsbox}
+
+\glabel{Why never bake secrets into the image?} An image is a stack of layers anyone who can pull it can inspect --- \code{docker history} and a layer unpack reveal every \code{ENV} and every copied file. A password written into the Dockerfile is a password published to your registry. Inject secrets at run time instead: a git-ignored \code{.env} locally, and a real secrets manager (AWS Secrets Manager, Vault, Kubernetes Secrets) in production --- the subject of Day 12.
+
+\begin{secwarn}[secrets leak through layers and history]
+A secret ``removed'' in a later Dockerfile instruction still lives in the earlier layer that added it. \code{docker history --no-trunc} and simple layer extraction expose it. The only safe secret is one that was \emph{never} written to a layer: pass it as a runtime environment variable or mount it, and keep \code{.env} out of version control and out of the build context (via \code{.dockerignore}).
+\end{secwarn}
+
+\glabel{Why named volumes?} A container's writable layer is \emph{ephemeral} --- \code{docker compose down} and it is gone, taking the database with it. A \keyterm{named volume} (\code{pgdata} above) is storage that Docker manages \emph{outside} any single container's lifecycle, mounted into Postgres's data directory. It survives restarts and recreates, and is the correct way to persist stateful data locally.
+
+\begin{dbinsight}
+Bind-mounting a host directory into Postgres (\code{./data:/var/lib/postgresql/data}) works on Linux but causes permission and performance grief on Docker Desktop for Mac/Windows, where the data crosses a virtualisation boundary. Prefer a \emph{named volume} for database data --- Docker keeps it inside its own managed storage where the database's \code{uid} owns the files cleanly.
+\end{dbinsight}
+
+You also want a \code{.dockerignore}, the build-context twin of \code{.gitignore}. Before a build, Docker sends the whole build context (your project directory) to the daemon; without exclusions that means \code{.git}, \code{target/}, IDE folders --- often hundreds of megabytes --- copied on every build and, worse, potentially copied \emph{into} the image.
+
+\begin{propsbox}[.dockerignore]
+.git
+target/
+*.iml
+.idea/
+.env
+**/*.log
+Dockerfile
+docker-compose.yml
+\end{propsbox}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Multi-stage always: build with the JDK, ship only a JRE and the jar.
+  \item Run as a declared non-root user (\code{USER spring}).
+  \item Pin base image tags (\code{postgres:16-alpine}), never \code{latest}.
+  \item Order the Dockerfile stable-to-volatile so the dependency layer stays cached.
+  \item Named volumes for anything that must survive \code{compose down}; a \code{.dockerignore} to keep the context lean.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Copying the whole project (\code{.git}, \code{target/}) in with no \code{.dockerignore}.
+  \item Hardcoding \code{localhost} as the DB host in Compose instead of the service name \code{db}.
+  \item \code{latest} tags everywhere, making builds non-reproducible.
+  \item Running the app as root; baking passwords into \code{ENV} or the image.
+  \item Assuming \code{depends\_on} waits for the database to be \emph{ready}.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You have met five diagrams. Reproducing two of them from memory is what converts ``I recognised that'' into ``I can draw that at a whiteboard in an interview.''
+
+\begin{writespace}[Redraw: the VM stack vs the container stack --- mark exactly where the kernel is shared]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the Compose network --- three services, which names resolve, which port is published to the host]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Coding Lab --- Containerize ShopFlow}
+
+\textbf{Goal of this lab:} take the ShopFlow app exactly as it stands after Day 7 and give it a production-grade image and a one-command local stack. You will \emph{watch} the image shrink and the services find each other by name.
+
+\resetlab
+\labstep{Baseline a naive single-stage image}
+Write a throwaway \code{Dockerfile.naive} that does \code{FROM eclipse-temurin:21-jdk}, copies everything, and runs \code{./mvnw package}. Build it and record the size with \code{docker images}.
+\labwhy{You need a ``before'' number so the multi-stage win is a measurement, not a claim --- expect roughly 700--900\,MB.}
+
+\labstep{Write the multi-stage Dockerfile}
+Create the real \code{Dockerfile} from Topic 3.3: JDK build stage, dependency layer before source, JRE-alpine runtime, non-root \code{spring} user, \code{COPY --from=build}.
+\labwhy{This is the artifact every later day and every deploy target consumes; getting the stage boundary right is the whole point.}
+
+\labstep{Add a \code{.dockerignore} and measure the context}
+Add the \code{.dockerignore} from Topic 3.5. Rebuild and watch the ``transferring context'' size in the build output drop.
+\labwhy{A lean context builds faster and prevents \code{.git} or a stray \code{.env} from ever entering an image layer.}
+
+\labstep{Compare the two images}
+Run \code{docker images shopflow} for both tags side by side. The multi-stage image should be a small fraction of the naive one.
+\labwhy{Seeing 800\,MB collapse to under 200\,MB is the moment multi-stage stops being abstract.}
+
+\labstep{Write \code{docker-compose.yml} for app + db + redis}
+Use the Compose file from Topic 3.4: service-name networking, \code{\$\{DB\_PASSWORD\}} from a git-ignored \code{.env}, a \code{pgdata} named volume, a Postgres healthcheck gating the app.
+\labwhy{This is the local world your teammates will \code{git clone \&\& docker compose up} into on day one.}
+
+\labstep{Bring it up and prove networking}
+Run \code{docker compose up --build}. Watch the app wait for the DB healthcheck, then connect to \code{db:5432}. Hit \code{localhost:8080} from your browser.
+\labwhy{You are confirming the two hardest-won facts of the day: readiness gating works, and \code{db} resolves without \code{localhost}.}
+
+\labstep{Prove the volume persists}
+Insert a row, run \code{docker compose down} (not \code{-v}), then \code{docker compose up} again and confirm the row is still there.
+\labwhy{This is the difference between a demo and a database: state must outlive the container.}
+
+\begin{prodtip}
+Do not copy image sizes from this page --- run the two builds and read \emph{your own} \code{docker images} output. The number depends on your dependency set, and the habit of measuring (not assuming) image size is exactly what keeps production images from quietly bloating over a year of commits.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+Write a sentence or two for each --- the goal is to make your reasoning explicit, not to be right on the first try.
+
+\begin{thinkbox}
+Your image ships in 40 seconds after a code-only change but takes 6 minutes after you edit \code{pom.xml}. Explain, in terms of layer-cache invalidation, why editing the dependency manifest is so much more expensive --- and what that tells you about instruction ordering.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Compose lets the app reach Postgres at the hostname \code{db}. From first principles, what makes \code{db} resolve to an IP address inside the network, and why would the very same URL fail if you ran the app with a bare \code{docker run} on the default bridge?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A teammate argues ``non-root inside a container is pointless --- it is isolated anyway.'' Give the strongest counter-argument, and name one thing running as root inside the container makes materially easier for an attacker who has already achieved code execution.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The app can't reach the database --- ``Connection refused: localhost:5432''}
+\textbf{Symptom.} Under Compose the app crashes at startup; the log shows it trying \code{localhost:5432} and getting connection refused, even though the \code{db} container is clearly running.
+
+\smallskip\textbf{Evidence.}
+\begin{yamlbox}[docker-compose.yml (excerpt)]
+  app:
+    build: .
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/shopflow
+    depends_on: [db]
+\end{yamlbox}
+
+\textbf{Work the method:}
+\begin{tickcheck}
+  \item \textbf{Observe.} The URL host is \code{localhost}. Inside the app container, \code{localhost} is \emph{that container itself}, where nothing listens on 5432.
+  \item \textbf{Hypothesise.} On a Compose network each service is reachable by its \emph{service name}, so the DB is at host \code{db}, not \code{localhost}.
+  \item \textbf{Verify.} \code{docker compose exec app getent hosts db} resolves to an IP; \code{getent hosts localhost} points back at the app.
+  \item \textbf{Fix.} Change the URL to \code{jdbc:postgresql://db:5432/shopflow}.
+  \item \textbf{Prevent.} Never hardcode \code{localhost} in container config; use service names and inject them as environment variables.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Intermittent boot failure --- the app wins the race against Postgres}
+\textbf{Symptom.} \code{docker compose up} succeeds maybe half the time. When it fails, the app log shows a connection error in the first second, then the container exits; the DB comes up healthy moments later.
+
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{depends\_on: [db]} only orders \emph{startup}; it does not wait for Postgres to accept connections, and Postgres needs a second or two to initialise.
+  \item \textbf{Hypothesise.} The app is racing the database: sometimes it connects, sometimes it tries before Postgres is listening.
+  \item \textbf{Verify.} \code{docker compose logs db} shows ``database system is ready to accept connections'' \emph{after} the app's failed attempt.
+  \item \textbf{Fix.} Add a \code{healthcheck} to \code{db} and gate the app with \code{depends\_on: db: condition: service\_healthy}.
+  \item \textbf{Prevent.} Beyond Compose, make the app itself resilient --- connection-pool retries and a readiness probe --- so it tolerates a briefly-absent database in any environment.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~25 min}
+\textbf{Goal.} Feel the multi-stage size win as a measured number.\\
+\textbf{Context.} You have a working Spring Boot jar and a single-stage image already.\\
+\textbf{Requirements.} Write the multi-stage Dockerfile; build both; record both sizes.\\
+\textbf{Hints.} \code{docker images} shows a \code{SIZE} column; tag them \code{shopflow:naive} and \code{shopflow:multi}.\\
+\textbf{Expected outcome.} The multi-stage image is a small fraction of the single-stage one.\\
+\textbf{Common pitfalls.} Forgetting \code{COPY --from=build}, so the final stage has no jar; or leaving \code{-jdk} instead of \code{-jre} in the runtime stage.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~45 min}
+\textbf{Goal.} Stand up app + Postgres + Redis with one command and correct wiring.\\
+\textbf{Context.} The app reads its datasource and Redis host from environment variables.\\
+\textbf{Requirements.} Compose file with service-name networking, a \code{pgdata} named volume, and \code{\$\{DB\_PASSWORD\}} sourced from a git-ignored \code{.env}.\\
+\textbf{Hints.} Verify name resolution with \code{docker compose exec app getent hosts db}.\\
+\textbf{Expected outcome.} One \code{docker compose up} brings the whole stack live; the app connects to \code{db} and \code{redis} by name.\\
+\textbf{Common pitfalls.} Using \code{localhost} for the DB host; committing the \code{.env}; publishing 5432 to the host when nothing outside needs it.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~75 min}
+\textbf{Goal.} Harden the image and stack the way a platform team would review it.\\
+\textbf{Context.} You are preparing this image to be promoted unchanged from CI to production.\\
+\textbf{Requirements.} Non-root user; \code{.dockerignore}; pinned base tags; a Postgres \code{healthcheck} gating the app; a \code{HEALTHCHECK} or Actuator readiness endpoint; container memory limits.\\
+\textbf{Hints.} Point the JVM at container limits with \code{-XX:MaxRAMPercentage}; expose \code{/actuator/health} for the healthcheck.\\
+\textbf{Expected outcome.} \code{docker compose up} yields a stack where the app starts only after the DB is healthy and reports healthy itself.\\
+\textbf{Common pitfalls.} A healthcheck that curls an endpoint the app secures behind auth; setting a heap larger than the container's memory limit and getting OOM-killed.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+A curated margin from engineers who have shipped and debugged images at scale. Read these as judgment, not trivia.
+
+\begin{seniornote}
+The JVM did not understand cgroup memory limits until the container-awareness fixes that are standard on Java 11+. On a modern JDK the JVM reads the container's limit, but you should still set \code{-XX:MaxRAMPercentage} (say 75) rather than a fixed \code{-Xmx} --- then the same image sizes its heap correctly whether it runs with 512\,MB or 4\,GB, which is exactly the ``one image, many environments'' property you want.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{``What is the difference between an image and a container?''} The answer that lands: an image is an immutable, versioned stack of read-only layers --- a template; a container is a running instance of that image with a thin \emph{writable} layer on top. Many containers can run from one image; the image never changes. Say ``read-only layers'' and ``writable layer'' and you have shown you know the mechanism, not just the metaphor.
+\end{interview}
+
+\begin{perfnote}
+Pin base images by \emph{digest}, not just tag, when reproducibility matters: \code{FROM eclipse-temurin:21-jre-alpine@sha256:...} guarantees the identical bytes months later, whereas the \code{21-jre-alpine} tag is re-pointed at new patch builds over time. Tags are convenient for humans; digests are what make a build truly deterministic in CI.
+\end{perfnote}
+
+\begin{prodtip}
+Add a \code{HEALTHCHECK} that hits your Actuator readiness endpoint so the orchestrator knows when the app is genuinely ready, not merely started. But keep the readiness path unauthenticated or the healthcheck itself will report unhealthy forever --- a classic self-inflicted outage where the platform kills a perfectly healthy app because it cannot get past your own security filter.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project --- ShopFlow}
+
+By Day 7, ShopFlow is a clean-layered, tested, secured Spring Boot app that you run locally against a hand-installed database. Today you make it portable: one image, one command, service-name networking, no secrets on disk.
+
+\begin{buildalong}[Day 08 --- containerize the whole stack]
+\begin{wbitem}
+  \item Add a production-grade \emph{multi-stage} \code{Dockerfile}: JDK build stage with the dependency layer before source, JRE-alpine runtime, a non-root \code{spring} user, \code{COPY --from=build} of only the jar.
+  \item Add a \code{.dockerignore} excluding \code{.git}, \code{target/}, IDE files, \code{.env}, and logs so the build context stays lean and secret-free.
+  \item Write \code{docker-compose.yml} bringing up \code{app} + \code{db} (postgres:16-alpine) + \code{redis} (redis:7-alpine) on one network, addressed by service name (\code{db}, \code{redis} --- never \code{localhost}).
+  \item Configure everything through environment variables (\code{SPRING\_DATASOURCE\_URL}, \code{SPRING\_DATA\_REDIS\_HOST}, \code{SPRING\_PROFILES\_ACTIVE=docker}); source \code{\$\{DB\_PASSWORD\}} from a git-ignored \code{.env}.
+  \item Persist the database with a named \code{pgdata} volume, and gate the app on a Postgres \code{healthcheck} so startup is race-free.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a fresh clone runs the entire stack with a single \code{docker compose up --build}; the app reaches Postgres and Redis by service name; inserted data survives \code{docker compose down} and a fresh \code{up}; and no secret appears in the image, the Dockerfile, or a committed file. This image is the exact artifact Day 12 will build in CI and promote to production.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item A container is an isolated \emph{process} sharing the host kernel via namespaces and cgroups --- not a VM.
+  \item An image is a stack of cached, read-only layers; the cache invalidates \emph{downward}, so order Dockerfiles stable-to-volatile.
+  \item Multi-stage builds compile with a JDK and ship only a JRE plus the jar, as a non-root user.
+  \item On a Compose network, services reach each other by \emph{service name}; \code{localhost} means ``this container.''
+  \item Configure per environment with environment variables and persist state with named volumes; keep secrets out of every layer.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{depends\_on} orders startup; only a \code{healthcheck} with \code{condition: service\_healthy} waits for \emph{readiness}.
+  \item \code{docker history} exposes every \code{ENV} and layer --- a baked-in secret is a published secret.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item \code{localhost} DB host in Compose $\rightarrow$ connection refused. \quad$\bullet$\quad No \code{.dockerignore} $\rightarrow$ bloated context and leaked files.
+  \item \code{latest} tags $\rightarrow$ non-reproducible builds. \quad$\bullet$\quad Root user + baked secrets $\rightarrow$ avoidable risk.
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Image vs container}{image = immutable read-only layers (template); container = running instance + thin writable layer.}
+\cheatitem{Multi-stage}{\code{FROM jdk AS build} \dots \code{FROM jre}; \code{COPY --from=build} only the jar; toolchain never ships.}
+\cheatitem{Layer cache}{keyed per instruction + inputs; first miss rebuilds everything after it --- order stable-to-volatile.}
+\cheatitem{Compose networking}{services reach each other by service name via embedded DNS; \code{localhost} = this container.}
+\cheatitem{depends\_on}{orders start; add a \code{healthcheck} + \code{condition: service\_healthy} to wait for readiness.}
+\cheatitem{Config \& secrets}{env vars per environment (relaxed binding); never bake secrets --- inject at run time.}
+\cheatitem{Persistence}{named volume (\code{pgdata}) survives \code{compose down}; the writable layer does not.}
+\end{cheatsheet}
+
+\begin{iqbox}
+\iq{Why use a multi-stage Dockerfile instead of a single-stage build?}
+\iq{How do containers on the same Compose network talk to each other?}
+\iq{What is the difference between a Docker image and a container?}
+\iq{How would you persist database data across container restarts?}
+\iq{Why avoid the \code{latest} tag in production?}
+\iq{Why run the container as a non-root user, and how do you set that up?}
+\end{iqbox}
+
+\wbsub{Suggested further reading}
+\begin{wbitem}
+  \item \emph{Docker docs} --- ``Multi-stage builds'' and ``Networking in Compose.''
+  \item \emph{Spring Boot Reference} --- ``Container Images'' (buildpacks, layered jars) and ``Externalized Configuration.''
+  \item \emph{Google} --- ``Best practices for building containers'' (non-root, minimal base, reproducibility).
+\end{wbitem}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 09).} Your app now runs beside a real Redis container. Tomorrow you put it to work: caching. You will learn where a cache belongs in the request path, how \code{@Cacheable} is delivered by the very proxies you met on Day 1, and how to avoid the stampedes and stale-data traps that make caching subtle in production.
+\end{keyidea}
