@@ -1,0 +1,736 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 08 ============================
+\daychapter{08}{Configuration Management}{Configuration Management with Ansible}{Idempotency, playbooks, inventory, roles and Vault}{7 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item State precisely where Terraform's job ends and Ansible's begins --- and why owning both with one tool creates two sources of truth.
+  \item Explain idempotency as a \emph{module-level} property, and say why a \code{shell} task is not idempotent even when re-running it is harmless.
+  \item Describe what actually happens on the wire when a task runs: SSH multiplexing, the packaged module, the JSON result.
+  \item Structure configuration as roles with environment-separated inventory, and make restarts fire only on real change.
+  \item Keep credentials in a Git-tracked repository safely with Ansible Vault --- and know what Vault does \emph{not} give you.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} Yesterday Terraform created a bastion host, a VPC and a security group. Terraform is now finished: the instance exists, it has an IP, it is tagged. But the machine is a bare Ubuntu image. It has no service user, no hardened SSH configuration, no packages, no \code{systemd} unit, no log rotation. Something must put those things \emph{inside} the host --- and must do so identically on the next host, and the next fifty, and again in six months when the AMI changes. That is configuration management, and Ansible is today's default answer.
+
+\glabel{Why DevOps engineers need it.} The failure mode this prevents has a name: \keyterm{configuration drift}. Two hosts provisioned from the same image diverge because someone SSH'd into one at 2am to "just quickly" install a debugging tool, edit \code{/etc/nginx/nginx.conf}, or bump a kernel parameter. Six months later one host serves traffic fine and its twin returns 502s, and nobody can say what differs. Drift is invisible, it compounds, and it is the reason the phrase "works on that box" exists. Configuration management makes the desired state of a host a reviewed file in Git rather than an accumulation of undocumented human actions.
+
+\begin{keyidea}
+Day 1 ended with \code{bootstrap.sh} --- a shell script you had to write carefully so that running it twice was safe. Ansible inverts that burden. Instead of \emph{you} writing "check if the user exists, and if not create it," you \emph{declare} \code{state: present} and a purpose-built module does the checking. Idempotency stops being your discipline and becomes the tool's contract. That single shift is what this chapter is about.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Ansible occupies a narrow, precise band of the stack: above the cloud API (Terraform's territory) and below the container runtime (Docker's territory). It configures the operating system of machines that are not disposable.
+
+\begin{wbfigure}{Fig 8.0 — The provisioning/configuration boundary. Terraform owns whether the host exists; Ansible owns what is inside it. Containerised workloads bypass this band entirely.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[lyr, wbboxk8s] (app) {\textbf{Application workloads} \hfill \scriptsize Day 4--6};
+  \node[lyr, wbboxops, below=of app] (os) {\textbf{OS state: users · pkgs · units · sshd} \hfill \scriptsize \textbf{Ansible --- this chapter}};
+  \node[lyr, wbboxcloud, below=of os] (infra) {\textbf{Instances · VPC · security groups} \hfill \scriptsize Terraform, Day 7};
+  \node[lyr, wbboxghost, below=of infra] (api) {\textbf{Cloud provider API} \hfill \scriptsize AWS, Day 3 \& 10};
+  \foreach \a/\b in {app/os,os/infra,infra/api}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=4mm of os, text width=25mm, anchor=west] {mutable state\\ inside a host};
+  \node[wbcap, right=4mm of infra, text width=25mm, anchor=west] {resource lifecycle\\ + state file};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 gave you the material Ansible manipulates --- users, permission bits, \code{systemd} units, the journal. Day 2 gave you the review workflow that makes a playbook change auditable. Day 7 gave you Terraform and the idea of declaring desired state; Ansible is the same idea applied one layer up, with a crucial difference in how state is tracked. Day 12 will generalise the secrets problem that Vault only partially solves here.
+
+\glabel{Where companies use it in production.} NASA's public case study describes migrating roughly 65 applications out of a hardware data centre into AWS with no centralised management and a highly heterogeneous estate. They standardised on Ansible plus Ansible Tower (the control-plane product, whose open-source upstream is AWX) specifically because it needed no agent installed on the managed machines and because non-specialists could read a play and understand it. The published outcomes are operational, not glamorous: baselining a standard AMI moved from an hour of manual configuration to a background process, and provisioning OS accounts across the whole estate to under ten minutes. The architectural lesson is that the win came from \emph{centralising} execution behind an inventory and an audit trail, not from any single clever playbook.
+
+\glabel{Common misconceptions.} That Ansible and Terraform overlap and you should pick one (they answer different questions); that "idempotent" means "safe to run twice" (it means the tool can \emph{tell} whether anything changed); that Ansible tracks state like Terraform does (it does not --- it re-derives current state from the host on every run); and that Vault is a secrets manager (it is file encryption, and it has no rotation, no audit log and no dynamic credentials).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 8.1 — The Day 8 territory. Inventory says \emph{where}, plays say \emph{what}, modules decide \emph{whether to act}, handlers react to real change.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (ctrl) {Control node\\ansible-playbook};
+  \node[wbbox, right=10mm of ctrl] (inv) {Inventory\\groups · vars};
+  \node[wbbox, above=8mm of inv] (play) {Playbook\\plays · tasks};
+  \node[wbboxsec, below=8mm of inv] (vault) {Vault\\AES256 vars};
+  \draw[wbarrow] (ctrl)--(inv); \draw[wbarrow] (ctrl)--(play); \draw[wbarrow] (ctrl)--(vault);
+  \node[wbboxops, right=9mm of play] (role) {Roles\\tasks · defaults};
+  \node[wbboxgood, right=9mm of inv] (mod) {Modules\\declare state};
+  \node[wbbox, right=9mm of vault] (facts) {Facts\\setup module};
+  \draw[wbarrow] (play)--(role); \draw[wbarrow] (inv)--(mod); \draw[wbarrow] (vault)--(facts);
+  \node[wbboxgood, right=9mm of mod] (idem) {Idempotency\\ok vs changed};
+  \node[wbboxops, above=8mm of idem] (hand) {Handlers\\notify · flush};
+  \draw[wbarrow] (mod)--(idem); \draw[wbarrow] (idem)--(hand); \draw[wbarrow] (role)--(hand);
+  \draw[wbarrow] (facts)--(idem);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{control node} $\rightarrow$ \keyterm{inventory} $\rightarrow$ \keyterm{play} $\rightarrow$ \keyterm{task} $\rightarrow$ \keyterm{module} $\rightarrow$ \keyterm{idempotency} $\rightarrow$ \keyterm{handler} $\rightarrow$ \keyterm{role} $\rightarrow$ \keyterm{Vault}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Provisioning versus Configuration --- Two Different Questions}
+
+\glabel{What is it?} Terraform answers \emph{"does this resource exist, with these properties, in this account?"} Ansible answers \emph{"given that the machine exists and I can reach it over SSH, what is installed on it and what is running?"} The boundary is the machine's network interface: outside it is cloud API territory, inside it is operating-system territory.
+
+\glabel{Why does it exist?} Because the two problems have genuinely different shapes. Cloud resources have a \emph{lifecycle}: they are created, updated, and destroyed, and something must remember that the \code{aws\_instance} named \code{bastion} in your code corresponds to instance \code{i-0abc123} in the account. That memory is Terraform state. Operating-system configuration has no lifecycle to remember: a package is either installed or it is not, and you can find out by asking the host. Ansible therefore keeps \emph{no state file at all}. It re-derives the current state on every run, which is why an Ansible run can be aborted, resumed, or run from a different laptop with no reconciliation ceremony --- and also why Ansible can never tell you "this thing exists and is no longer in your code, shall I delete it?" Terraform can; Ansible structurally cannot.
+
+\begin{tradeoff}
+No state file is both Ansible's greatest simplification and its hardest limit. You gain: no state locking (Day 7's \code{DynamoDB} table), no drift between state and reality, no \code{terraform import} ritual. You lose: no ability to detect removal. Delete a task that installed a package and the package stays installed on every host forever. Deletion in Ansible must be \emph{explicitly declared} (\code{state: absent}) and kept in the repo, sometimes for years. Teams call these "tombstone tasks", and forgetting them is the most common way an Ansible codebase quietly stops describing reality.
+\end{tradeoff}
+
+\glabel{How does it work internally?} Ansible is \keyterm{agentless} and \keyterm{push}-based. The control node --- your laptop, or more usually a CI runner --- opens an SSH connection to each target, ships code over it, and executes it. Nothing is installed on the target beyond a Python interpreter, which every server distribution already has.
+
+Contrast that with the previous generation. CFEngine (1993), Puppet (2005) and Chef (2009) are \keyterm{agent}-based and \keyterm{pull}-based: a daemon on every managed node wakes on a timer, fetches its catalogue from a central server, and converges itself. GitLab runs exactly this model on GitLab.com and documents it publicly: \code{chef-client} runs on every VM every 30 minutes, cookbook versions are pinned per Chef environment (\code{gstg} for staging, \code{gprd} for production) mirroring the same infrastructure split their Terraform uses, and a cookbook change is promoted by merging a version bump into the non-production environment first, verifying convergence, then merging the production bump. Rollback is reverting the version number.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{26mm} X X@{}}
+\wbtablehead{Property} & \wbtablehead{Push / agentless (Ansible)} & \wbtablehead{Pull / agent (Chef, Puppet)}\\
+Who initiates & An operator or CI job, deliberately & The node itself, on a timer\\
+Install footprint & SSH plus Python on the target & A daemon, its runtime, and certs\\
+Drift correction & Only when someone runs it & Continuously, every interval\\
+New host joins & Must appear in inventory first & Bootstraps itself on first check-in\\
+Blast radius & Bounded by the hosts you targeted & A bad catalogue reaches everything\\
+Best fit & Orchestrated, ordered change & Large steady-state fleets\\
+\end{tabularx}
+\end{center}
+
+\begin{seniornote}
+The push/pull distinction matters most for \emph{ordered} change. Rolling a database schema, draining a load balancer, upgrading node by node --- these need a coordinator that knows the sequence. A pull agent waking up independently on each host cannot orchestrate anything; it can only converge its own machine. This is why many organisations run both: an agent for continuous baseline compliance, and Ansible for the deliberate, sequenced operations. Choosing "one tool for everything" is usually a decision to do one of those two jobs badly.
+\end{seniornote}
+
+\glabel{When should I use it?} Any host you cannot rebuild from scratch on demand: bastions, build agents, database VMs, network appliances, legacy application servers, on-premises hardware. Also for orchestrated operational procedures --- rolling restarts, certificate rotation, emergency patching --- where the ordering is the point.
+
+\glabel{When should I \emph{not}?} For anything running in a container. A container image is already the declarative artefact; configuring a running container with Ansible reintroduces the mutable state that images exist to eliminate. Also do not use Ansible to \emph{create} cloud resources. Ansible has \code{amazon.aws} modules that can launch an EC2 instance, and they work, but now two tools claim ownership of that instance and neither can be trusted. Let Terraform own resource lifecycle. Let Ansible own the inside.
+
+\begin{misconception}
+"Ansible replaces Terraform because it can also create EC2 instances." It can, and the result is an instance with no recorded lifecycle: nothing knows to destroy it when the code changes, nothing detects that someone resized it by hand, nothing can plan a change before applying it. The capability exists mainly for environments where Terraform is not available. Duplicating the source of truth is a more expensive mistake than learning the second tool.
+\end{misconception}
+
+\wbsub{3.2\quad Inventory --- Telling Ansible What Exists and Where}
+
+\glabel{What is it?} The inventory is the list of managed hosts, organised into groups, with variables attached at host and group level. Everything Ansible does is scoped by it: \code{hosts: web} in a play means "every host in the \code{web} group of the inventory I was given."
+
+\glabel{Why does it exist?} Because the alternative --- passing hostnames on the command line --- makes environment separation a matter of human care. With inventories as files, "run this against production" and "run this against staging" are two different paths, and the wrong one is a visible mistake in a command, not an invisible typo in an IP address.
+
+\begin{propsbox}[inventories/prod/hosts.ini]
+[bastion]
+bastion-prod-1.cloudbase.internal
+
+[app]
+app-prod-1.cloudbase.internal
+app-prod-2.cloudbase.internal
+
+[db]
+db-prod-1.cloudbase.internal ansible_user=dbadmin
+
+[prod:children]
+bastion
+app
+db
+
+[prod:vars]
+ansible_python_interpreter=/usr/bin/python3
+\end{propsbox}
+
+\glabel{How does it work internally?} Group membership is a graph, not a list: \code{[prod:children]} makes \code{prod} a parent of three groups, and every host inherits variables from every group it belongs to, transitively. Where two groups set the same variable, Ansible resolves the conflict by group depth (a child overrides its parent), then by alphabetical name at equal depth, and a host variable overrides them all. The full precedence chain has more than twenty levels; the two that matter daily are that a role's \code{defaults/main.yml} sits near the \emph{bottom} (designed to be overridden by anyone), while \code{vars/main.yml} in the same role sits near the \emph{top} (designed to be hard to override). Variables belong in \code{group\_vars/} and \code{host\_vars/} directories beside the inventory, never inline in the host line except for genuinely per-host connection details.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{50mm} X@{}}
+\wbtablehead{Path (under \code{inventories/})} & \wbtablehead{Applies to}\\
+prod/hosts.ini & Which hosts exist in production\\
+prod/group\_vars/all.yml & Every production host\\
+prod/group\_vars/app.yml & Only the \code{app} group in production\\
+prod/group\_vars/app/vault.yml & Encrypted secrets for that group\\
+staging/\ldots & The same shape, different values\\
+(\code{roles/base/defaults/main.yml}) & Lowest precedence --- the role's opinion\\
+\end{tabularx}
+\end{center}
+
+\glabel{Dynamic inventory.} A static file is a lie the moment an autoscaling group replaces an instance. A \keyterm{dynamic inventory plugin} queries the cloud provider at run time and builds the host list from tags. With the \code{amazon.aws.aws\_ec2} plugin, an instance tagged \code{Environment=prod} and \code{Role=app} lands automatically in groups derived from those tags. The inventory then has exactly one source of truth: the tags Terraform already set when it created the instance.
+
+\begin{yamlbox}[inventories/prod/aws\_ec2.yml]
+plugin: amazon.aws.aws_ec2
+regions:
+  - eu-west-1
+filters:
+  tag:Environment: prod
+  instance-state-name: running
+keyed_groups:
+  - key: tags.Role          # tag Role=app  -> group "role_app"
+    prefix: role
+  - key: placement.availability_zone
+    prefix: az
+hostnames:
+  - private-ip-address     # never public IP; reach via the bastion
+compose:
+  ansible_host: private_ip_address
+\end{yamlbox}
+
+\begin{infranote}
+Notice the handoff this creates. Terraform sets the tags as part of resource creation; Ansible reads them as its inventory. Neither tool calls the other, there is no shared state file, and yet the two stay consistent because both derive from the same authoritative record --- the cloud provider's own metadata. Designing integrations so that both sides read from a third source, rather than one pushing to the other, is a general pattern worth stealing.
+\end{infranote}
+
+\begin{secwarn}[production is not a flag]
+Keep production in a separate inventory \emph{directory}, and never make it the default. \code{ansible-playbook site.yml} with no \code{-i} should either fail or target a harmless environment. Every incident report that begins "I meant to run it against staging" ends with a recommendation that could have been written in advance: make the dangerous target require an explicit argument, and make the safe one the default.
+\end{secwarn}
+
+\wbsub{3.3\quad The Execution Model --- What Actually Happens on the Wire}
+
+\glabel{What is it?} When you run a play, Ansible does not "send commands" to the host. For each task it \emph{builds a self-contained Python program}, ships it over SSH, runs it once, reads a single JSON document back, and discards it.
+
+\glabel{Why does it exist?} Because the alternative --- streaming shell commands and parsing their human-readable output --- is exactly what makes bespoke scripts fragile. Parsing \code{apt-get} output to decide whether something changed is guesswork; a program that inspects the package database and returns \code{\{"changed": false\}} is a fact.
+
+\glabel{How does it work internally?} The packaging step is called \keyterm{AnsiballZ}. Ansible takes the module's Python source, the module utilities it imports, and the task's parameters, and zips them into one executable Python file. For each host and task, the sequence is roughly:
+
+\begin{wbfigure}{Fig 8.2 — One task, one host. Everything above the dashed line is the module's own decision; Ansible only reads the JSON it returns.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=68mm, minimum height=7mm, align=left, text width=62mm}]
+  \node[stg, wbboxaccent] (a) {\textbf{1 · Build AnsiballZ payload} \hfill \scriptsize module + args, zipped};
+  \node[stg, below=of a] (b) {\textbf{2 · Open (or reuse) SSH connection} \hfill \scriptsize ControlPersist};
+  \node[stg, below=of b] (c) {\textbf{3 · Write payload to a temp dir on target} \hfill \scriptsize skipped if pipelining};
+  \node[stg, wbboxops, below=of c] (d) {\textbf{4 · Run it under the remote Python} \hfill \scriptsize as the become user};
+  \node[stg, wbboxgood, below=of d] (e) {\textbf{5 · Module inspects, decides, acts} \hfill \scriptsize the idempotency step};
+  \node[stg, wbboxgood, below=of e] (f) {\textbf{6 · Print one JSON object to stdout} \hfill \scriptsize changed · failed · diff};
+  \node[stg, wbboxghost, below=of f] (g) {\textbf{7 · Remove temp dir, keep socket warm} \hfill \scriptsize next task reuses it};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f,f/g}{\draw[wbarrow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+Three configuration knobs follow directly from that picture, and knowing the mechanism tells you what each one does.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{28mm} L{18mm} X@{}}
+\wbtablehead{Setting} & \wbtablehead{Default} & \wbtablehead{What the mechanism explains}\\
+\code{forks} & 5 & How many hosts run a task in parallel. Five is a laptop-safe default, not a fleet-safe one.\\
+\code{pipelining} & off & Removes step 3: the payload is piped straight into the remote Python. Requires \code{requiretty} to be off in \code{sudoers}.\\
+ControlPersist & 60s & Keeps the SSH master socket open so later tasks skip the handshake entirely.\\
+\code{strategy} & linear & Every host finishes task \emph{n} before any starts \emph{n+1}. \code{free} lets hosts race ahead independently.\\
+\code{gather\_facts} & true & An implicit \code{setup} task on every host before task one. Turn it off when no fact is used.\\
+\end{tabularx}
+\end{center}
+
+\begin{perfnote}
+A slow playbook is almost never slow because the modules are slow. It is slow because \code{forks: 5} serialises a hundred hosts into twenty batches, because pipelining is off and every task pays two extra round trips, or because fact gathering runs on every host for a play that reads no facts. Measure before tuning: run with \code{ANSIBLE\_CALLBACKS\_ENABLED=profile\_tasks} and let the per-task timings tell you where the time went. Raising \code{forks} to 50 on a control node that then exhausts its file descriptors is a common self-inflicted wound.
+\end{perfnote}
+
+\begin{behind}
+The \code{setup} module is why a play appears to "pause" before its first task. It is a real module run on every host that collects hundreds of facts --- distribution, kernel, network interfaces, mounts, CPU count --- and returns them as \code{ansible\_facts}. Those facts are what make one role work on both Debian and RHEL: the role branches on \code{ansible\_facts['os\_family']} rather than assuming. Disabling fact gathering to speed things up will silently break any such branch.
+\end{behind}
+
+\wbsub{3.4\quad Idempotency --- A Property of Modules, Not of Playbooks}
+
+\glabel{What is it?} An operation is \keyterm{idempotent} when applying it to a system already in the desired state produces no further change --- and, critically for Ansible, when the operation can \emph{report} whether it changed anything. The second half is what most definitions omit and what makes the concept useful.
+
+\glabel{Why does it exist?} Automation must run against an unknown starting state. Someone rebuilt one host last week, someone patched another by hand, a third is brand new from an autoscaling event. A procedure that assumes a clean slate breaks on two of the three. A procedure that declares the end state works on all three.
+
+\glabel{How does it work internally?} Idempotency is implemented \emph{inside each module}, not by the playbook engine. A well-written module follows the same four steps regardless of what it manages:
+
+\begin{wbfigure}{Fig 8.3 — Inside any state-aware module. The engine contributes nothing here; \code{ok} versus \code{changed} is the module's own verdict.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm and 8mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=60mm, minimum height=7mm, align=left, text width=54mm}]
+  \node[stg] (a) {\textbf{1 · Read current state on the host}};
+  \node[stg, below=of a] (b) {\textbf{2 · Compare with declared desired state}};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · Act only on the difference}};
+  \node[stg, wbboxgood, below=of c] (d) {\textbf{4 · Return changed: true / false}};
+  \foreach \x/\y in {a/b,b/c,c/d}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbboxghost, right=8mm of c, text width=26mm, align=left] (sh) {\code{shell} / \code{command}\\ jump straight to 3\\ and always claim\\ changed: true};
+  \draw[wbarrowg] (sh.west)--(c.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+This is why \code{shell: apt-get install -y nginx} is a bug even though running it twice is harmless. The module has no idea whether nginx was already installed; it cannot skip work, cannot report accurately, and --- most damagingly --- will fire every handler that depends on it, restarting a healthy service on every single run. Your "no-op" playbook becomes a fleet-wide restart.
+
+\begin{ansiblebox}[roles/base/tasks/main.yml — the same intent, three ways]
+# WRONG: not idempotent. Always "changed", always notifies.
+- name: Install nginx
+  ansible.builtin.shell: apt-get install -y nginx
+
+# RIGHT: the module reads dpkg state and decides.
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# ACCEPTABLE: no module exists, so guard the shell task yourself.
+- name: Compile the custom auth plugin
+  ansible.builtin.command: /opt/cloudbase/build-plugin.sh
+  args:
+    creates: /opt/cloudbase/lib/auth.so   # skip entirely if it exists
+  register: plugin_build
+  changed_when: plugin_build.rc == 0
+\end{ansiblebox}
+
+\glabel{The three guards.} When no purpose-built module exists, you supply the missing logic explicitly. \code{creates:} and \code{removes:} make the task skip if a path already does (or does not) exist --- this is the cheapest guard and should be the first reach. \code{changed\_when:} overrides the module's verdict with an expression over the registered result, letting you say "this only counts as a change if the output contained the word \code{applied}". \code{failed\_when:} does the same for failure, which matters for commands that use non-zero exit codes to mean something other than failure.
+
+\begin{autotip}
+\code{--check} runs the playbook in \keyterm{check mode}: modules report what they \emph{would} change without changing it, and combined with \code{--diff} you get a line-level preview of every file that would be modified. This is Ansible's equivalent of \code{terraform plan}, with an important caveat --- \code{command} and \code{shell} tasks cannot be previewed, so they are skipped by default. A playbook full of shell tasks has a useless check mode, which is another reason to prefer modules. Run \code{--check --diff} against production on a schedule and treat any reported change as drift that needs explaining.
+\end{autotip}
+
+\begin{misconception}
+"My playbook is idempotent because running it twice does not break anything." Not the same claim. Idempotency in Ansible means the second run reports \code{changed=0}. If it reports \code{changed=8} every time, you have lost the ability to distinguish "nothing drifted" from "eight things drifted" --- which is precisely the signal configuration management exists to give you. A green run that always says \code{changed} is a broken smoke detector.
+\end{misconception}
+
+\wbsub{3.5\quad Roles and Handlers --- Structure and Reaction}
+
+\glabel{What is it?} A \keyterm{role} is a directory with a fixed layout bundling everything needed to configure one concern. A \keyterm{handler} is a task that runs only if some other task actually reported a change, and only once, at the end of the play.
+
+\glabel{Why does it exist?} A single \code{site.yml} that configures everything becomes unreadable at roughly two hundred lines and unreviewable shortly after. More importantly it cannot be reused: the nginx configuration for the bastion and for the app tier are ninety percent identical, and copy-paste guarantees they diverge. Roles are to Ansible what modules are to Terraform --- the unit of reuse and the unit of review.
+
+\glabel{How does it work internally?} Role directories are discovered by convention. When a play includes a role, Ansible looks for seven standard subdirectories and loads \code{main.yml} from each if present. Nothing is registered or imported; the layout \emph{is} the interface.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{24mm} X@{}}
+\wbtablehead{Directory} & \wbtablehead{Role in the design}\\
+tasks/ & The work. Entry point is \code{tasks/main.yml}.\\
+handlers/ & Reactions, referenced by name from \code{notify}.\\
+templates/ & Jinja2 files rendered with host variables (\code{.j2}).\\
+files/ & Static files copied verbatim.\\
+defaults/ & Lowest-precedence variables --- the role's overridable opinion.\\
+vars/ & High-precedence variables --- internal constants, rarely overridden.\\
+meta/ & Dependencies on other roles, and Galaxy metadata.\\
+\end{tabularx}
+\end{center}
+
+\begin{seniornote}
+The \code{defaults} versus \code{vars} distinction is a public-API decision, not a filing preference. Anything in \code{defaults/} is you saying "callers may override this" --- it is your role's parameter list. Anything in \code{vars/} is you saying "this is internal; overriding it will break assumptions." A role whose every variable lives in \code{vars/} cannot be reused; a role with no \code{defaults/} has no documented interface. Write \code{defaults/main.yml} first, with a comment per variable, and treat it as the role's README.
+\end{seniornote}
+
+\glabel{Handler semantics.} A handler is notified by name. Ansible collects notifications during the play, deduplicates them, and runs each notified handler exactly once, in the order the handlers are \emph{defined} --- not the order they were notified. They run at the end of the play, after every task. This ordering is deliberate: if three tasks each modify part of the nginx configuration, you want one restart at the end, not three restarts mid-configuration leaving the service running on a half-written config.
+
+\begin{ansiblebox}[roles/base/handlers/main.yml and the tasks that notify them]
+# --- tasks/main.yml (excerpt) ---
+- name: Deploy hardened sshd configuration
+  ansible.builtin.template:
+    src: sshd_config.j2
+    dest: /etc/ssh/sshd_config
+    owner: root
+    group: root
+    mode: "0600"
+    validate: /usr/sbin/sshd -t -f %s   # refuse to install a broken config
+  notify: Restart sshd
+
+- name: Install the CloudBase systemd unit
+  ansible.builtin.template:
+    src: cloudbase-api.service.j2
+    dest: /etc/systemd/system/cloudbase-api.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart cloudbase-api
+
+# --- handlers/main.yml ---
+- name: Reload systemd            # defined first -> runs first
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Restart cloudbase-api
+  ansible.builtin.systemd_service:
+    name: cloudbase-api
+    state: restarted
+
+- name: Restart sshd
+  ansible.builtin.service:
+    name: sshd
+    state: restarted
+\end{ansiblebox}
+
+\begin{reliability}
+The \code{validate:} parameter on \code{template} and \code{copy} is the single most underused safety feature in Ansible. It runs a validation command against the rendered file in a temporary location and installs it only if the command exits zero. Without it, a typo in \code{sshd\_config.j2} deploys a file that stops \code{sshd} from starting --- and the handler that restarts \code{sshd} then locks you out of every host in the play simultaneously. With \code{validate}, the task fails loudly and the old, working config stays in place. Use it for sshd, nginx (\code{nginx -t}), sudoers (\code{visudo -cf \%s}) and every config format that ships a checker.
+\end{reliability}
+
+\begin{misconception}
+"My handler did not run, so the task must have failed." More often the play failed \emph{before} reaching the end, and handlers are discarded when a play aborts on a host. If a mid-play restart is genuinely required --- for example the service must be running before a later task talks to it --- force it with a \code{meta: flush\_handlers} task at that point. Relying on end-of-play handlers for something a later task depends on is an ordering bug waiting for a slow day to surface.
+\end{misconception}
+
+\glabel{When should I \emph{not} use a role?} A five-line playbook that runs once during an incident does not need a role. Extraction is justified by the \emph{second} caller, not the first. Building a role library before you have two consumers produces abstractions shaped by imagination rather than by use, and those are harder to fix than duplication.
+
+\wbsub{3.6\quad Ansible Vault --- Secrets That Can Live in Git}
+
+\glabel{What is it?} \code{ansible-vault} encrypts a file, or a single variable inside a plaintext file, with a passphrase. The encrypted form is ASCII-armoured text that diffs and merges tolerably in Git, and Ansible decrypts it in memory at run time.
+
+\glabel{Why does it exist?} Playbooks need real credentials --- a database password, an API token, a TLS private key --- and those cannot sit in plaintext in a repository that every engineer clones. Before Vault, teams either kept a secrets file outside version control (so it drifted, and onboarding meant "ask someone to send you the file") or committed plaintext and hoped. Day 2 covered what happens after a secret is pushed; Vault is how you avoid needing that chapter.
+
+\glabel{How does it work internally?} A vaulted payload is AES-256 encrypted with a key derived from your passphrase, wrapped in a header line that records the format version, the cipher, and optionally a \keyterm{vault ID} label:
+
+\begin{outbox}[head -2 inventories/prod/group\_vars/app/vault.yml]
+$ANSIBLE_VAULT;1.2;AES256;prod
+39373530666432616465383966393261333866626434366533373062303538616...
+\end{outbox}
+
+The vault ID (\code{prod} above) is a label, not a secret. It lets one run carry several passphrases --- staging encrypted with one, production with another --- so a developer holding only the staging passphrase can decrypt staging files and simply cannot read production ones. That is the mechanism you use to give the whole team the ability to run staging without giving anyone production credentials.
+
+\begin{bashbox}[working with vault]
+# encrypt a whole file (preferred: rekeyable, greppable filename)
+ansible-vault encrypt --vault-id prod@prompt \
+  inventories/prod/group_vars/app/vault.yml
+
+# encrypt one value to paste into an otherwise plaintext vars file
+ansible-vault encrypt_string --vault-id prod@prompt 's3cr3t' \
+  --name 'cloudbase_db_password'
+
+# edit in place: decrypts to a temp file, re-encrypts on save
+ansible-vault edit inventories/prod/group_vars/app/vault.yml
+
+# rotate the passphrase across a file
+ansible-vault rekey inventories/prod/group_vars/app/vault.yml
+
+# run: in CI, read the passphrase from a file the runner injects
+ansible-playbook -i inventories/prod site.yml \
+  --vault-id prod@/run/secrets/vault-pass
+\end{bashbox}
+
+\begin{prodtip}
+Adopt the two-file convention: \code{group\_vars/app/vars.yml} holds plaintext variable names that reference vaulted values (\code{cloudbase\_db\_password: "\{\{ vault\_cloudbase\_db\_password \}\}"}), and \code{group\_vars/app/vault.yml} holds the encrypted \code{vault\_}-prefixed originals. You get a readable, greppable, reviewable list of which secrets exist and where they are used, without decrypting anything. Encrypting the whole variables file instead makes every review of a non-secret change opaque.
+\end{prodtip}
+
+\begin{secwarn}[what Vault does not do]
+Vault is file encryption, not secret management. There is no rotation workflow, no per-user access log, no expiry, no dynamic credentials, and no revocation --- if someone leaves with the passphrase, every secret it ever protected is compromised and must be rotated by hand. It also cannot stop a leak at run time: a vaulted value passed to a task is printed in the output unless the task carries \code{no\_log: true}, and it appears in plaintext in \code{-vvv} debug output regardless. Use Vault for the bootstrap secret and low-churn credentials; for anything that must rotate, reach for AWS Secrets Manager or HashiCorp Vault, which Day 12 covers.
+\end{secwarn}
+
+\begin{costnote}
+There is an unglamorous economic argument for configuration management that rarely gets made. Snowflake hosts cannot be rebuilt, so they cannot be right-sized, moved to cheaper instance families, or replaced by spot capacity --- nobody dares, because nobody knows what is on them. A fleet that is fully described by roles can be destroyed and recreated on demand, which is the precondition for every meaningful cloud cost lever. Ansible's payoff is often measured in the migrations it makes possible rather than in hours saved.
+\end{costnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Prefer a purpose-built module over \code{shell}/\code{command}; when you must use one, guard it with \code{creates:} or \code{changed\_when:}.
+  \item Use fully qualified module names (\code{ansible.builtin.apt}) --- short names resolve differently depending on installed collections.
+  \item Put restarts in handlers so they fire on real change, and add \code{validate:} to every config template that has a checker.
+  \item Separate inventories per environment, with \code{group\_vars/} beside each; never let production be the default target.
+  \item Keep the role's public interface in \code{defaults/main.yml}, one commented variable per line.
+  \item Run \code{--check --diff} on a schedule against production; treat any reported change as drift to explain.
+  \item Lint before merge with \code{ansible-lint}, and add \code{no\_log: true} to any task handling a secret.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Writing tasks that report \code{changed} on every run, destroying drift detection and triggering pointless restarts.
+  \item Hardcoding IP addresses in a static inventory that an autoscaling group invalidates within the hour.
+  \item Committing plaintext secrets because Vault "felt like overhead" for one password.
+  \item Using Ansible to create infrastructure Terraform should own, leaving two tools claiming the same resource.
+  \item Assuming a handler ran, when the play aborted before reaching the end.
+  \item Putting everything in \code{vars/} so the role can never be reused with different values.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. Being able to reproduce the mechanism is what turns "I use Ansible" into "I can debug Ansible."
+
+\begin{writespace}[Redraw: the seven steps of one task on one host --- payload, SSH, temp dir, execute, decide, JSON, cleanup]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the four steps inside a state-aware module, and mark exactly where \code{shell} enters the diagram]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Replace \code{bootstrap.sh} With a Role}
+
+\textbf{Goal.} Take the Day 1 shell script and re-express it as an Ansible role that configures the Terraform-provisioned bastion: service user, packages, hardened SSH, the \code{systemd} unit, and a vaulted secret. The finish line is not "it ran" --- it is "the second run reports \code{changed=0}."
+
+\resetlab
+\labstep{Reach the host at all, before writing any task}
+Set up the control node, an SSH key, and a \code{prod} inventory containing exactly one host. Verify with the \code{ping} module --- which is not ICMP; it connects, runs Python, and returns \code{pong}.
+\labwhy{Connectivity, privilege escalation and the Python interpreter are three separate failure modes. Proving all three work before writing logic means every later failure is about your code, not your plumbing.}
+
+\labstep{Scaffold the role and write \code{defaults/main.yml} first}
+Create \code{roles/base/} with the seven standard directories. Before any task, list every value the role should accept --- service user name, app directory, SSH port, allowed SSH groups --- with a comment each.
+\labwhy{Writing the interface first forces you to decide what varies per environment. Discovering that later means retrofitting variables through tasks you have already written and tested.}
+
+\labstep{Convert the script's package and user steps to modules}
+Replace \code{useradd} and \code{apt-get install} with \code{ansible.builtin.user} and \code{ansible.builtin.apt}. Run the play, then run it again immediately.
+\labwhy{The second run is the whole lesson. The script needed hand-written guards to survive it; the modules needed none, because state checking lives inside them.}
+
+\labstep{Template the \code{systemd} unit instead of copying it}
+Use \code{ansible.builtin.template} with a \code{.j2} file that interpolates the service user and app directory from your defaults. Notify a \code{Reload systemd} handler and a restart handler.
+\labwhy{A template turns "the unit file" into "the unit file for this environment". This is where the Day 1 unit stops being a static artefact and becomes a function of the inventory.}
+
+\labstep{Harden \code{sshd} --- with \code{validate:} in place before you touch it}
+Deploy an \code{sshd\_config} template disabling password authentication and root login, with \code{validate: /usr/sbin/sshd -t -f \%s}.
+\labwhy{This is the task most likely to lock you out of every host at once. Adding the validator before the change, not after the first incident, is the habit worth building.}
+
+\labstep{Introduce a deliberate non-idempotent task, then fix it}
+Add a \code{shell} task that appends a line to a file. Run twice, observe the duplicate line and the permanent \code{changed}. Then replace it with \code{lineinfile}, or guard it with \code{creates:}.
+\labwhy{You will recognise this failure instantly in someone else's codebase afterwards --- and you will understand why the handler was firing on every run.}
+
+\labstep{Move one credential into Vault}
+Encrypt a \code{vault.yml} with a \code{prod} vault ID, reference it from a plaintext \code{vars.yml}, and mark the consuming task \code{no\_log: true}. Confirm the value is unreadable in the repository and absent from normal output.
+\labwhy{Secrets handling that is added at the end is always retrofitted badly. Doing it while the role is small teaches the two-file convention when it costs nothing.}
+
+\labstep{Prove idempotency and preview drift}
+Run the play until the summary reads \code{changed=0}. Then hand-edit a managed file on the host and run with \code{--check --diff}.
+\labwhy{You have just built a drift detector. The same command in a scheduled CI job turns "someone changed something" from a mystery into an alert.}
+
+\begin{prodtip}
+Put the idempotency proof in CI. A pipeline stage that runs the play twice against a throwaway VM and fails if the second run reports any change catches non-idempotent tasks at review time, when they cost minutes, instead of in production, when they cost a fleet-wide restart. Molecule is the standard tool for this, but a two-run shell check plus a grep for \code{changed=0} gets you most of the value on day one.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Terraform keeps a state file and can therefore tell you that a resource exists which is no longer in your code. Ansible keeps none and cannot. Design a practical way for a team to detect "this package is installed on our fleet but no role installs it" --- and then argue whether the mechanism you invented is worth its maintenance cost.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Ansible is push-based and runs when a human or CI job decides; Chef is pull-based and converges every thirty minutes. Consider a security patch that must reach every host within an hour, and a database configuration change that must be applied one node at a time. Which model handles each better, and what does that suggest about organisations that run both?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Check mode cannot preview \code{shell} tasks, so a playbook built from shell tasks has a useless dry run. Notice that this is the same structural problem as a test suite full of mocks: the safety mechanism silently degrades in proportion to how much you bypass the abstraction. Where else in your stack does a safety net quietly weaken exactly when it is needed most?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The playbook that restarts the whole fleet on every run}
+\textbf{Symptom.} A nightly compliance run of \code{site.yml} is meant to be a no-op, but every night the API tier drops requests for a few seconds. The playbook always finishes green.
+
+\begin{outbox}[ansible-playbook site.yml — PLAY RECAP, run 2 of 2]
+TASK [base : Ensure log directory exists] *******************
+changed: [app-prod-1]
+
+TASK [base : Register host with the metrics agent] **********
+changed: [app-prod-1]
+
+RUNNING HANDLER [base : Restart cloudbase-api] **************
+changed: [app-prod-1]
+
+PLAY RECAP **************************************************
+app-prod-1  : ok=17  changed=4  unreachable=0  failed=0
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The second consecutive run reports \code{changed=4}. On an idempotent playbook it should report \code{changed=0}; the handler firing is a downstream consequence, not the cause.
+  \item \textbf{Hypothesise.} One or more tasks report \code{changed} unconditionally, and at least one of them notifies the restart handler.
+  \item \textbf{Investigate.} Run with \code{--diff} to see which tasks claim a change and what they think differs. Inspect the four culprits: two are \code{shell} tasks, one is a \code{file} task setting \code{mode} on a directory whose mode is already correct but written as \code{0755} unquoted (YAML parses it as the integer 493), and one is a \code{copy} of a file whose content is rendered with a timestamp.
+  \item \textbf{Root cause.} \code{shell}/\code{command} always report changed because they cannot inspect state; the unquoted octal mode is a YAML typing bug; the timestamped template guarantees new content every run.
+  \item \textbf{Fix.} Replace the shell tasks with \code{ansible.builtin.file} and the metrics-agent module (or guard them with \code{creates:}/\code{changed\_when:}); quote the mode as \code{"0755"}; remove the timestamp from the template, or move it to a file the service does not depend on.
+  \item \textbf{Prevent.} Add a CI stage that runs the play twice against a throwaway host and fails unless the second run reports \code{changed=0}. Add \code{ansible-lint}, which flags unquoted octal modes and unguarded shell tasks before review.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Works on my laptop, fails in the CI runner with a decryption error}
+\textbf{Symptom.} A deploy pipeline that has run for months starts failing at the first task that reads a variable. The same playbook runs fine from an engineer's machine.
+
+\begin{outbox}[GitLab CI job log — deploy:prod]
+TASK [Gathering Facts] ***************************************
+ok: [app-prod-1]
+
+TASK [base : Configure database connection] ******************
+fatal: [app-prod-1]: FAILED! => {"msg": "Attempting to decrypt
+but no vault secrets found"}
+
+ERROR! the field 'vault_password_file' has an invalid value
+  ('/run/secrets/vault-pass'), and could not be converted to
+  an AnsibleUnicode. No such file or directory
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Two messages: the playbook found vaulted content it cannot decrypt, and the configured passphrase file does not exist in the runner.
+  \item \textbf{Hypothesise.} The passphrase reaches the local machine through a developer's \code{ansible.cfg} or an interactive prompt, and reaches CI through an injected file --- and that injection stopped happening.
+  \item \textbf{Investigate.} Check whether the CI variable holding the passphrase is still defined and still exposed to this branch. Protected CI variables are only injected on protected branches: a release cut from a new, unprotected branch silently receives nothing, and the file is never written.
+  \item \textbf{Root cause.} A configuration change, not a code change --- the pipeline ran from a branch that does not match the protected-branch pattern, so the masked variable was absent and the \code{before\_script} wrote an empty (or no) file.
+  \item \textbf{Fix.} Restore the branch protection pattern, or scope the variable to the environment rather than the branch. Have the \code{before\_script} assert the variable is non-empty and exit with a clear message if not.
+  \item \textbf{Prevent.} Never let a missing secret surface as a decryption error three tasks in. Validate every required secret at the start of the job with an explicit check, so the failure names the missing variable instead of describing a symptom. Keep vault IDs per environment so a staging passphrase can never accidentally satisfy a production run.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~35 min}
+\textbf{Goal.} Feel idempotency by breaking it deliberately.\\
+\textbf{Business context.} Your team's playbook reports changes on every run and nobody trusts the output any more.\\
+\textbf{Architecture.} One local VM or container, one playbook, no roles.\\
+\textbf{Requirements.} Write two tasks that install nginx --- one with \code{shell}, one with \code{ansible.builtin.apt} --- plus one \code{lineinfile} and one equivalent \code{shell} append. Run twice and record the recap.\\
+\textbf{Constraints.} Do not use handlers yet; observe raw \code{ok}/\code{changed} counts only.\\
+\textbf{Hints.} \code{ansible-playbook p.yml --diff} shows why a task believes it changed something.\\
+\textbf{Expected outcome.} A short table: task, run 1 result, run 2 result, and a sentence explaining each.\\
+\textbf{Production considerations.} Note which tasks would have fired a handler on run 2, and what that would have restarted.\\
+\textbf{Common pitfalls.} Writing \code{mode: 0644} unquoted and getting a spurious change; concluding \code{shell} is "fine because nothing broke."
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~60 min}
+\textbf{Goal.} Extract a flat playbook into a reusable role with a real public interface.\\
+\textbf{Business context.} The bastion and the app tier need the same baseline, and the copy-pasted versions have already diverged.\\
+\textbf{Architecture.} \code{roles/base/} with \code{tasks}, \code{handlers}, \code{templates}, \code{defaults}; two host groups consuming it with different values.\\
+\textbf{Requirements.} Every value that differs between the two groups lives in \code{defaults/main.yml} and is overridden in \code{group\_vars/}. One templated config with \code{validate:}, one handler.\\
+\textbf{Constraints.} \code{vars/main.yml} may hold only values a caller must never change; justify each in a comment.\\
+\textbf{Hints.} Run against one group, then the other, and diff the resulting files on each host.\\
+\textbf{Expected outcome.} One role, two host groups, two correct and different configurations, second run \code{changed=0} on both.\\
+\textbf{Production considerations.} Write the three-line \code{README} a colleague would need to consume your role.\\
+\textbf{Common pitfalls.} Leaking a host-specific value into the role; notifying a handler from a task that always reports changed.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~110 min}
+\textbf{Goal.} Configure a freshly Terraform-provisioned host end to end, with secrets and drift detection.\\
+\textbf{Business context.} New CloudBase hosts must be production-ready without anyone SSHing in.\\
+\textbf{Architecture.} Terraform creates and tags the instance $\rightarrow$ dynamic inventory reads the tags $\rightarrow$ the \code{base} role configures it $\rightarrow$ a scheduled \code{--check} job reports drift.\\
+\textbf{Requirements.} Dynamic inventory from cloud tags; service user, packages, hardened sshd with \code{validate}, templated \code{systemd} unit; database password in a Vault file with a \code{prod} vault ID; \code{no\_log} on the consuming task.\\
+\textbf{Constraints.} No IP address anywhere in the repository. No plaintext secret. Ansible must create no cloud resources.\\
+\textbf{Hints.} Reach private hosts through the bastion with an SSH \code{ProxyCommand} in the inventory's group vars.\\
+\textbf{Expected outcome.} \code{terraform apply} then \code{ansible-playbook site.yml} yields a working host; a second play run reports \code{changed=0}; \code{--check --diff} after a hand-edit reports exactly that edit.\\
+\textbf{Production considerations.} What breaks when the fleet reaches 500 hosts and \code{forks: 5}? Where would the vault passphrase live if the control node were a CI runner nobody owns?\\
+\textbf{Common pitfalls.} Committing the dynamic inventory cache; letting the role \code{apt upgrade} everything and calling it hardening; forgetting that removing a task does not uninstall anything.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{opsnote}
+Ansible's real product is not the playbook --- it is the answer to "what is supposed to be on this host, and who decided that?" A role in Git with a merge request history answers both questions in thirty seconds. A host configured by hand answers neither, ever. When you evaluate whether a piece of automation is worth writing, weigh the review trail as heavily as the time saved.
+\end{opsnote}
+
+\begin{scalenote}
+The scaling wall is the control node, not the fleet. At a few hundred hosts you will hit \code{forks}, file-descriptor limits and a single point of failure in whoever's laptop is running the play. The architectural answer is a centralised execution layer --- AWX, its supported form Ansible Automation Platform, or simply a dedicated CI runner --- that owns the inventory, holds the credentials, serialises concurrent runs and logs who ran what against which hosts. NASA's published case study attributes its results specifically to centralising execution this way rather than to any individual playbook.
+\end{scalenote}
+
+\begin{drtip}
+Configuration management is a recovery tool before it is a convenience. The question "can we rebuild this host from scratch in an hour?" has an honest answer only if a role describes it completely. Test it the only way that means anything: destroy a non-production host and rebuild it from Terraform plus the role, on the clock, with the runbook you actually have. Whatever manual step you discover is missing is the same step that will be missing at 3am.
+\end{drtip}
+
+\begin{interview}
+Expect: \emph{"Where is the line between Terraform and Ansible?"} The weak answer names the tools. The strong one names the property: Terraform owns resource \emph{lifecycle} and keeps state so it can detect additions and removals; Ansible owns in-host state and keeps none, re-deriving reality every run. Then land the consequence --- that is why deleting an Ansible task uninstalls nothing, and why letting both tools own the same resource gives you two sources of truth and no way to reconcile them.
+\end{interview}
+
+\begin{whyexists}
+Ansible succeeded against technically mature competitors largely because it removed the bootstrap problem. Agent-based tools require you to install and certificate-enroll an agent before you can manage a host --- which means you need configuration management to set up configuration management. Building on SSH and an interpreter that every server already has made the first useful run possible in minutes. Reducing time-to-first-value beats feature completeness more often than engineers expect.
+\end{whyexists}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a hand-written \code{bootstrap.sh}; Day 2 put it under review; Day 7 had Terraform provision the VPC, the bastion and the app subnet. The script is now the weakest link: it lives in the repository but nothing verifies it was run, what version was run, or whether anyone has edited a host since. Today it retires.
+
+\begin{buildalong}[Day 08 — from bootstrap script to declared host state]
+\begin{wbitem}
+  \item Add \code{ansible/} to the CloudBase repository: \code{ansible.cfg}, \code{site.yml}, \code{roles/}, and \code{inventories/staging/} and \code{inventories/prod/} as separate directories with their own \code{group\_vars/}.
+  \item Build \code{roles/base/} that reproduces everything \code{bootstrap.sh} did --- the \code{cloudbase} service user, \code{/opt/cloudbase} with mode \code{0750}, the JRE and base packages, log rotation --- using purpose-built modules only.
+  \item Template the Day 1 \code{systemd} unit as \code{cloudbase-api.service.j2}, interpolating the service user, app directory and environment name from \code{defaults/main.yml}.
+  \item Add hardened \code{sshd} configuration --- no password authentication, no root login, group-restricted access --- deployed with \code{validate: /usr/sbin/sshd -t -f \%s} and notifying a restart handler.
+  \item Wire dynamic inventory to the tags Terraform already sets, so no IP address or hostname is committed; reach private hosts through the bastion via \code{ProxyCommand} in group vars.
+  \item Move the database password into \code{inventories/prod/group\_vars/app/vault.yml} encrypted with a \code{prod} vault ID, referenced from a plaintext \code{vars.yml}, with \code{no\_log: true} on the consuming task.
+  \item Delete \code{bootstrap.sh} and record in \code{docs/host-baseline.md} that the role is now the sole description of host state.
+  \item Add a CI stage that runs the play twice against a throwaway host and fails unless the second run reports \code{changed=0}; add a scheduled \code{--check --diff} run against production that reports drift.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{terraform apply} followed by \code{ansible-playbook -i inventories/prod site.yml} takes a bare instance to a fully configured CloudBase host with no manual step; an immediate second run reports \code{changed=0} on every host; no IP address and no plaintext secret exists anywhere in the repository; and \code{bootstrap.sh} is gone.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Terraform owns resource lifecycle and keeps state; Ansible owns in-host state and keeps none.
+  \item Because there is no state, Ansible cannot detect removal --- deletion must be declared with \code{state: absent}.
+  \item Idempotency lives inside modules: read current state, compare, act on the difference, report \code{changed}.
+  \item \code{shell} and \code{command} always report changed, so they break drift detection, check mode and handlers.
+  \item Handlers deduplicate, run once, at the end of the play, in definition order --- not notification order.
+  \item Roles are the unit of reuse; \code{defaults/} is the public interface, \code{vars/} is internal.
+  \item Vault is AES-256 file encryption with per-environment vault IDs --- not rotation, audit or revocation.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item A second run reporting \code{changed=0} is the only proof of idempotency that counts.
+  \item \code{mode: 0644} unquoted is an integer in YAML; always write \code{"0644"}.
+  \item \code{validate:} on a template is what stops a typo from locking you out of an entire fleet at once.
+  \item \code{--check --diff} is Ansible's \code{plan}, and it is worthless in a playbook made of shell tasks.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Always-\code{changed} tasks \quad$\bullet$\quad hardcoded IPs \quad$\bullet$\quad plaintext secrets in Git
+  \item Two tools owning one resource \quad$\bullet$\quad assuming a handler ran after a failed play
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Boundary}{Terraform provisions and owns lifecycle; Ansible configures what is inside a host.}
+\cheatitem{Agentless}{SSH plus remote Python; no daemon, no certificates, no state file.}
+\cheatitem{Idempotency}{A module property: compare declared state to actual, act on the difference, report \code{changed}.}
+\cheatitem{Guards}{\code{creates:} / \code{removes:} to skip, \code{changed\_when:} / \code{failed\_when:} to correct a verdict.}
+\cheatitem{Handlers}{Notified by name, deduplicated, run once at end of play in definition order.}
+\cheatitem{Roles}{\code{tasks} · \code{handlers} · \code{templates} · \code{files} · \code{defaults} (low) · \code{vars} (high) · \code{meta}.}
+\cheatitem{Inventory}{Static file or dynamic plugin over cloud tags; \code{group\_vars/} beside it, one directory per environment.}
+\cheatitem{Vault}{\code{\$ANSIBLE\_VAULT;1.2;AES256;prod} --- file or single value, vault IDs per environment.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 8 commands worth memorising]
+# connectivity and inventory
+ansible -i inventories/prod all -m ping        # SSH + python check
+ansible-inventory -i inventories/prod --graph  # resolved group tree
+ansible-inventory -i inventories/prod --host app-prod-1  # all vars
+
+# running
+ansible-playbook -i inventories/prod site.yml
+ansible-playbook -i inventories/prod site.yml --check --diff   # dry run
+ansible-playbook -i inventories/prod site.yml --limit app --tags sshd
+ansible-playbook -i inventories/prod site.yml --start-at-task "Deploy unit"
+
+# introspection
+ansible-doc ansible.builtin.apt         # params + check-mode support
+ansible-lint roles/base                 # catch non-idempotent patterns
+ANSIBLE_CALLBACKS_ENABLED=profile_tasks ansible-playbook site.yml
+
+# vault
+ansible-vault encrypt --vault-id prod@prompt group_vars/app/vault.yml
+ansible-vault edit   --vault-id prod@prompt group_vars/app/vault.yml
+ansible-vault rekey  --vault-id prod@prompt group_vars/app/vault.yml
+ansible-playbook site.yml --vault-id prod@/run/secrets/vault-pass
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What does idempotency mean in Ansible, concretely, and why does it matter?}
+\iq{Why is Ansible agentless, and what is the trade-off versus an agent-based tool?}
+\iq{What is the difference between a task and a handler, and when do handlers actually run?}
+\iq{How would you structure configuration for reuse across many playbooks and environments?}
+\iq{Where does the line sit between what Terraform should manage and what Ansible should manage?}
+\iq{How does Ansible Vault protect secrets in a Git-tracked repo --- and what does it not protect against?}
+\iq{Your playbook reports \code{changed=6} on every run. Walk me through diagnosing it.}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Ansible playbook guide, at \code{docs.ansible.com} under \code{playbook\_guide/} $\rightarrow$ \code{playbooks\_intro} --- the authoritative introduction to plays, tasks and idempotency.
+  \item Reusing playbooks with roles --- \code{playbook\_guide/} $\rightarrow$ \code{playbooks\_reuse\_roles}: the seven standard directories, and \code{defaults} versus \code{vars} precedence.
+  \item Playbook execution strategies --- \code{playbook\_guide/} $\rightarrow$ \code{playbooks\_strategies}: \code{linear} versus \code{free}, forks and serial execution.
+  \item Protecting sensitive data with Ansible Vault --- the \code{vault\_guide/} section, including vault IDs and payload format 1.1 and 1.2.
+  \item Ansible-core porting guides (2.19 and 2.20) --- required reading before an upgrade; 2.19 overhauled templating and introduced Data Tagging, which broke brittle Jinja patterns.
+  \item Red Hat, "8 ways to speed up your Ansible playbooks" --- forks, pipelining, ControlPersist and fact gathering, with the mechanism behind each.
+  \item GitLab public runbooks, \code{runbooks.gitlab.com} --- their Chef cookbook process, for a real pull-based, agent-driven contrast to everything in this chapter.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item A second consecutive run of every playbook reports \code{changed=0}.
+  \item No \code{shell} or \code{command} task exists without \code{creates:}, \code{removes:} or \code{changed\_when:}.
+  \item Every config template that has a validator uses \code{validate:}.
+  \item Production and staging are separate inventory directories; production is never the default.
+  \item No IP address is committed --- inventory derives from cloud tags.
+  \item Every secret in the repository is vaulted, with per-environment vault IDs, and consumed under \code{no\_log: true}.
+  \item \code{ansible-lint} runs in CI, and a scheduled \code{--check --diff} job reports drift against production.
+  \item Removal is declared explicitly, not implied by deleting a task.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 09).} Your hosts are now declared, your infrastructure is declared, and both live in Git --- but a human still decides when to run them. Tomorrow you build the pipeline that decides: CI/CD, from a commit through build, test and artefact to an automated, reversible deployment, with the deployment strategies that let you change production without holding your breath.
+\end{keyidea}

@@ -1,0 +1,205 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ FRONT MATTER ============================
+\newcommand{\frontheading}[2]{%
+  \par\addvspace{7mm}%
+  \noindent\begin{tikzpicture}[baseline=(t.base)]
+    \node[fill=cBrand, text=white, rounded corners=1.3mm, font=\normalsize,
+          inner sep=0pt, minimum width=8mm, minimum height=8mm] (n) {#1};
+    \node[anchor=west, font=\sffamily\bfseries\LARGE, text=cInk] (t) at (n.east) [xshift=3mm] {#2};
+  \end{tikzpicture}\par\vspace{1mm}%
+  \noindent{\color{cBrand}\rule{\linewidth}{1pt}}\par\addvspace{2.5mm}%
+}
+
+% ---------------------------------------------------------------- COVER
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  \fill[cBrandDeep] (current page.south west) rectangle (current page.north east);
+  \fill[cBrand] ([yshift=-4.2cm]current page.north west) rectangle ([yshift=-9.7cm]current page.north east);
+  \fill[cAccent] ([yshift=-4.2cm]current page.north west) rectangle ([yshift=-4.05cm]current page.north east);
+  \fill[cAccent] ([yshift=-9.85cm]current page.north west) rectangle ([yshift=-9.7cm]current page.north east);
+  % faint infrastructure glyph, lower-right
+  \node[anchor=south east, text=white, opacity=0.04, font=\bfseries, scale=20]
+     at ([xshift=0.7cm,yshift=-0.6cm]current page.south east) {\faCloud};
+  % eyebrow
+  \node[anchor=north west, text=cAccent, font=\sffamily\bfseries]
+     at ([xshift=2.2cm,yshift=-2.5cm]current page.north west)
+     {\Large BACKEND ENGINEERING\, \textbullet\, SPEEDRUN SERIES\, \textbullet\, VOLUME II};
+  % title
+  \node[anchor=north west, text=white, font=\sffamily\bfseries, align=left]
+     at ([xshift=2.2cm,yshift=-5.25cm]current page.north west)
+     {{\fontsize{39}{43}\selectfont The DevOps Engineer's}\\[3mm]
+      {\fontsize{39}{43}\selectfont Lab Notebook}};
+  % subtitle
+  \node[anchor=north west, text=white, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-10.7cm]current page.north west)
+     {\large A guided-practice companion to the};
+  \node[anchor=north west, text=cAccent, font=\sffamily\bfseries, align=left]
+     at ([xshift=2.2cm,yshift=-11.28cm]current page.north west)
+     {\large DevOps Engineer --- 14-Day Speedrun Roadmap};
+  % tagline
+  \node[anchor=north west, text=white!85, font=\sffamily, align=left, text width=15.6cm]
+     at ([xshift=2.2cm,yshift=-12.9cm]current page.north west)
+     {From ``I can write a Dockerfile'' to designing, automating, securing, observing and operating
+      production cloud infrastructure --- understanding \emph{why} each layer exists, not just which command to run.};
+  % stat row
+  \node[anchor=north west, align=left] at ([xshift=2.2cm,yshift=-15.3cm]current page.north west)
+     {\begin{tikzpicture}[x=3.7cm, node distance=0pt]
+        \foreach \i/\v/\l in {0/14/DAYS, 1/42/GUIDED LABS, 2/115+/HOURS DEPTH, 3/1/CAPSTONE}{
+          \node[anchor=west, text=cAccent, font=\sffamily\bfseries] at (\i,0.35) {\Huge \v};
+          \node[anchor=west, text=white!80, font=\sffamily\bfseries\footnotesize] at (\i,-0.35) {\l};
+        }
+      \end{tikzpicture}};
+  % owner lines
+  \node[anchor=north west, text=white!75, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-18.9cm]current page.north west)
+     {This notebook belongs to:\ \ \textcolor{white!35}{\rule{7cm}{0.4pt}}};
+  \node[anchor=north west, text=white!75, font=\sffamily, align=left]
+     at ([xshift=2.2cm,yshift=-19.8cm]current page.north west)
+     {Started on:\ \ \textcolor{white!35}{\rule{3.6cm}{0.4pt}}\qquad Target finish:\ \ \textcolor{white!35}{\rule{3.6cm}{0.4pt}}};
+  \node[anchor=south west, text=white!55, font=\sffamily\footnotesize]
+     at ([xshift=2.2cm,yshift=1.4cm]current page.south west)
+     {Study the roadmap first \textbullet\ then learn with this workbook open beside you \textbullet\ break things on purpose};
+\end{tikzpicture}
+\end{titlepage}
+
+% ---------------------------------------------------------------- HOW TO USE
+\frontheading{\faCompass}{How to Use This Workbook}
+
+This is not an exam-prep book and not a second reference manual. It is a \keyterm{laboratory manual} --- a
+place to \emph{do the engineering} beside the roadmap. The roadmap tells you \emph{what} to learn; this
+workbook walks you through understanding \emph{why it exists}, \emph{how it works underneath}, and
+\emph{what it costs you} --- then makes you build, break and fix it.
+
+The goal is not command recall. It is to leave each chapter reasoning like a senior engineer: able to
+justify a design decision, name its trade-offs, and say what you would do differently at ten times the scale.
+
+\wbsub{The daily study loop}
+\begin{wbfigure}{Fig 0.1 — Run this loop once per day. The learning is in steps 3 and 4, not step 1.}
+\wbscale{\begin{tikzpicture}[node distance=7mm and 12mm, every node/.style={font=\sffamily\footnotesize}]
+  \node[wbbox, text width=30mm] (a) {\textbf{1 · Read}\\\scriptsize the roadmap day, first};
+  \node[wbboxaccent, right=of a, text width=30mm] (b) {\textbf{2 · Work the 11 parts}\\\scriptsize concepts, diagrams, notes};
+  \node[wbboxgood, right=of b, text width=30mm] (c) {\textbf{3 · Build it by hand}\\\scriptsize labs \& CloudBase};
+  \node[wbboxwarn, below=8mm of c, text width=30mm] (d) {\textbf{4 · Break \& debug it}\\\scriptsize debugging labs};
+  \node[wbboxops, below=8mm of a, text width=30mm] (e) {\textbf{5 · Reflect \& check}\\\scriptsize write-in spaces, checklist};
+  \draw[wbarrow] (a)--(b); \draw[wbarrow] (b)--(c); \draw[wbarrow] (c)--(d);
+  \draw[wbarrow] (d) -- (e); \draw[wbarrow] (e)--(a);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\wbsub{The eleven parts of every chapter}
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}p{4mm}L{38mm}X@{}}
+\textbf{1} & \textbf{The Big Picture} & What problem it solves, where it sits in a cloud architecture, how it links to earlier days.\\[1.2mm]
+\textbf{2} & \textbf{Concept Map} & One page holding the whole territory and its vocabulary.\\[1.2mm]
+\textbf{3} & \textbf{Guided Learning} & Each idea taught progressively: what / why it exists / how it works internally / when / when not / production example.\\[1.2mm]
+\textbf{4} & \textbf{Visualizations} & Redraw the architecture from memory to lock it in.\\[1.2mm]
+\textbf{5} & \textbf{Guided Hands-On Lab} & Build it step by step --- the workbook guides the decisions, you write the code.\\[1.2mm]
+\textbf{6} & \textbf{Thinking Exercises} & Engineering reflections, not quizzes.\\[1.2mm]
+\textbf{7} & \textbf{Debugging Practice} & A real incident worked as Observe → Hypothesise → Investigate → Root cause → Fix → Prevent.\\[1.2mm]
+\textbf{8} & \textbf{Mini-Labs} & Three labs: Beginner, Intermediate, Production-style.\\[1.2mm]
+\textbf{9} & \textbf{Engineering Notes} & Senior judgment, trade-offs, cost and reliability thinking.\\[1.2mm]
+\textbf{10} & \textbf{Build-Along Project} & Extend \keyterm{CloudBase}, one cloud platform built across all 14 days.\\[1.2mm]
+\textbf{11} & \textbf{Chapter Summary} & Takeaways, cheat sheet, CLI reference, official docs, production checklist.\\
+\end{tabularx}
+\end{center}
+
+\begin{prodtip}
+The write-in spaces and "redraw from memory" boxes are meant to be filled in \emph{by hand}. Print the pages
+you are working, or annotate the PDF. Reproducing an architecture diagram yourself is what turns
+"I have seen that" into "I can whiteboard that in an interview."
+\end{prodtip}
+
+\begin{secwarn}[on copy-paste]
+This workbook deliberately does not hand you finished infrastructure. The labs guide you to build it. If you
+paste a Terraform module or a Kubernetes manifest you did not type and reason through, you will feel
+productive and learn nothing --- and you will not be able to debug it at 3am. The struggle in Parts 5, 7 and 10
+is the entire point.
+\end{secwarn}
+
+% ---------------------------------------------------------------- LEGEND
+\frontheading{\faInfoCircle}{Field Guide to the Engineering Notes}
+
+Coloured callouts flag different \emph{kinds} of engineering thinking. Learn to read them at a glance.
+
+\begin{multicols}{1}
+\begin{seniornote}How an experienced engineer reasons about the decision --- the judgment behind the code.\end{seniornote}
+\begin{prodtip}A concrete practice that holds up under real production load.\end{prodtip}
+\begin{infranote}Something the infrastructure is doing underneath the abstraction.\end{infranote}
+\begin{behind}What the tool or kernel is actually doing behind the command.\end{behind}
+\begin{tradeoff}An honest design trade-off --- what you gain and what you give up.\end{tradeoff}
+\begin{scalenote}What changes when traffic, nodes or teams multiply by ten.\end{scalenote}
+\begin{reliability}A principle that keeps the system up when something fails.\end{reliability}
+\begin{secwarn}A security trap --- read these twice.\end{secwarn}
+\begin{costnote}Where the cloud bill quietly comes from, and how to avoid it.\end{costnote}
+\begin{autotip}Where to replace human effort with automation.\end{autotip}
+\begin{opsnote}Operational excellence: runbooks, on-call, and what "done" means.\end{opsnote}
+\begin{drtip}Disaster recovery: what happens when a whole component or region is gone.\end{drtip}
+\begin{perfnote}A latency or throughput consideration worth measuring.\end{perfnote}
+\begin{interview}A question you will likely be asked, and how to answer it well.\end{interview}
+\begin{misconception}A belief many engineers hold that is subtly wrong.\end{misconception}
+\end{multicols}
+
+\smallskip And the working blocks you will act on:
+
+\begin{minilab}{Beginner / Intermediate / Production}{graded practice}
+Labs with a Goal, Business context, Architecture, Requirements, Constraints, Hints, Expected outcome,
+Production considerations and Common pitfalls.
+\end{minilab}
+\begin{debuglab}{A real production incident}
+Symptom and evidence --- logs, \code{kubectl} output, a plan diff --- then a guided
+Observe → Hypothesise → Investigate → Root cause → Fix → Prevent walkthrough.
+\end{debuglab}
+\begin{thinkbox}
+An engineering reflection with ruled space to write your answer by hand.
+\end{thinkbox}
+\begin{buildalong}[CloudBase]
+The one cloud platform you extend a little further every single day.
+\end{buildalong}
+
+% ---------------------------------------------------------------- THE ARC
+\frontheading{\faMapSigns}{The 14-Day Arc at a Glance}
+
+Each day earns its place and feeds the next. Read down the "CloudBase milestone" column to watch one
+platform grow from a bare Linux host into production infrastructure with GitOps delivery and real SLOs.
+
+\begin{center}\footnotesize
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}C{7mm}L{38mm}X@{}}
+\rowcolor{cBrand}\textcolor{white}{\textbf{Day}} & \textcolor{white}{\textbf{Topic}} & \textcolor{white}{\textbf{CloudBase milestone you build}}\\
+1 & Linux \& the Command Line & Base host: strict-mode bootstrap, service user, systemd unit.\\
+2 & Git \& Version Control & Repo conventions: branch protection, CODEOWNERS, secret-blocking hook.\\
+3 & Networking for DevOps & Network design: /16 VPC, public/private subnets, bastion, least-privilege SGs.\\
+4 & Docker Deep Dive & Hardened multi-stage image, non-root, minimal build context.\\
+5 & Kubernetes Fundamentals & Deployment, Service, config/secrets, liveness \& readiness probes.\\
+6 & Kubernetes in Production & Helm chart, Ingress with TLS, HPA, least-privilege RBAC.\\
+7 & Terraform (IaC) & The network in code, with remote state and locking.\\
+8 & Ansible (Config Mgmt) & Idempotent role replacing the bootstrap script; Vault secrets.\\
+9 & CI/CD Engineering & test → scan → build → push, SHA-tagged, promoted not rebuilt.\\
+10 & Cloud Infra on AWS & ALB, cluster, RDS in private subnets, least-privilege IAM.\\
+11 & Monitoring \& Observability & Prometheus + Grafana, correlated logs, one real SLO and alert.\\
+12 & Security \& Secrets & Secrets manager, image-scan gate, NetworkPolicies, RBAC audit.\\
+13 & GitOps \& Deployment & Argo CD reconciliation, canary gated on SLO, rehearsed rollback.\\
+14 & Capstone & Full assembly, DR drill, runbook, architecture review.\\
+\end{tabularx}
+\end{center}
+
+\begin{keyidea}
+\textbf{CloudBase} is deliberately a \emph{small} application carrying a \emph{large} amount of operational
+weight --- exactly the shape of a strong take-home assignment or a well-scoped first project at a new job.
+If you have worked Volume I of this series, the natural application to wrap in this infrastructure is the
+order API you built there. Depth over breadth, every day.
+\end{keyidea}
+
+\clearpage
+% ---------------------------------------------------------------- TOC
+\frontheading{\faListUl}{Contents}
+\vspace{1mm}
+{\hypersetup{linkcolor=cInk}%
+ \makeatletter\@starttoc{toc}\makeatother}
+\vfill
+\begin{center}\footnotesize\itshape\color{cInk!60}
+Fourteen chapters \textbullet\ one growing platform \textbullet\ every layer understood, not just invoked.
+\end{center}
+\clearpage

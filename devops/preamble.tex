@@ -1,0 +1,519 @@
+% SPDX-License-Identifier: MIT
+% Copyright (c) 2026 Aymix — LaTeX design system, reusable under the MIT Licence.
+% =====================================================================
+%  THE DEVOPS ENGINEER'S LAB NOTEBOOK  —  shared design system
+%  Companion workbook to the "DevOps Engineer 14-Day Speedrun Roadmap"
+%  Volume II of the Speedrun Series (Volume I: Backend Engineering)
+%  Engine: pdflatex   |   No shell-escape required (listings, not minted)
+% =====================================================================
+
+% ----- core -----
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amssymb}
+\usepackage{etoolbox}
+\usepackage[table,dvipsnames]{xcolor}
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{multicol}
+\usepackage{enumitem}
+\usepackage{ragged2e}
+\usepackage[a4paper,top=2.5cm,bottom=2.3cm,left=2.25cm,right=2.25cm,headheight=17pt,headsep=6mm,footskip=12mm]{geometry}
+
+% ----- fonts: Fira Sans body + Source Code Pro mono -----
+\usepackage[sfdefault,scaled=1.0]{FiraSans}
+\usepackage[scaled=0.84]{sourcecodepro}
+\usepackage[defaultsans]{lato} % fallback safety (not default)
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage{microtype}
+
+% ----- fontawesome icons -----
+\usepackage{fontawesome5}
+
+% =====================================================================
+%  COLOUR SYSTEM
+% =====================================================================
+\definecolor{cInk}{HTML}{1C2230}        % near-black body text
+\definecolor{cBrand}{HTML}{0E4A5B}      % deep petrol teal — primary (Vol. II)
+\definecolor{cBrandDeep}{HTML}{07303C}  % darker petrol (headers)
+\definecolor{cAccent}{HTML}{E8952E}     % warm amber — series accent
+\definecolor{cRule}{HTML}{C9CFDA}       % light rules / borders
+\definecolor{cFigBg}{HTML}{FBFCFE}      % figure background
+\definecolor{cCodeBg}{HTML}{1E2536}     % code background (dark)
+\definecolor{cCodeFrame}{HTML}{2C3550}
+\definecolor{cCodeTitle}{HTML}{111725}
+
+% semantic callout colours
+\definecolor{cSenior}{HTML}{0F766E}     % teal-green — senior engineer insight
+\definecolor{cProd}{HTML}{1D6FB8}       % blue — production tip
+\definecolor{cPerf}{HTML}{B45309}       % amber-brown — performance
+\definecolor{cSecurity}{HTML}{B3261E}   % red — security warning
+\definecolor{cDb}{HTML}{6D28D9}         % purple — (legacy alias)
+\definecolor{cInterview}{HTML}{3730A3}  % indigo — interview insight
+\definecolor{cMiscon}{HTML}{C2410C}     % orange — common misconception
+\definecolor{cBehind}{HTML}{4C1D95}     % violet — behind the scenes
+% --- DevOps volume: additional semantic colours ---
+\definecolor{cInfra}{HTML}{2A5A8C}      % slate blue — infrastructure insight
+\definecolor{cCost}{HTML}{8A6D0B}       % olive gold — cloud cost optimization
+\definecolor{cAuto}{HTML}{6D28D9}       % purple — automation tip
+\definecolor{cRely}{HTML}{1B6E4A}       % forest green — reliability principle
+\definecolor{cTrade}{HTML}{92400E}      % brown — design tradeoff
+\definecolor{cScale}{HTML}{075985}      % deep blue — scalability note
+\definecolor{cOps}{HTML}{334155}        % slate — operational excellence
+\definecolor{cDR}{HTML}{9D174D}         % crimson — disaster recovery
+\definecolor{cGood}{HTML}{1E7A46}       % green — best practices
+\definecolor{cBad}{HTML}{B3261E}        % red — common mistakes
+\definecolor{cThink}{HTML}{7A5A12}      % ochre — thinking / reflection
+\definecolor{cLab}{HTML}{0E7490}        % cyan-teal — labs
+\definecolor{cDebug}{HTML}{9A3412}      % burnt orange — debugging
+\definecolor{cBuild}{HTML}{155E75}      % deep cyan — build-along
+
+% =====================================================================
+%  CODE (listings inside tcolorbox)
+% =====================================================================
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{listings,skins,breakable}
+
+\definecolor{lstKw}{HTML}{7CC5FF}
+\definecolor{lstKw2}{HTML}{C792EA}
+\definecolor{lstStr}{HTML}{ECC48D}
+\definecolor{lstCom}{HTML}{7E8AA3}
+\definecolor{lstNum}{HTML}{F78C6C}
+\definecolor{lstTxt}{HTML}{E6EAF2}
+\definecolor{lstAnno}{HTML}{82E0C6}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize\color{lstTxt},
+  keywordstyle=\color{lstKw}\bfseries,
+  keywordstyle=[2]\color{lstKw2},
+  commentstyle=\color{lstCom}\itshape,
+  stringstyle=\color{lstStr},
+  numberstyle=\ttfamily\scriptsize\color{lstCom},
+  showstringspaces=false,
+  keepspaces=true,
+  upquote=true,
+  columns=fullflexible,
+  breaklines=true,
+  breakatwhitespace=false,
+  tabsize=2,
+  extendedchars=true,
+  literate={→}{{$\rightarrow$}}1 {←}{{$\leftarrow$}}1 {≤}{{$\leq$}}1 {≥}{{$\geq$}}1
+}
+
+% Java (built-in) + annotation highlighting
+\lstdefinestyle{stJava}{
+  language=Java,
+  morekeywords={var,record,sealed,yield,permits},
+  moredelim=[is][\color{lstAnno}]{@@}{@@},
+}
+\lstdefinestyle{stSql}{language=SQL, morekeywords={ANALYZE,EXPLAIN,SERIALIZABLE,UNCOMMITTED,COMMITTED,REPEATABLE,ILIKE,RETURNING}}
+
+\lstdefinelanguage{yamlx}{
+  keywords={true,false,null},
+  keywordstyle=\color{lstKw2},
+  comment=[l]{\#},
+  morestring=[b]",
+  moredelim=[l][\color{lstKw}]{},
+}
+\lstdefinestyle{stYaml}{language=yamlx, basicstyle=\ttfamily\footnotesize\color{lstTxt}}
+
+\lstdefinelanguage{dockerx}{
+  morekeywords={FROM,AS,WORKDIR,COPY,RUN,CMD,ENTRYPOINT,EXPOSE,ENV,USER,ARG,VOLUME,LABEL,ADD,HEALTHCHECK},
+  keywordstyle=\color{lstKw}\bfseries,
+  comment=[l]{\#},
+  morestring=[b]",
+}
+\lstdefinestyle{stDocker}{language=dockerx}
+
+\lstdefinelanguage{bashx}{
+  morekeywords={curl,docker,mvn,java,git,echo,export,cd,psql,redis-cli,kubectl,grep,cat,sudo,run,build,push,compose,up,down},
+  keywordstyle=\color{lstKw}\bfseries,
+  comment=[l]{\#},
+  morestring=[b]",morestring=[b]',
+}
+\lstdefinestyle{stBash}{language=bashx}
+
+\lstdefinelanguage{httpx}{
+  morekeywords={GET,POST,PUT,PATCH,DELETE,HTTP,Authorization,Bearer,Content-Type,Accept,Location},
+  keywordstyle=\color{lstKw}\bfseries,
+  morestring=[b]",
+}
+\lstdefinestyle{stHttp}{language=httpx}
+
+\lstdefinestyle{stProps}{
+  morecomment=[l]{\#},
+  morekeywords={true,false},
+  keywordstyle=\color{lstKw2},
+}
+
+% base code box
+\tcbset{
+  wbcode/.style={
+    enhanced, breakable,
+    colback=cCodeBg, colframe=cCodeFrame, boxrule=0.6pt,
+    arc=1.2mm, outer arc=1.2mm,
+    left=3mm, right=3mm, top=1.8mm, bottom=1.8mm, boxsep=0.5mm,
+    coltitle=white, fonttitle=\ttfamily\bfseries\scriptsize,
+    colbacktitle=cCodeTitle,
+    attach boxed title to top left={xshift=2.2mm, yshift=-2.4mm},
+    boxed title style={colback=cCodeTitle, colframe=cCodeTitle, arc=0.6mm, boxrule=0pt},
+    listing only,
+    top=3.2mm,
+  }
+}
+\newtcblisting{javabox}[1][Java]{wbcode, listing style=stJava, title={\ #1\ }}
+\newtcblisting{sqlbox}[1][SQL]{wbcode, listing style=stSql, title={\ #1\ }}
+\newtcblisting{yamlbox}[1][config.yaml]{wbcode, listing style=stYaml, title={\ #1\ }}
+\newtcblisting{dockerbox}[1][Dockerfile]{wbcode, listing style=stDocker, title={\ #1\ }}
+\newtcblisting{bashbox}[1][shell]{wbcode, listing style=stBash, title={\ #1\ }}
+\newtcblisting{httpbox}[1][HTTP]{wbcode, listing style=stHttp, title={\ #1\ }}
+\newtcblisting{propsbox}[1][properties]{wbcode, listing style=stProps, title={\ #1\ }}
+
+% ---- DevOps volume: Terraform (HCL), Kubernetes manifests, terminal output ----
+\lstdefinelanguage{hclx}{
+  morekeywords={resource,provider,variable,output,module,data,locals,terraform,backend,
+    required_providers,for_each,count,depends_on,dynamic,lifecycle,true,false,null,var,each,source},
+  keywordstyle=\color{lstKw}\bfseries,
+  keywordstyle=[2]\color{lstKw2},
+  morekeywords=[2]{string,number,bool,list,map,object,set,any},
+  comment=[l]{\#}, morecomment=[l]{//}, morecomment=[s]{/*}{*/},
+  morestring=[b]",
+  sensitive=true,
+}
+\lstdefinestyle{stHcl}{language=hclx}
+\newtcblisting{tfbox}[1][main.tf]{wbcode, listing style=stHcl, title={\ #1\ }}
+
+% Kubernetes manifest — YAML styling, manifest-flavoured default caption
+\newtcblisting{k8sbox}[1][deployment.yaml]{wbcode, listing style=stYaml, title={\ #1\ }}
+% Ansible playbook — YAML styling
+\newtcblisting{ansiblebox}[1][playbook.yml]{wbcode, listing style=stYaml, title={\ #1\ }}
+
+% Terminal / log output — no keyword colouring, but +/-/~ diff markers and log levels highlighted.
+\definecolor{lstAdd}{HTML}{86E08A}
+\definecolor{lstDel}{HTML}{FF8A8A}
+\definecolor{lstChg}{HTML}{F0C674}
+\lstdefinelanguage{outx}{
+  morekeywords={},
+  moredelim=[l][\color{lstAdd}]{+\ },
+  moredelim=[l][\color{lstDel}]{-\ },
+  moredelim=[l][\color{lstChg}]{\~\ },
+  morecomment=[l][\color{lstCom}\itshape]{\#},
+}
+\lstdefinestyle{stOut}{language=outx, basicstyle=\ttfamily\scriptsize\color{lstTxt}}
+\newtcblisting{outbox}[1][terminal output]{wbcode, listing style=stOut, title={\ #1\ }}
+% Terraform plan diff — same output style, plan-flavoured caption
+\newtcblisting{planbox}[1][terraform plan]{wbcode, listing style=stOut, title={\ #1\ }}
+
+% ---- AWS / cloud console mock frame (illustration placeholder, not a screenshot) ----
+\newtcolorbox{consolemock}[1][AWS Management Console]{enhanced, breakable=false,
+  colback=white, colframe=cInk!35, boxrule=0.7pt, arc=1.4mm,
+  left=3mm, right=3mm, top=3mm, bottom=2.6mm,
+  fonttitle=\sffamily\bfseries\scriptsize, coltitle=white, colbacktitle=cInk!78,
+  title={\faCloud\ \ #1 \hfill \normalfont\scriptsize\textit{illustration}},
+  fontupper=\footnotesize}
+% a labelled console "field" row
+\newcommand{\consolerow}[2]{\noindent{\sffamily\scriptsize\color{cInk!60}#1}\;\;{\ttfamily\scriptsize\color{cInk}#2}\par\addvspace{0.7mm}}
+
+% inline code — colored monospace, line-break friendly (never overflows the margin)
+\newcommand{\code}[1]{{\ttfamily\small\color{cBrandDeep}#1}}
+% boxed chip — ONLY for very short labels/keys (<= ~14 chars); do not use for long identifiers
+\newcommand{\chip}[1]{{\ttfamily\footnotesize\colorbox{cRule!35}{\hspace{0.3mm}\textcolor{cBrandDeep}{#1}\hspace{0.3mm}}}}
+\newcommand{\anno}[1]{{\ttfamily\small\textbf{\color{cDb}#1}}}
+
+% =====================================================================
+%  CALLOUT BOXES
+% =====================================================================
+\tcbset{
+  callout/.style={
+    enhanced, breakable,
+    colframe=black, colback=white, coltitle=white,
+    fonttitle=\sffamily\bfseries\small,
+    fontupper=\small,
+    arc=1.4mm, outer arc=1.4mm,
+    boxrule=0.5pt, leftrule=3.4pt,
+    left=3.2mm, right=3.2mm, top=2.4mm, bottom=2.4mm, boxsep=0.8mm,
+    toptitle=0.8mm, bottomtitle=0.8mm, lefttitle=1mm,
+  }
+}
+% factory: #1 env, #2 colour, #3 icon+title
+\newcommand{\definecallout}[3]{%
+  \newtcolorbox{#1}[1][]{callout, colframe=#2, colback=#2!6,
+    title={#3\ifblank{##1}{}{\ \textmd{\textbullet}\ ##1}}}%
+}
+\definecallout{seniornote}{cSenior}{\faLightbulb\enspace Senior engineer insight}
+\definecallout{prodtip}{cProd}{\faRocket\enspace Production tip}
+\definecallout{perfnote}{cPerf}{\faBolt\enspace Performance note}
+\definecallout{secwarn}{cSecurity}{\faUserShield\enspace Security warning}
+\definecallout{dbinsight}{cDb}{\faDatabase\enspace Database insight}
+\definecallout{interview}{cInterview}{\faUserTie\enspace Interview insight}
+\definecallout{misconception}{cMiscon}{\faExclamationTriangle\enspace Common misconception}
+\definecallout{behind}{cBehind}{\faEye\enspace Behind the scenes}
+\definecallout{whyexists}{cBrand}{\faQuestionCircle\enspace Why does this exist?}
+\definecallout{keyidea}{cBrand}{\faKey\enspace Key idea}
+% --- DevOps volume: additional engineering notes ---
+\definecallout{infranote}{cInfra}{\faServer\enspace Infrastructure insight}
+\definecallout{costnote}{cCost}{\faCoins\enspace Cloud cost optimization}
+\definecallout{autotip}{cAuto}{\faRobot\enspace Automation tip}
+\definecallout{reliability}{cRely}{\faHeartbeat\enspace Reliability principle}
+\definecallout{tradeoff}{cTrade}{\faBalanceScale\enspace Design trade-off}
+\definecallout{scalenote}{cScale}{\faChartLine\enspace Scalability note}
+\definecallout{opsnote}{cOps}{\faTasks\enspace Operational excellence}
+\definecallout{drtip}{cDR}{\faLifeRing\enspace Disaster recovery tip}
+
+% Best practices / Mistakes — two-column friendly, no title bar variant
+\newtcolorbox{bestpractices}{callout, colframe=cGood, colback=cGood!6,
+  title={\faCheckCircle\enspace Best practices — what experienced engineers do}}
+\newtcolorbox{mistakes}{callout, colframe=cBad, colback=cBad!6,
+  title={\faTimesCircle\enspace Common mistakes beginners make}}
+
+% =====================================================================
+%  STRUCTURAL SECTION HEADERS  (11 canonical parts per chapter)
+% =====================================================================
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.misc,fit,backgrounds,calc,chains}
+
+\newcommand{\wbpart}[3][cBrand]{%
+  \par\addvspace{6.5mm}%
+  \noindent\begin{tikzpicture}[baseline=(t.base)]
+    \node[fill=#1, text=white, rounded corners=1.3mm, font=\sffamily\bfseries\normalsize,
+          inner sep=0pt, minimum width=8mm, minimum height=8mm] (n) {#2};
+    \node[anchor=west, font=\sffamily\bfseries\large, text=cInk] (t) at (n.east) [xshift=3mm] {#3};
+  \end{tikzpicture}\par\vspace{1mm}%
+  \noindent{\color{#1}\rule{\linewidth}{1pt}}\par\addvspace{2.5mm}%
+}
+% lighter sub-heading
+\newcommand{\wbsub}[2][cBrand]{\par\addvspace{3.5mm}\noindent{\sffamily\bfseries\large\color{#1}#2}\par\addvspace{1.2mm}}
+% run-in guided-learning label
+\newcommand{\glabel}[2][cBrand]{\par\addvspace{2mm}\noindent{\sffamily\bfseries\color{#1}#2\enspace}\ignorespaces}
+% eyebrow tag
+\newcommand{\eyebrow}[2][cAccent]{{\sffamily\bfseries\footnotesize\color{#1}\MakeUppercase{#2}}}
+
+% =====================================================================
+%  FIGURE / DIAGRAM WRAPPER
+% =====================================================================
+\newtcolorbox{wbfigure}[1]{
+  enhanced, breakable=false, colback=cFigBg, colframe=cRule, boxrule=0.6pt,
+  arc=1.6mm, halign=center, left=3mm,right=3mm,top=4mm,bottom=2.6mm,
+  after upper={\par\vspace{2.4mm}{\color{cRule}\rule{0.42\linewidth}{0.3pt}}\par\vspace{1.1mm}%
+    {\footnotesize\itshape\color{cInk!72}#1}}}
+
+% auto-fit: scale a diagram DOWN to fit the column (with padding margin) if too wide, else leave it.
+\newsavebox{\wbscalebox}
+\newlength{\wbtargetw}
+\newcommand{\wbscale}[1]{%
+  \sbox{\wbscalebox}{#1}%
+  \setlength{\wbtargetw}{0.94\linewidth}%
+  \ifdim\wd\wbscalebox>\wbtargetw
+    \resizebox{\wbtargetw}{!}{\usebox{\wbscalebox}}%
+  \else
+    \usebox{\wbscalebox}%
+  \fi}
+
+% TikZ diagram vocabulary
+\tikzset{
+  wbarrow/.style={-{Latex[length=2.6mm,width=2.1mm]}, line width=0.75pt, draw=cBrand},
+  wbarrowg/.style={-{Latex[length=2.6mm,width=2.1mm]}, line width=0.75pt, draw=cInk!45},
+  wbbox/.style={draw=cBrand, line width=0.9pt, fill=cBrand!7, rounded corners=1.6mm,
+    text=cInk, font=\sffamily\small, align=center, inner sep=3.5pt,
+    minimum height=10mm, minimum width=24mm},
+  wbboxaccent/.style={wbbox, draw=cAccent, fill=cAccent!12},
+  wbboxgood/.style={wbbox, draw=cGood, fill=cGood!10},
+  wbboxwarn/.style={wbbox, draw=cSecurity, fill=cSecurity!8},
+  wbboxghost/.style={wbbox, draw=cInk!35, fill=cInk!4},
+  wbboxdb/.style={wbbox, draw=cDb, fill=cDb!8},
+  wbcap/.style={font=\sffamily\scriptsize\itshape, text=cInk!70, align=center},
+  wbtag/.style={font=\sffamily\scriptsize, text=cInk!75, align=center},
+  wbcyl/.style={cylinder, shape border rotate=90, aspect=0.28, draw=cDb, line width=0.9pt,
+    fill=cDb!8, text=cInk, font=\sffamily\small, align=center, minimum height=12mm, minimum width=20mm, inner sep=2pt},
+  % --- DevOps volume: infrastructure diagram vocabulary ---
+  wbboxcloud/.style={wbbox, draw=cInfra, fill=cInfra!8},          % AWS / cloud resource
+  wbboxk8s/.style={wbbox, draw=cScale, fill=cScale!8},            % Kubernetes object
+  wbboxsec/.style={wbbox, draw=cSecurity, fill=cSecurity!7},      % security boundary/control
+  wbboxops/.style={wbbox, draw=cOps, fill=cOps!8},                % operational component
+  % dashed grouping boundary — VPC, subnet, AZ, namespace, cluster
+  wbzone/.style={draw=cInfra!70, line width=0.8pt, dashed, rounded corners=2.4mm,
+    inner sep=3.4mm, fill=cInfra!3},
+  wbzonesec/.style={wbzone, draw=cSecurity!60, fill=cSecurity!3},
+  wbzonek8s/.style={wbzone, draw=cScale!60, fill=cScale!3},
+  % label sitting on a zone boundary
+  wbzonelabel/.style={font=\sffamily\bfseries\scriptsize, text=cInfra, fill=cFigBg, inner sep=1.2pt},
+  wbzonelabelk8s/.style={wbzonelabel, text=cScale},
+  wbzonelabelsec/.style={wbzonelabel, text=cSecurity},
+  % dotted "traffic flow" arrow, for request paths
+  wbflow/.style={-{Latex[length=2.6mm,width=2.1mm]}, line width=0.9pt, draw=cAccent, densely dashed},
+}
+
+% =====================================================================
+%  LABS, DEBUGGING, THINKING, REFLECTION, CHECKLISTS
+% =====================================================================
+% Guided coding lab — step machinery
+\newcounter{labstep}
+\newcommand{\resetlab}{\setcounter{labstep}{0}}
+\newcommand{\labstep}[1]{%
+  \par\addvspace{2.5mm}\refstepcounter{labstep}%
+  \noindent\begin{tikzpicture}[baseline=(s.base)]
+    \node[fill=cLab, text=white, circle, inner sep=0pt, minimum size=6.4mm,
+          font=\sffamily\bfseries\footnotesize] (s) {\thelabstep};
+    \node[anchor=west, font=\sffamily\bfseries, text=cInk] at (s.east) [xshift=2.2mm] {#1};
+  \end{tikzpicture}\par\vspace{0.6mm}%
+}
+\newcommand{\labwhy}[1]{\par\addvspace{0.8mm}\noindent{\sffamily\itshape\color{cLab}\faLightbulb\ Why:\ }{\small\itshape\color{cInk!85}#1}\par\addvspace{0.4mm}}
+
+% Mini-lab box (Beginner / Intermediate / Production-style)
+\newtcolorbox{minilab}[2]{enhanced,breakable,
+  colback=cLab!4, colframe=cLab, boxrule=0.7pt, leftrule=3.2pt, arc=1.4mm,
+  left=3.2mm,right=3.2mm,top=2.6mm,bottom=2.6mm,
+  coltitle=white, colbacktitle=cLab, fonttitle=\sffamily\bfseries\small,
+  title={\faFlask\enspace Mini-Lab \textbullet\ #1 \hfill \normalfont\itshape\footnotesize #2}}
+
+% Debugging lab box
+\newtcolorbox{debuglab}[1]{enhanced,breakable,
+  colback=cDebug!4, colframe=cDebug, boxrule=0.7pt, leftrule=3.2pt, arc=1.4mm,
+  left=3.2mm,right=3.2mm,top=2.6mm,bottom=2.6mm,
+  coltitle=white, colbacktitle=cDebug, fonttitle=\sffamily\bfseries\small,
+  title={\faBug\enspace Debugging Lab \textbullet\ #1}}
+
+% Thinking / reflection prompt box
+\newtcolorbox{thinkbox}[1][Think it through]{enhanced,breakable,
+  colback=cThink!7, colframe=cThink, boxrule=0.6pt, leftrule=3.2pt, arc=1.4mm,
+  left=3.2mm,right=3.2mm,top=2.4mm,bottom=2.4mm,
+  coltitle=white, colbacktitle=cThink, fonttitle=\sffamily\bfseries\small,
+  title={\faBrain\enspace #1}}
+
+% Build-along project box
+\newtcolorbox{buildalong}[1][CloudBase — extend the platform]{enhanced,breakable,
+  colback=cBuild!5, colframe=cBuild, boxrule=0.8pt, leftrule=3.6pt, arc=1.6mm,
+  left=3.4mm,right=3.4mm,top=2.8mm,bottom=2.8mm,
+  coltitle=white, colbacktitle=cBuild, fonttitle=\sffamily\bfseries\small,
+  title={\faHammer\enspace Build-Along \textbullet\ #1}}
+
+% reflection ruled lines (write-in space)
+\newcommand{\reflectionlines}[1][4]{%
+  \par\addvspace{1.4mm}%
+  \foreach \wbi in {1,...,#1}{%
+    \noindent{\color{cRule}\rule{\linewidth}{0.35pt}}\par\vspace{5.4mm}}%
+  \vspace{-3mm}\par}
+
+% dotted write-in space with a soft label
+\newtcolorbox{writespace}[1][My notes]{enhanced,breakable=false,
+  colback=white, colframe=cRule, boxrule=0.5pt, arc=1.2mm,
+  left=3mm,right=3mm,top=2mm,bottom=1mm,
+  fonttitle=\sffamily\itshape\footnotesize, coltitle=cInk!55, colbacktitle=white,
+  title={\faPenNib\ #1}}
+
+% checklists
+\newlist{checklist}{itemize}{2}
+\setlist[checklist]{label=\textcolor{cBrand}{\large$\square$}, leftmargin=7mm, itemsep=2.2pt, topsep=2pt}
+\newlist{tickcheck}{itemize}{1}
+\setlist[tickcheck]{label=\textcolor{cGood}{\faCheck}, leftmargin=7mm, itemsep=2pt, topsep=2pt}
+
+% takeaway / plain bullet
+\newlist{wbitem}{itemize}{2}
+\setlist[wbitem]{label=\textcolor{cAccent}{\footnotesize\faCircle}, leftmargin=6mm, itemsep=2.5pt, topsep=2pt}
+\setlist[wbitem,2]{label=\textcolor{cBrand}{\scriptsize\faAngleRight}, leftmargin=5mm}
+
+% =====================================================================
+%  CHEAT SHEET
+% =====================================================================
+\newtcolorbox{cheatsheet}[1][One-Page Cheat Sheet]{enhanced,breakable,
+  colback=cBrand!4, colframe=cBrand, boxrule=0.9pt, arc=1.8mm,
+  left=3.4mm,right=3.4mm,top=3mm,bottom=3mm,
+  coltitle=white, colbacktitle=cBrand, fonttitle=\sffamily\bfseries,
+  title={\faClipboardCheck\enspace #1}}
+\newcommand{\cheatitem}[2]{\noindent{\sffamily\bfseries\color{cBrandDeep}#1}\ \textemdash\ #2\par\addvspace{0.6mm}}
+
+% =====================================================================
+%  INTERVIEW Q / KEYTERM / SUMMARY helpers
+% =====================================================================
+\newtcolorbox{iqbox}{enhanced,breakable,
+  colback=cInterview!5, colframe=cInterview, boxrule=0.7pt, leftrule=3.2pt, arc=1.4mm,
+  left=3.2mm,right=3.2mm,top=2.4mm,bottom=2.4mm,
+  coltitle=white, colbacktitle=cInterview, fonttitle=\sffamily\bfseries\small,
+  title={\faUserTie\enspace Interview questions to master}}
+\newcommand{\iq}[1]{\noindent\textcolor{cInterview}{\faAngleRight}\ #1\par\addvspace{0.8mm}}
+
+\newcommand{\keyterm}[1]{\textbf{\color{cBrandDeep}#1}}
+
+% two-col best/mistakes side by side helper
+\newenvironment{twocolcallouts}{\par\begin{minipage}[t]{0.485\linewidth}}{\end{minipage}\hfill\ignorespaces}
+\newcommand{\colgap}{\end{minipage}\hfill\begin{minipage}[t]{0.485\linewidth}}
+
+% =====================================================================
+%  TABLES
+% =====================================================================
+\newcommand{\wbtablehead}[1]{\cellcolor{cBrand}\textcolor{white}{\sffamily\bfseries #1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\definecolor{cRowA}{HTML}{F3F5FA}
+\newcommand{\wbrowcolors}{\rowcolors{2}{white}{cRowA}}
+
+% =====================================================================
+%  CHAPTER OPENER
+% =====================================================================
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+\hypersetup{bookmarksnumbered=true, pdfstartview=FitH,
+  colorlinks=true, linkcolor=cBrand, urlcolor=cProd, citecolor=cBrand}
+
+\newcommand{\daychapter}[5]{%
+  % #1 day number (01..14)  #2 track eyebrow  #3 title  #4 subtitle  #5 study time
+  \clearpage
+  \phantomsection
+  \addcontentsline{toc}{chapter}{\texorpdfstring{\textbf{Day #1}\, — #3}{Day #1 — #3}}%
+  \markboth{Day #1 \ \textbullet\ \ #3}{}%
+  \begin{tcolorbox}[enhanced, breakable=false, colback=cBrand, colframe=cBrandDeep,
+      boxrule=0pt, arc=2.2mm, left=6mm,right=6mm,top=5mm,bottom=5.5mm,
+      overlay={\node[anchor=north east, font=\sffamily\bfseries, text=white!12,
+         scale=5.4] at ([xshift=-3mm,yshift=2mm]frame.north east) {#1};}]
+    {\sffamily\bfseries\footnotesize\textcolor{cAccent}{\MakeUppercase{Day #1 \ \ \textbullet\ \ #2}}}\\[1.6mm]
+    {\sffamily\bfseries\huge\textcolor{white}{#3}}\\[2.2mm]
+    {\sffamily\normalsize\textcolor{white!88}{#4}}\\[3.4mm]
+    {\sffamily\footnotesize\textcolor{white}{\faRegularClock\ \ Estimated study time: \textbf{#5}}}
+  \end{tcolorbox}\par\vspace{3mm}%
+}
+% robust clock (regular style may vary): alias
+\providecommand{\faRegularClock}{\faClock}
+
+% learning objectives box
+\newtcolorbox{objectives}{enhanced,breakable,
+  colback=cAccent!7, colframe=cAccent, boxrule=0.7pt, leftrule=3.4pt, arc=1.4mm,
+  left=3.2mm,right=3.2mm,top=2.6mm,bottom=2.6mm,
+  coltitle=cInk, colbacktitle=cAccent!22, fonttitle=\sffamily\bfseries\small,
+  title={\faBullseye\enspace By the end of this day, you will be able to\ldots}}
+
+% =====================================================================
+%  HEADERS / FOOTERS
+% =====================================================================
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\footnotesize\sffamily\color{cInk!58}\nouppercase{\leftmark}}
+\fancyhead[R]{\footnotesize\sffamily\color{cInk!58}The DevOps Engineer's Lab Notebook}
+\fancyfoot[C]{\footnotesize\sffamily\color{cInk!55}\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancyhead[L]{\footnotesize\sffamily\color{cInk!58}\nouppercase{\leftmark}%
+  \protect\raisebox{-3mm}{\protect\makebox[0pt][l]{\protect\color{cRule}\protect\rule{\headwidth}{0.4pt}}}}
+
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\footnotesize\sffamily\color{cInk!55}\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+% paragraph spacing for readability
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2.6pt plus 1pt}
+\linespread{1.045}
+
+% line-breaking safeguards (prevents long inline-code tokens overflowing the margin)
+\tolerance=1400
+\hbadness=2500
+\emergencystretch=2.4em
+\hyphenpenalty=200
+\pretolerance=1200
+
+% spacing niceties
+\setlist{topsep=2pt,partopsep=0pt}
+\raggedbottom

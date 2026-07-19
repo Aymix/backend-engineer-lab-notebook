@@ -1,0 +1,238 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ APPENDICES ============================
+\newcommand{\appheading}[3]{%
+  \clearpage\phantomsection
+  \addcontentsline{toc}{chapter}{\texorpdfstring{\textbf{Appendix #1}\, — #2}{Appendix #1 — #2}}%
+  \markboth{Appendix #1 \ \textbullet\ \ #2}{}%
+  \begin{tcolorbox}[enhanced, breakable=false, colback=cBrand, colframe=cBrandDeep,
+      boxrule=0pt, arc=2.2mm, left=6mm,right=6mm,top=5mm,bottom=5.5mm,
+      overlay={\node[anchor=north east, font=\sffamily\bfseries, text=white!12,
+         scale=4.6] at ([xshift=-3mm,yshift=2mm]frame.north east) {#1};}]
+    {\sffamily\bfseries\footnotesize\textcolor{cAccent}{\MakeUppercase{Appendix #1}}}\\[1.6mm]
+    {\sffamily\bfseries\huge\textcolor{white}{#2}}\\[2.2mm]
+    {\sffamily\normalsize\textcolor{white!88}{#3}}
+  \end{tcolorbox}\par\vspace{3mm}%
+}
+\newcommand{\qa}[2]{%
+  \par\addvspace{2.2mm}%
+  \noindent{\sffamily\bfseries\color{cInterview}\faAngleRight\ #1}\par
+  \noindent#2\par}
+\newcommand{\gterm}[2]{\par\addvspace{1.4mm}\noindent{\sffamily\bfseries\color{cBrandDeep}#1}\ \textemdash\ #2\par}
+
+% ---------------------------------------------------------------- APPENDIX A
+\appheading{A}{DevOps Interview Cheat Sheet}{The mechanism behind the tool --- review this before every interview}
+
+Interviewers at the junior/mid level test \emph{judgment} as much as tool syntax: the ability to explain why a
+decision was made, not recite a flag. Every answer below states the mechanism. Read a question, answer it
+out loud from memory, then check yourself.
+
+\wbsub{Linux}
+\qa{What is PID 1 responsible for?}{PID 1 (\code{systemd} on modern distros) is the first userspace process the kernel starts. It reaps orphaned processes and starts every other service in dependency order.}
+\qa{Hard link vs symlink?}{A hard link is a second directory entry pointing at the same inode --- the same file, and it survives the original being deleted. A symlink is a separate file containing a path, and it breaks if the target moves.}
+\qa{Why does SIGKILL risk data corruption that SIGTERM does not?}{SIGKILL is handled by the kernel and cannot be caught, so the process gets no chance to flush buffers, close files or release locks before dying.}
+\qa{What does load average actually mean?}{The average number of processes running or waiting on CPU/IO over 1/5/15 minutes. A load average above the core count means work is queued.}
+
+\wbsub{Git}
+\qa{Merge vs rebase --- the mechanical difference?}{Merge creates a new commit joining two histories, rewriting nothing. Rebase replays commits onto a new base, generating new commit hashes and a linear history.}
+\qa{Why is \code{-{}-force-with-lease} safer than \code{-{}-force}?}{It refuses to push if the remote branch has commits you have not fetched, preventing you from silently overwriting a teammate's work.}
+\qa{How do you find which commit introduced a bug?}{\code{git bisect} --- a binary search between a known-good and known-bad commit, testing each candidate until it isolates the exact one.}
+
+\wbsub{Docker}
+\qa{Image vs container?}{An image is a read-only, layered template; a container is a running (or stopped) instance of that image plus one writable layer on top.}
+\qa{Why do multi-stage builds reduce attack surface, not just size?}{Build tools, compilers and dev dependencies never ship in the final image --- fewer packages for a scanner to flag, and fewer tools available to an attacker who gets a shell.}
+\qa{CMD vs ENTRYPOINT?}{\code{ENTRYPOINT} defines the fixed executable that always runs; \code{CMD} supplies default arguments that can be overridden at \code{docker run} time.}
+
+\wbsub{Kubernetes}
+\qa{What actually happens when you run \code{kubectl apply}?}{\code{kubectl} sends the desired state to the API server, which persists it to etcd. Controllers then reconcile actual cluster state toward that desired state, asynchronously.}
+\qa{Why does a Service keep working when Pods are replaced?}{A Service selects Pods dynamically by label, not by a fixed IP list --- as old Pods die and new ones start, the endpoint list updates automatically.}
+\qa{Liveness vs readiness, concretely?}{Liveness failing restarts the container. Readiness failing only removes it from load balancing. Conflating the two turns a slow dependency into a restart storm.}
+\qa{What is a DaemonSet for?}{Ensuring exactly one copy of a Pod runs on every (or every matching) node --- used for node-level agents such as log shippers and monitoring agents.}
+
+\wbsub{Terraform}
+\qa{Why can Terraform not work correctly without state?}{State is the only record mapping configuration blocks to the real IDs of what was created. Without it, Terraform cannot tell what exists from what needs creating.}
+\qa{What does \code{terraform plan} actually do?}{Refreshes real resource state, computes the diff against the desired configuration, and prints exactly what would change --- without touching anything.}
+\qa{Why remote state with locking instead of local?}{A team needs one source of truth. Without a lock, two simultaneous applies can corrupt the state file or make conflicting changes.}
+
+\wbsub{CI/CD}
+\qa{Continuous Delivery vs Continuous Deployment?}{Delivery means every passing build is one click from production. Deployment removes the click and ships automatically.}
+\qa{Why tag images by commit SHA instead of \code{latest}?}{Every deployed artifact is traceable to the exact source commit, and rollback means redeploying a known-good tag rather than guessing what \code{latest} currently points at.}
+\qa{Why promote the same image across environments instead of rebuilding?}{Rebuilding risks a different dependency resolution or base-image patch sneaking in between builds --- exactly the drift a tested pipeline exists to eliminate.}
+
+\wbsub{AWS \& Cloud}
+\qa{Why put a database in a private subnet?}{Private subnets have no route to an internet gateway, so nothing on the internet can reach the database directly regardless of security-group rules. It is a second layer of defence, not the only one.}
+\qa{Why prefer IAM roles over access keys for compute identity?}{Roles issue short-lived, automatically rotated credentials scoped to the resource. A static access key is a permanent secret that works from anywhere the moment it leaks.}
+\qa{Multi-AZ vs read replica?}{Multi-AZ is synchronous replication for automatic failover (availability). A read replica is asynchronous replication for scaling reads. Different problems --- often combined.}
+
+\wbsub{Monitoring \& Observability}
+\qa{Why does p99 latency matter more than average latency?}{Averages smooth outliers into invisibility. p99 exposes the tail of genuinely slow requests, which is where real user pain and SLO breaches live.}
+\qa{What is an error budget, practically?}{The allowed amount of SLO violation over a period. Once it is spent, team priority should shift from shipping features to reliability work.}
+\qa{Counter vs gauge?}{A counter only increases (resetting on restart); a gauge moves freely up and down. Using a gauge where a counter belongs breaks \code{rate()} calculations.}
+
+\wbsub{Security}
+\qa{First move when a secret is committed and pushed?}{Treat it as compromised immediately --- rotate or revoke it --- \emph{then} separately clean git history. Deleting the file in a later commit does not remove it from history.}
+\qa{Why run SAST, dependency scanning and image scanning as three separate gates?}{Each catches a different class of risk: insecure code you wrote, known CVEs in libraries you depend on, and known CVEs in the OS packages baked into the image. No single scan covers all three.}
+\qa{What does a Kubernetes NetworkPolicy actually restrict?}{Pod-to-pod traffic by label selector. By default every Pod can reach every Pod; a NetworkPolicy is what limits lateral movement if one is compromised.}
+
+\wbsub{System Design \& Troubleshooting}
+\qa{How would you scale a read-heavy API?}{Add a cache in front of the database, add read replicas, and consider CDN caching for public/static data before scaling the database vertically.}
+\qa{The app is intermittently returning 5xx --- what is your process?}{Check dashboards for error-rate/latency spikes correlated with a deploy or traffic change; check logs by correlation ID; check downstream dependency health; check resource saturation (CPU, memory, connection pool, disk).}
+\qa{How do you safely roll back a bad deploy under pressure?}{Redeploy the last known-good, SHA-tagged image. Never rebuild from source under incident pressure --- which is exactly why CI/CD promotes immutable, tagged artifacts.}
+\qa{Vertical vs horizontal scaling?}{Vertical is a bigger machine: simple, but with a ceiling and a single point of failure. Horizontal is more machines behind a load balancer, which requires statelessness to work.}
+
+\begin{seniornote}
+The candidates who get offers are not the ones who recite the most flags. They are the ones who can say
+``here is the trade-off I made, and here is what I would do differently at ten times the scale.'' That sentence
+is worth more than a perfect, over-engineered capstone. Practise answering every question above with a
+\emph{because}.
+\end{seniornote}
+
+% ---------------------------------------------------------------- APPENDIX B
+\appheading{B}{The CloudBase Build-Along Master Tracker}{One platform, fourteen increments --- tick each as you finish it}
+
+Your single source of truth for the capstone. By Day 14, \code{terraform apply} should bring up the whole
+environment from a clean state and the pipeline should deploy into it unattended.
+
+\wbsub{Phase 1 --- Foundations (Days 1--3)}
+\begin{checklist}
+  \item \textbf{Day 1:} Base host --- strict-mode \code{bootstrap.sh}, dedicated non-root service user, \code{/opt/cloudbase} with correct modes, systemd unit with a restart policy, verified via \code{journalctl}.
+  \item \textbf{Day 2:} Repo conventions --- branch protection on \code{main} (passing CI + one review), \code{CODEOWNERS}, commit convention, pre-commit hook blocking secret patterns.
+  \item \textbf{Day 3:} Network design on paper --- one /16 VPC, public and private subnets across two AZs, a bastion as the single audited SSH entry point, least-privilege security groups.
+\end{checklist}
+
+\wbsub{Phase 2 --- Containers \& Orchestration (Days 4--6)}
+\begin{checklist}
+  \item \textbf{Day 4:} Hardened multi-stage Dockerfile --- non-root \code{USER}, pinned base tag, \code{.dockerignore}, layers ordered for cache reuse.
+  \item \textbf{Day 5:} Kubernetes deployment --- Deployment with resource requests/limits, Service, ConfigMap and Secret, separated liveness and readiness probes.
+  \item \textbf{Day 6:} Production Kubernetes --- Helm chart with per-environment values, Ingress with TLS termination, HPA, least-privilege RBAC.
+\end{checklist}
+
+\wbsub{Phase 3 --- Infrastructure as Code \& Delivery (Days 7--10)}
+\begin{checklist}
+  \item \textbf{Day 7:} Terraform --- VPC, subnets, IGW, NAT gateway and route tables in code, with a remote backend and state locking.
+  \item \textbf{Day 8:} Ansible --- an idempotent role replacing \code{bootstrap.sh}, per-environment inventory, secrets in Vault.
+  \item \textbf{Day 9:} CI/CD --- test $\rightarrow$ scan $\rightarrow$ build $\rightarrow$ push, SHA-tagged images, secrets from the CI store, manual gate before production.
+  \item \textbf{Day 10:} AWS --- ALB as the only public entry, cluster compute, RDS in private subnets, least-privilege IAM roles rather than static keys.
+\end{checklist}
+
+\wbsub{Phase 4 --- Operate It Like Production (Days 11--14)}
+\begin{checklist}
+  \item \textbf{Day 11:} Observability --- Prometheus and Grafana, structured logs with correlation IDs, one real SLO with an alert tied to it.
+  \item \textbf{Day 12:} Security --- secrets in a manager or Vault, image scanning as a blocking gate, default-deny NetworkPolicies, IAM/RBAC audit.
+  \item \textbf{Day 13:} GitOps --- Argo CD (or Flux) reconciling from git, a canary rollout gated on the Day 11 metrics, and a \emph{rehearsed} rollback.
+  \item \textbf{Day 14:} Capstone --- full assembly, a disaster-recovery restore drill, an operational runbook, and an architecture review.
+\end{checklist}
+
+\begin{buildalong}[Final completion checklist]
+\begin{checklist}
+  \item All 13 prior days' concepts are represented somewhere in this infrastructure.
+  \item \code{terraform apply} brings up the full environment from a clean state.
+  \item The CI/CD pipeline is green and gates on tests plus security scans.
+  \item A dashboard and at least one real alert exist and reflect actual SLOs.
+  \item Secrets exist in a secrets manager --- never in git, never in the image.
+  \item A rollback has been rehearsed, not just designed.
+  \item The README explains architecture \emph{decisions} and trade-offs, not just how to run it.
+\end{checklist}
+\end{buildalong}
+
+% ---------------------------------------------------------------- APPENDIX C
+\appheading{C}{Command \& Manifest Quick Reference}{The commands you will actually reach for, grouped by tool}
+
+\wbsub{Linux triage}
+\begin{bashbox}[the first five minutes of an incident]
+uptime                                  # load average: 1/5/15 min
+ps aux --sort=-%cpu | head              # top CPU consumers
+df -h && sudo lsof +L1                  # disk full? deleted-but-open files?
+journalctl -u <unit> -p err --since "1 hour ago"
+ss -tulpn                               # what is listening on which port
+\end{bashbox}
+
+\wbsub{Git recovery}
+\begin{bashbox}[when something went wrong]
+git reflog                              # every HEAD position - your undo history
+git revert <sha>                        # safe on shared branches
+git bisect start / bad / good <sha>     # binary-search a regression
+git push --force-with-lease             # never bare --force
+\end{bashbox}
+
+\wbsub{Docker}
+\begin{bashbox}[build, inspect, debug]
+docker build -t app:$(git rev-parse --short HEAD) .
+docker history <image>                  # see layer sizes - find the bloat
+docker run --rm -it --entrypoint sh <image>
+docker logs -f --tail 100 <container>
+docker system df && docker system prune # reclaim disk
+\end{bashbox}
+
+\wbsub{Kubernetes}
+\begin{bashbox}[the debugging loop]
+kubectl get pods -o wide --sort-by=.status.startTime
+kubectl describe pod <pod>              # EVENTS at the bottom - read these first
+kubectl logs <pod> -c <container> --previous   # logs from the crashed instance
+kubectl exec -it <pod> -- sh
+kubectl get events --sort-by=.lastTimestamp
+kubectl rollout status/undo deployment/<name>
+\end{bashbox}
+
+\wbsub{Terraform}
+\begin{bashbox}[the safe loop]
+terraform init -backend-config=env/prod.hcl
+terraform plan -out=tfplan              # ALWAYS plan to a file
+terraform apply tfplan                  # apply exactly what you reviewed
+terraform state list / show <addr>
+terraform force-unlock <lock-id>        # only when you are certain
+\end{bashbox}
+
+\wbsub{Ansible}
+\begin{bashbox}[idempotency in practice]
+ansible-inventory --list -i inventory/prod
+ansible-playbook site.yml --check --diff   # dry run, show changes
+ansible-playbook site.yml --limit web --tags nginx
+ansible-vault edit group_vars/prod/vault.yml
+\end{bashbox}
+
+% ---------------------------------------------------------------- APPENDIX D
+\appheading{D}{Glossary of Key Terms}{The vocabulary of a DevOps engineer, in plain language}
+
+\begin{multicols}{2}
+\small
+\gterm{Namespace (Linux)}{Kernel feature giving a process an isolated \emph{view} of a resource (PIDs, network, mounts). One half of what a container is.}
+\gterm{cgroup}{Kernel feature limiting and accounting a process group's CPU, memory and IO. The other half of a container.}
+\gterm{PID 1}{First userspace process; reaps orphans and supervises services. In a container, your app usually is PID 1.}
+\gterm{SIGTERM / SIGKILL}{Catchable, graceful stop versus uncatchable kernel kill. Exit 137 = 128 + 9 = SIGKILL.}
+\gterm{Idempotency}{Running an operation again produces the same state. The property that makes automation safe to re-run.}
+\gterm{Image layer}{An immutable, content-addressed filesystem diff. Cached and shared between images.}
+\gterm{Multi-stage build}{A Dockerfile that builds in one stage and copies only artifacts into a lean runtime stage.}
+\gterm{Control plane}{Kubernetes API server, scheduler, controller manager and etcd --- the brain that records and reconciles desired state.}
+\gterm{Reconciliation loop}{A controller continuously driving actual state toward desired state. The core idea of Kubernetes and GitOps.}
+\gterm{Liveness vs readiness}{Liveness failure restarts the container; readiness failure only removes it from load balancing.}
+\gterm{Service / Ingress}{A Service gives stable in-cluster networking by label selector; an Ingress is an HTTP reverse proxy for external traffic, usually terminating TLS.}
+\gterm{HPA}{Horizontal Pod Autoscaler --- scales replica count from a metric ratio.}
+\gterm{Helm chart}{A templated, versioned package of Kubernetes manifests with per-environment values.}
+\gterm{Terraform state}{The map from configuration to real resource IDs. Contains secrets --- never commit it.}
+\gterm{Plan / apply}{Plan computes and prints the diff without changing anything; apply executes exactly that diff.}
+\gterm{Drift}{Reality diverging from what the code declares, usually because someone changed it by hand.}
+\gterm{Remote backend}{Shared, locked state storage so a team cannot corrupt state with concurrent applies.}
+\gterm{CIDR}{\code{10.0.0.0/16} --- the prefix length fixes the network portion; the rest addresses hosts. /24 = 254 usable.}
+\gterm{Security group vs NACL}{Stateful, instance-level, allow-only versus stateless, subnet-level, ordered with explicit deny.}
+\gterm{NAT gateway}{Lets private-subnet hosts reach the internet outbound without being reachable inbound. Bills hourly plus per GB.}
+\gterm{Bastion / jump host}{A single hardened, audited SSH entry point to hosts with no public route.}
+\gterm{IAM role vs access key}{A role issues short-lived rotated credentials to a workload; a static key is a permanent secret that works from anywhere.}
+\gterm{Least privilege}{Grant exactly the permissions needed, no more. Explicit deny always wins in IAM evaluation.}
+\gterm{TLS termination}{Decrypting HTTPS at the load balancer or ingress so backends handle plain HTTP inside the trust boundary.}
+\gterm{DNS TTL}{How long resolvers cache an answer. Lower it days before a planned cutover, never during one.}
+\gterm{Artifact promotion}{Building once and moving the same immutable, SHA-tagged image through environments.}
+\gterm{GitOps}{Git as the single source of truth, with an agent continuously reconciling the cluster to match it.}
+\gterm{Blue-green / canary}{Two full environments with an instant switch, versus shifting a small traffic percentage while watching metrics.}
+\gterm{SLI / SLO / error budget}{The measured indicator, the target for it, and the amount of failure you may spend before reliability work takes priority.}
+\gterm{p99 latency}{The 99th percentile --- the slow tail where real user pain lives, invisible in an average.}
+\gterm{Counter vs gauge}{Monotonically increasing versus free-moving. Using the wrong one breaks \code{rate()}.}
+\gterm{Cardinality}{Number of distinct label combinations in a metric. High cardinality is the usual cause of a melted Prometheus.}
+\gterm{NetworkPolicy}{Label-selector firewall for pod-to-pod traffic; without one, everything can reach everything.}
+\gterm{RTO / RPO}{How fast you must recover, and how much data you may lose. Both are business decisions, not technical ones.}
+\end{multicols}
+
+\vspace{4mm}
+\begin{center}\small\itshape\color{cInk!65}
+Good luck --- now go build something, and break it on purpose before production does it for you.
+\end{center}

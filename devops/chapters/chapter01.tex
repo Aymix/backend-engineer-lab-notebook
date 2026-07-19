@@ -1,0 +1,554 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 01 ============================
+\daychapter{01}{Foundations}{Linux \& the Command Line That Actually Matters}%
+{The substrate every container, cluster and cloud VM is standing on}{8--9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Navigate and reason about the Linux filesystem hierarchy like an operator, not a tourist.
+  \item Read and set permissions and ownership correctly --- including SUID and the sticky bit.
+  \item Manage processes and signals, and say exactly what each signal does to a running program.
+  \item Write and enable \code{systemd} units, and read their logs with \code{journalctl}.
+  \item Write shell scripts that fail loudly instead of silently corrupting state.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} Every abstraction you will build in the next thirteen days --- a container, a pod, a Terraform-provisioned EC2 instance, a CI runner --- is a Linux process with a Linux filesystem, Linux permissions and Linux signals underneath it. When a container exits with code 137, when a pod refuses to start because a mounted file is \code{root}-owned, when a deploy script silently deletes the wrong directory, the explanation is never in the tool's documentation. It is here.
+
+\glabel{Why DevOps engineers need it.} Tools change every few years; the kernel interface does not. An engineer who understands processes, file descriptors and signals can debug Docker, Kubernetes, systemd and a CI runner with the same mental model. An engineer who only knows \code{kubectl} is stuck the moment the abstraction leaks --- and abstractions always leak in production.
+
+\begin{keyidea}
+Containers are not small virtual machines. They are ordinary Linux processes with restricted views of the filesystem, the network and the process table. Everything you learn today is what a container actually \emph{is} --- which is why Day 4 will feel like a re-reading of this chapter rather than a new topic.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Linux is the bottom layer of the entire stack you are about to build. Read the diagram upward: nothing above works if the layer below is misunderstood.
+
+\begin{wbfigure}{Fig 1.0 — Where today sits. Every layer above is a Linux process with a restricted view of this one.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=62mm, minimum height=7.4mm, align=left, text width=56mm}]
+  \node[lyr, wbboxops] (obs) {\textbf{Observability} \hfill \scriptsize Day 11};
+  \node[lyr, wbboxk8s, below=of obs] (k8s) {\textbf{Kubernetes} \hfill \scriptsize Day 5--6};
+  \node[lyr, below=of k8s] (docker) {\textbf{Containers (Docker)} \hfill \scriptsize Day 4};
+  \node[lyr, wbboxcloud, below=of docker] (cloud) {\textbf{Cloud VMs \& networking} \hfill \scriptsize Day 3, 10};
+  \node[lyr, wbboxaccent, below=of cloud] (linux) {\textbf{Linux: processes · files · signals} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxghost, below=of linux] (kernel) {\textbf{Kernel: namespaces · cgroups} \hfill \scriptsize Day 4 internals};
+  \foreach \a/\b in {obs/k8s,k8s/docker,docker/cloud,cloud/linux,linux/kernel}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=5mm of linux, text width=24mm, anchor=west] {every layer above resolves to this};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Where companies use it in production.} Netflix runs its streaming control plane on tens of thousands of Linux instances and built its own base AMI tooling so that every machine boots from one hardened, reproducible image. Cloudflare's edge is Linux boxes running tuned kernel networking. Google's Borg --- the ancestor of Kubernetes --- is a scheduler placing Linux processes into cgroups. In all three the operational skill is identical: read the process table, read the logs, understand what the kernel is enforcing.
+
+\glabel{Common misconceptions.} That "Linux knowledge" means memorising commands (it means understanding the process and file model); that \code{root} is the answer to a permissions problem (it is usually the question); that a container isolates a process completely (it isolates a \emph{view}, and by default shares the kernel).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 1.1 — The Day 1 territory: the kernel exposes resources as files, processes act on them, systemd supervises, and the shell composes it all.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 7mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (kernel) {Kernel};
+  \node[wbbox, right=10mm of kernel] (fs) {Filesystem\\one tree from /};
+  \node[wbbox, above=8mm of fs] (proc) {Processes\\PID · state};
+  \node[wbbox, below=8mm of fs] (perm) {Permissions\\user · group · mode};
+  \draw[wbarrow] (kernel)--(proc); \draw[wbarrow] (kernel)--(fs); \draw[wbarrow] (kernel)--(perm);
+  \node[wbboxops, right=9mm of proc] (sig) {Signals\\TERM · KILL};
+  \node[wbboxops, right=9mm of fs] (systemd) {systemd\\units · journald};
+  \node[wbbox, right=9mm of perm] (fd) {File descriptors\\0 · 1 · 2};
+  \draw[wbarrow] (proc)--(sig); \draw[wbarrow] (proc)--(systemd); \draw[wbarrow] (fs)--(fd);
+  \node[wbboxgood, right=9mm of systemd] (shell) {Shell scripting\\pipes · strict mode};
+  \draw[wbarrow] (sig)--(shell); \draw[wbarrow] (systemd)--(shell); \draw[wbarrow] (fd)--(shell);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{everything is a file} $\rightarrow$ \keyterm{file descriptor} $\rightarrow$ \keyterm{process} $\rightarrow$ \keyterm{signal} $\rightarrow$ \keyterm{init (systemd)} $\rightarrow$ \keyterm{unit} $\rightarrow$ \keyterm{journal} $\rightarrow$ \keyterm{pipeline}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Filesystem Hierarchy \& Why Everything Is a File}
+
+\glabel{What is it?} Linux organises the entire system as a single tree rooted at \code{/}. There is no \code{C:}\ drive; a second disk is \emph{mounted} into the tree at some path.
+
+\glabel{Why does it exist?} A single namespace means one set of tools works everywhere. Before this convention, every resource type needed its own API. By modelling devices, sockets and pipes as files, the kernel gives you \emph{one} interface --- \code{open}, \code{read}, \code{write}, \code{close} --- for everything.
+
+\glabel{How does it work internally?} Directories map names to inodes; inodes hold metadata and block pointers. Some filesystems are not on disk at all: \code{/proc} is generated by the kernel on read. \code{/proc/cpuinfo} does not exist until you read it --- the kernel synthesises the bytes at that moment. This is why \code{/proc} is the canonical place to inspect live kernel state.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} X@{}}
+\wbtablehead{Path} & \wbtablehead{What lives there, and why you will care}\\
+/etc & System-wide configuration, plain text. Config drift lives here (Day 8 fixes it with Ansible).\\
+/var & Data that changes at runtime --- logs, caches, spools. \textbf{This is what fills up disks.}\\
+/home & User data.\\
+/usr & Installed software and its resources.\\
+/opt & Third-party, self-contained packages.\\
+/tmp & Wiped on reboot. Never durable storage.\\
+/proc & Not a real filesystem --- a live window into kernel state; every PID is a directory.\\
+\end{tabularx}
+\end{center}
+
+\begin{behind}
+When you run \code{ps aux}, nothing scans memory. \code{ps} walks \code{/proc}, reading one directory per PID and parsing text the kernel generated on demand. The process table \emph{is} a filesystem. This is also how container tools inspect processes --- and why a container with a restricted \code{/proc} mount cannot see the host's processes.
+\end{behind}
+
+\wbsub{3.2\quad Permissions, Ownership \& the Bits Engineers Get Wrong}
+
+\glabel{What is it?} Every file carries three permission triads --- owner, group, other --- each with read, write and execute (\code{rwx}). \code{chmod 750 deploy.sh} sets owner\,=\,rwx, group\,=\,r-x, other\,=\,none.
+
+\glabel{Why does it exist?} Multi-user systems needed a cheap, kernel-enforced answer to "who may touch this?" that did not require consulting a central service on every syscall. Three triads and nine bits fit in the inode.
+
+\glabel{How does it work internally?} On a \emph{directory}, the bits mean something different from a file, and this is the single most common source of confusion: \code{r} lists names, \code{w} creates/deletes entries, and \code{x} means "may traverse into it". A directory with read but no execute lets you list filenames but not \code{cd} into it or \code{stat} anything inside.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{28mm} X L{30mm}@{}}
+\wbtablehead{Symbol} & \wbtablehead{Meaning} & \wbtablehead{Common use}\\
+-rw-r-\,-r-\,- & Owner read/write; group and other read-only & Config files, source\\
+-rwxr-xr-x & Owner full; everyone may read/execute & Scripts, binaries\\
+drwxr-x-\,-\,- & Directory; group may enter but not write & Shared team directories\\
+chmod u+s & SUID --- runs as the file's \emph{owner}, not the invoker & \code{passwd}\\
+chmod +t & Sticky bit --- only the file's owner may delete it & \code{/tmp}\\
+\end{tabularx}
+\end{center}
+
+\code{umask} subtracts permission bits from every newly created file (the common default \code{022} strips write from group and other). \code{chown user:group file} changes ownership --- only \code{root} can give a file away.
+
+\begin{secwarn}[why chmod 777 is almost never the fix]
+\code{chmod 777} says "any user or process on this host may read, modify and execute this." It resolves the symptom because it removes all enforcement. The correct move is to read the actual bits, identify which \emph{identity} needs access, and grant that. This exact reflex is what Day 12's least-privilege IAM work is about --- the principle is identical, only the enforcement point moves to the cloud.
+\end{secwarn}
+
+\begin{prodtip}
+Prefer \code{sudo <command>} over an interactive root shell. Every invocation is logged with the real username, and \code{/etc/sudoers} can scope it to specific commands. "Who ran this?" is answerable afterwards --- which matters enormously during an incident review.
+\end{prodtip}
+
+\wbsub{3.3\quad Processes, Signals \& systemd}
+
+\glabel{What is it?} Every running program is a process with a PID, a parent PID and a state (running, sleeping, zombie, stopped). \code{kill} does not "kill" --- it \emph{sends a signal}, and the process decides how to react.
+
+\glabel{Why does it exist?} Signals are the kernel's minimal asynchronous notification mechanism: a way to tell a process something happened without a shared channel. They predate sockets and pipes as an IPC method.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} C{14mm} X@{}}
+\wbtablehead{Signal} & \wbtablehead{Number} & \wbtablehead{Behaviour}\\
+SIGHUP & 1 & Traditionally "reload config" --- many daemons trap it instead of dying.\\
+SIGINT & 2 & What Ctrl+C sends. Catchable.\\
+SIGTERM & 15 & Polite shutdown request; the process can clean up. \textbf{The default for \code{kill}, and what Docker and Kubernetes send first.}\\
+SIGKILL & 9 & Immediate, uncatchable termination by the kernel. No cleanup, no flushed buffers.\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 1.2 — The shutdown path Docker and Kubernetes both follow. The grace period is the whole game.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=58mm, minimum height=7.2mm, align=left, text width=52mm}]
+  \node[stg] (a) {\textbf{1 · SIGTERM sent} \hfill \scriptsize "please stop"};
+  \node[stg, wbboxgood, below=of a] (b) {\textbf{2 · App cleans up} \hfill \scriptsize close conns, flush, drain};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · Grace period} \hfill \scriptsize terminationGracePeriodSeconds};
+  \node[stg, wbboxwarn, below=of c] (d) {\textbf{4 · SIGKILL} \hfill \scriptsize only if still alive};
+  \foreach \x/\y in {a/b,b/c,c/d}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=5mm of b, text width=26mm, anchor=west] {this step is what you are protecting};
+  \node[wbcap, right=5mm of d, text width=26mm, anchor=west] {exit code 137 = 128 + 9};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{reliability}
+A process killed with \code{-9} cannot close database connections, flush write buffers or remove lock files --- this is precisely how you get corrupted files and orphaned locks. Always try SIGTERM and allow a grace period. When you see a container exit \code{137} in Day 4, you now know it means SIGKILL: the app ignored or outlasted its grace period.
+\end{reliability}
+
+\glabel{How does it work internally? (systemd)} \code{systemd} is PID 1: the first userspace process the kernel starts, and the ancestor of everything else. It reads declarative \emph{unit} files, resolves a dependency graph between them, starts services in a valid order, restarts them on failure, and captures their stdout/stderr into the journal.
+
+\begin{propsbox}[/etc/systemd/system/cloudbase-api.service]
+[Unit]
+Description=CloudBase API
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/java -jar /opt/cloudbase/app.jar
+Restart=on-failure
+RestartSec=5
+User=cloudbase
+EnvironmentFile=/etc/cloudbase/env
+
+[Install]
+WantedBy=multi-user.target
+\end{propsbox}
+
+\begin{bashbox}[managing the unit]
+sudo systemctl daemon-reload        # re-read unit files after ANY edit
+sudo systemctl enable --now cloudbase-api
+journalctl -u cloudbase-api -f      # follow live logs
+systemctl status cloudbase-api      # state, PID, recent log lines
+\end{bashbox}
+
+\begin{misconception}
+Editing a unit file does not change anything by itself. \code{systemd} caches the parsed unit graph in memory; without \code{systemctl daemon-reload} it keeps running the old definition. "I changed the config and nothing happened" is nearly always a missing \code{daemon-reload}.
+\end{misconception}
+
+\glabel{When should I use it?} Anything that must survive a reboot, restart on crash, start in a defined order, or have its logs collected --- which is essentially every long-running service on a VM.
+
+\glabel{When should I \emph{not}?} Inside a container. A container should run one foreground process as PID 1 so the runtime's signals reach it directly. Running \code{systemd} inside a container re-introduces the supervision layer the orchestrator is already providing --- that is Kubernetes' job from Day 5 onward.
+
+\wbsub{3.4\quad Shell Scripting Engineers Actually Write}
+
+\glabel{Why does it exist?} Most production shell is \emph{glue}: deploy steps, cron jobs, CI helpers, container entrypoints. It runs unattended, which means nobody is watching when it fails.
+
+\glabel{How does it work internally?} Bash's defaults are optimised for interactive use, where a failed command is obvious because you see it. Unattended, those same defaults silently swallow the failures you most need to know about. Strict mode reverses them.
+
+\begin{bashbox}[bootstrap.sh]
+#!/usr/bin/env bash
+set -euo pipefail
+# -e            exit immediately if any command fails
+# -u            treat an unset variable as an error, not an empty string
+# -o pipefail   a failure anywhere in a pipe fails the whole pipe
+
+ENVIRONMENT="${1:?Usage: bootstrap.sh <environment>}"
+LOG_FILE="/var/log/bootstrap-${ENVIRONMENT}.log"
+
+log() { echo "[$(date -Is)] $*" | tee -a "$LOG_FILE"; }
+
+main() {
+  log "Bootstrapping ${ENVIRONMENT}"
+  systemctl restart cloudbase-api || { log "restart failed"; exit 1; }
+}
+
+main "$@"
+\end{bashbox}
+
+\begin{secwarn}[the two failures strict mode prevents]
+Without \code{-u}, \code{rm -rf "\$PREFIX/"} with \code{PREFIX} unset expands to \code{rm -rf /}. Without \code{-e}, \code{cd /some/typo-path \&\& rm -rf ./*} carries on after the failed \code{cd} and deletes the \emph{current} directory. Without \code{pipefail}, \code{grep pattern file | wc -l} reports success (the exit code of \code{wc}) even if \code{grep} crashed. These are not hypotheticals; they are recurring outage post-mortems.
+\end{secwarn}
+
+\wbsub{3.5\quad Pipes, Redirection \& Text Processing}
+
+\glabel{How does it work internally?} Every process starts with three open file descriptors: \code{stdin} (0), \code{stdout} (1) and \code{stderr} (2). \code{>} redirects stdout, \code{2>} redirects stderr, and \code{2>\&1} points fd 2 at whatever fd 1 currently is. A pipe \code{|} is a kernel buffer wiring one process's fd 1 to the next process's fd 0 --- the two run \emph{concurrently}, not sequentially.
+
+\begin{wbfigure}{Fig 1.3 — A pipeline is concurrent processes joined by kernel buffers, not a sequence of steps.}
+\wbscale{\begin{tikzpicture}[node distance=7mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox] (a) {grep};
+  \node[wbbox, right=of a] (b) {awk};
+  \node[wbbox, right=of b] (c) {sort};
+  \node[wbboxgood, right=of c] (d) {head};
+  \draw[wbarrow] (a)--node[wbcap,above]{fd1$\rightarrow$fd0}(b);
+  \draw[wbarrow] (b)--node[wbcap,above]{pipe}(c);
+  \draw[wbarrow] (c)--node[wbcap,above]{buffer}(d);
+  \node[wbboxghost, below=8mm of b] (err) {stderr (fd 2)\\bypasses the pipe};
+  \draw[wbarrowg] (a.south)--(err);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{bashbox}[log and disk triage pipelines]
+# Top 5 IPs causing 5xx responses in an access log
+grep " 5[0-9][0-9] " access.log | awk '{print $1}' | sort | uniq -c | sort -rn | head -5
+
+# What is filling the disk? Top 10 largest directories under /var
+sudo du -h --max-depth=2 /var 2>/dev/null | sort -rh | head -10
+\end{bashbox}
+
+\begin{seniornote}
+Before reaching for a full observability stack, a senior engineer triages with a pipeline. Prometheus (Day 11) tells you \emph{that} error rate rose; a five-command pipeline over the log tells you \emph{which} endpoint and \emph{which} client, in about twenty seconds, on the box. Both skills matter; the second one is the one juniors skip.
+\end{seniornote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item \code{set -euo pipefail} in every script that runs unattended.
+  \item Use \code{systemd} units for anything that must survive a reboot --- not a \code{nohup \&} hack.
+  \item Read the actual permission bits before running \code{chmod}; grant to an identity, not to everyone.
+  \item Prefer \code{sudo <command>} over an interactive root shell --- it keeps an audit trail.
+  \item Quote every variable expansion (\code{"\$VAR"}); unquoted expansion is how paths with spaces destroy things.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Running \code{rm -rf} with an unquoted variable that can expand to empty.
+  \item Sending SIGKILL by default instead of SIGTERM plus a grace period.
+  \item Editing a unit file without \code{systemctl daemon-reload}, then wondering why nothing changed.
+  \item Treating \code{/tmp} as durable storage --- it is wiped on reboot.
+  \item Reaching for \code{chmod 777} as a first response to any permission error.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. Reproducing a diagram is what moves it from "I recognise that" to "I can explain that under pressure."
+
+\begin{writespace}[Redraw: the SIGTERM $\rightarrow$ grace period $\rightarrow$ SIGKILL shutdown path, and where exit code 137 comes from]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: a four-stage pipeline showing fd 0, 1 and 2, and where stderr goes]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Bootstrap a Production-Shaped Host}
+
+\textbf{Goal.} Provision a fresh Linux box the way a real team would: a dedicated service user, correct ownership, a supervised service, and a script that fails loudly. This becomes CloudBase's base-image prep, referenced again on Day 8 (Ansible) and Day 10 (AWS).
+
+\resetlab
+\labstep{Create a dedicated non-root service user}
+Create a system user (no login shell, no home directory) that the application will run as.
+\labwhy{If the app is compromised, the blast radius is that user's permissions. Running as root means the blast radius is the whole host --- the same reasoning drives non-root containers on Day 4.}
+
+\labstep{Lay out the application directory with correct ownership}
+Create \code{/opt/cloudbase}, own it by the service user, and set directory mode \code{750}.
+\labwhy{You are practising "grant to an identity", not "open to everyone". Notice execute on a directory means traverse.}
+
+\labstep{Write the systemd unit}
+Declare \code{ExecStart}, \code{User}, \code{Restart=on-failure}, \code{RestartSec}, and an \code{EnvironmentFile}.
+\labwhy{Declaring restart policy and identity in the unit means the host enforces them --- you are not relying on a human remembering.}
+
+\labstep{Enable, start, and read the journal}
+\code{daemon-reload}, \code{enable --now}, then follow with \code{journalctl -u ... -f}.
+\labwhy{You must be able to answer "is it running and what did it say?" without guessing. This is the same question \code{kubectl logs} answers later.}
+
+\labstep{Prove the restart policy works}
+Kill the process with SIGKILL and watch systemd bring it back. Then \code{systemctl stop} it and observe that it stays down.
+\labwhy{Distinguishing "crashed" from "intentionally stopped" is exactly what Kubernetes probes encode on Day 6.}
+
+\labstep{Wrap it all in a strict-mode bootstrap script}
+Put every step above into \code{bootstrap.sh} with \code{set -euo pipefail} and an environment argument.
+\labwhy{An idempotent, loud-failing script is the bridge to configuration management --- Day 8 replaces it with Ansible, and you will appreciate why.}
+
+\labstep{Break it on purpose}
+Remove \code{set -u}, unset a variable used in a path, and observe what the script does. Then restore it.
+\labwhy{You will never forget strict mode after watching what its absence does once.}
+
+\begin{prodtip}
+Run the script twice. A bootstrap script that fails the second time (because the user already exists) is not production-ready --- \keyterm{idempotency} is the property that lets automation run safely on an unknown starting state. That single idea is the foundation of Terraform (Day 7) and Ansible (Day 8).
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Kubernetes sends SIGTERM, waits, then sends SIGKILL. Why does it not simply send SIGKILL and start a fresh pod immediately --- wouldn't that be faster and more predictable?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+\code{/proc} is generated on read rather than stored on disk. What would break, or become much harder, if the kernel instead wrote process state to a real file every time it changed?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Running as a non-root user is standard advice, yet plenty of production containers still run as root. What makes the correct choice inconvenient, and what does that tell you about how security defaults should be designed?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The service that "restarted successfully" but is serving old config}
+\textbf{Symptom.} A colleague edited \code{cloudbase-api.service} to add an environment variable, ran \code{systemctl restart}, saw no error --- but the app still behaves as before.
+
+\begin{outbox}[systemctl status cloudbase-api]
+* cloudbase-api.service - CloudBase API
+     Loaded: loaded (/etc/systemd/system/cloudbase-api.service; enabled)
+     Active: active (running) since Mon 2026-07-19 09:12:04 UTC; 2min ago
+   Main PID: 2841 (java)
+Warning: The unit file, source configuration file or drop-ins of
+cloudbase-api.service changed on disk. Run 'systemctl daemon-reload'.
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The service is running and restarted cleanly --- but there is a warning about the unit file changing on disk.
+  \item \textbf{Hypothesise.} \code{restart} restarts the process using the \emph{cached} unit definition; the edit was never parsed.
+  \item \textbf{Investigate.} Compare the file on disk with what systemd loaded: \code{systemctl cat cloudbase-api} versus the actual file.
+  \item \textbf{Root cause.} A missing \code{systemctl daemon-reload} --- systemd's in-memory unit graph is stale.
+  \item \textbf{Fix.} \code{sudo systemctl daemon-reload \&\& sudo systemctl restart cloudbase-api}, then confirm the variable is present.
+  \item \textbf{Prevent.} Put \code{daemon-reload} in the deploy script so a human can never skip it --- and treat that warning line as an error in review.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Disk full at 3am, but \code{du} says the disk is nearly empty}
+\textbf{Symptom.} Writes fail with "No space left on device". \code{df} shows 100\% used; \code{du -sh /} totals far less than the disk size.
+
+\begin{outbox}[df -h  /  and  lsof]
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1   50G   50G     0 100% /
+
+COMMAND   PID  USER   FD   TYPE  SIZE/OFF      NODE NAME
+java     2841  cloud  3w   REG  31457280000  (deleted) /var/log/cloudbase/app.log
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{df} (kernel's view) and \code{du} (directory walk) disagree --- a classic signature.
+  \item \textbf{Hypothesise.} A file was deleted while a process still held it open, so its blocks are not freed.
+  \item \textbf{Investigate.} \code{sudo lsof +L1} lists open files with zero links --- here a 30\,GB deleted log still held by the app.
+  \item \textbf{Root cause.} Log rotation deleted the file instead of truncating it; the process kept writing to the open descriptor.
+  \item \textbf{Fix.} Restart (or \code{HUP}) the process to release the descriptor; space returns immediately.
+  \item \textbf{Prevent.} Configure \code{logrotate} with \code{copytruncate} or a proper post-rotate signal --- and alert on disk usage before it reaches 100\%, not at it.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~30 min}
+\textbf{Goal.} Build a signal-handling script and watch each signal's real behaviour.\\
+\textbf{Business context.} Your team keeps losing in-flight work when deploys roll pods.\\
+\textbf{Architecture.} One bash script, one terminal, \code{kill} from a second terminal.\\
+\textbf{Requirements.} Trap SIGTERM and SIGINT, log which arrived, clean up a lock file, exit 0.\\
+\textbf{Constraints.} Do not trap SIGKILL (prove to yourself that you cannot).\\
+\textbf{Hints.} \code{trap 'handler' TERM INT}; use a sleep loop as the workload.\\
+\textbf{Expected outcome.} TERM and INT run cleanup; \code{kill -9} leaves the lock file behind.\\
+\textbf{Production considerations.} This is exactly what a graceful-shutdown hook does in a container.\\
+\textbf{Common pitfalls.} Trapping inside a subshell so the handler never fires.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~50 min}
+\textbf{Goal.} Diagnose a "disk full" incident you create yourself.\\
+\textbf{Business context.} Logging filled a production volume last quarter; you are writing the runbook.\\
+\textbf{Architecture.} One VM (or container), a writer process, a deleted-but-open file.\\
+\textbf{Requirements.} Reproduce the \code{df}/\code{du} discrepancy, find the holder with \code{lsof}, reclaim the space.\\
+\textbf{Constraints.} Do not reboot --- diagnose it live, as you would in production.\\
+\textbf{Hints.} Write with a long-running redirect, then \code{rm} the file while the writer runs.\\
+\textbf{Expected outcome.} A written runbook: symptom, three commands, root cause, fix.\\
+\textbf{Production considerations.} Add the alert threshold you would set, and why not 100\%.\\
+\textbf{Common pitfalls.} Concluding "\code{du} is wrong" instead of understanding open descriptors.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~90 min}
+\textbf{Goal.} Write \code{bootstrap.sh} that provisions a host for CloudBase, safely and repeatably.\\
+\textbf{Business context.} New hosts are provisioned by whoever is on call; results must not vary by person.\\
+\textbf{Architecture.} Fresh VM $\rightarrow$ service user $\rightarrow$ app directory $\rightarrow$ systemd unit $\rightarrow$ enabled service.\\
+\textbf{Requirements.} Strict mode, an environment argument, structured log output, correct ownership and modes, unit installed and enabled.\\
+\textbf{Constraints.} Must be \keyterm{idempotent} --- running it three times leaves the same state and exits 0 every time.\\
+\textbf{Hints.} Guard each step (\code{id -u user \&>/dev/null || useradd ...}); prefer \code{install -d -o -m} over \code{mkdir} plus \code{chmod}.\\
+\textbf{Expected outcome.} Three consecutive runs, all exit 0, host identical each time.\\
+\textbf{Production considerations.} What would you do differently for 500 hosts? (That answer is Day 8.)\\
+\textbf{Common pitfalls.} Hardcoding a path or environment; forgetting \code{daemon-reload}; assuming a clean starting state.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{opsnote}
+The operational question is never "does it run?" but "what happens when it stops?" A service without a restart policy, a log destination and a known shutdown path is not deployed --- it is merely started. Every layer in this book re-asks these three questions.
+\end{opsnote}
+
+\begin{infranote}
+Immutability starts here. The reason teams move from "SSH in and fix it" to rebuilt images (Day 4) and declared infrastructure (Day 7) is that hand-edits on a host are invisible, unversioned and unreproducible. Every manual \code{vim} on a production box is future config drift.
+\end{infranote}
+
+\begin{costnote}
+Unrotated logs are a real cloud bill. Filled volumes trigger emergency disk expansion, and expanded EBS volumes are rarely shrunk afterwards --- so a forgotten \code{logrotate} config quietly becomes permanent monthly spend. Cost discipline starts with mundane hygiene, not with a dashboard.
+\end{costnote}
+
+\begin{interview}
+Expect: \emph{"What is the difference between SIGTERM and SIGKILL, and why does it matter?"} The answer that lands is not the numbers. It is: SIGTERM is catchable so the app can drain connections and flush state; SIGKILL is enforced by the kernel and gives it no chance. Then connect it: that is why orchestrators send TERM first and why exit code 137 means the grace period was exceeded.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Across fourteen days you build \keyterm{CloudBase}: the full production infrastructure and operational tooling around a small containerised API. Today you prepare the ground it runs on.
+
+\begin{buildalong}[Day 1 — the base host]
+\begin{wbitem}
+  \item Create the CloudBase repository and commit a \code{scripts/} directory (Day 2 adds conventions and protection).
+  \item Write \code{bootstrap.sh}: strict mode, environment argument, structured logging.
+  \item Provision a dedicated non-root service user and \code{/opt/cloudbase} with correct ownership and modes.
+  \item Install and enable a \code{systemd} unit for a placeholder service, with \code{Restart=on-failure}.
+  \item Verify with \code{systemctl status} and \code{journalctl -u}, and prove the restart policy by killing the process.
+  \item Document the host's assumptions in \code{docs/host-baseline.md} --- OS version, user, paths, ports.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{bootstrap.sh production} runs cleanly three times in a row on a fresh VM, leaves an enabled service running, and every step is reproducible from the repository with no manual edits.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Everything is a file --- one kernel interface for devices, sockets, pipes and process state.
+  \item \code{/proc} is synthesised on read; it is the live window into the kernel, and how \code{ps} works.
+  \item Permission bits mean something different on directories: execute means \emph{traverse}.
+  \item \code{kill} sends a signal. SIGTERM is catchable and lets the app clean up; SIGKILL is not.
+  \item \code{systemd} declares identity, restart policy and logging --- and caches units until \code{daemon-reload}.
+  \item \code{set -euo pipefail} converts silent corruption into a loud, early failure.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Exit code 137 = 128 + 9 = SIGKILL. You will see it constantly from Day 4 onward.
+  \item \code{df} and \code{du} disagreeing means a deleted file is still held open.
+  \item Idempotency is the property that makes automation safe to re-run --- the seed of Terraform and Ansible.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item \code{chmod 777} as a reflex \quad$\bullet$\quad SIGKILL as a habit \quad$\bullet$\quad missing \code{daemon-reload}
+  \item Unquoted variable expansion \quad$\bullet$\quad treating \code{/tmp} as durable
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Filesystem}{one tree from \code{/}; \code{/var} fills disks; \code{/proc} is live kernel state.}
+\cheatitem{Permissions}{owner/group/other × rwx; on a directory \code{x} = traverse; SUID runs as owner; \code{+t} = only owner deletes.}
+\cheatitem{Signals}{TERM (15) catchable, graceful $\rightarrow$ KILL (9) uncatchable. Exit 137 = SIGKILL.}
+\cheatitem{systemd}{unit declares \code{ExecStart}, \code{User}, \code{Restart}; always \code{daemon-reload} after an edit.}
+\cheatitem{Journald}{\code{journalctl -u <unit> -f} to follow; \code{-p err} to filter by priority.}
+\cheatitem{Strict mode}{\code{set -euo pipefail} --- fail fast, no unset vars, pipes propagate failure.}
+\cheatitem{Descriptors}{0 stdin, 1 stdout, 2 stderr; \code{2>\&1} points stderr at stdout's current target.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 1 commands worth memorising]
+# processes & signals
+ps aux --sort=-%mem | head            # top memory consumers
+kill -15 <pid>                        # polite stop (default)
+kill -9 <pid>                         # last resort, no cleanup
+
+# systemd
+systemctl daemon-reload               # after ANY unit file edit
+systemctl enable --now <unit>         # start now + on boot
+journalctl -u <unit> -f --since "10 min ago"
+
+# permissions
+stat -c '%A %U:%G %n' <file>          # exact mode and ownership
+install -d -o app -g app -m 750 /opt/app
+
+# disk triage
+df -h                                 # kernel's view (authoritative)
+du -h --max-depth=2 /var | sort -rh | head
+sudo lsof +L1                         # deleted-but-open files
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the difference between SIGTERM and SIGKILL, and why does it matter for graceful shutdown?}
+\iq{Walk me through what \code{chmod 640} actually sets.}
+\iq{What is \code{/proc}, and why is it not a real filesystem on disk?}
+\iq{How does \code{systemd} decide the order in which services start?}
+\iq{What does \code{pipefail} change about a shell pipeline's exit code?}
+\iq{Why prefer \code{sudo} over logging in as root?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Filesystem Hierarchy Standard 3.0 --- the specification behind \code{/etc}, \code{/var}, \code{/usr}.
+  \item \code{man 7 signal} --- the authoritative signal list and default dispositions.
+  \item \code{man 5 systemd.service} and \code{man 5 systemd.unit} --- every directive, with defaults.
+  \item \code{man 1 bash}, the "SHELL BUILTIN COMMANDS" section on \code{set}.
+  \item Google SRE Book, "Monitoring Distributed Systems" --- why you alert before saturation, not at it.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Services run as a dedicated non-root user, never \code{root}.
+  \item Every long-running service has a unit with an explicit restart policy.
+  \item Logs go to the journal (or a shipper), never to an unrotated flat file.
+  \item Every unattended script starts with \code{set -euo pipefail} and quotes its variables.
+  \item Provisioning is a script in version control, not steps in someone's memory.
+  \item Disk usage alerts fire well before 100\%.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 2).} You just wrote a script that provisions a host. Tomorrow you make that script --- and everything after it --- \emph{versioned, reviewable and recoverable}: Git's real object model, branching strategies that match a team's release cadence, and what to actually do when a secret is committed and pushed.
+\end{keyidea}

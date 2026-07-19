@@ -3,12 +3,11 @@ Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
 
 Copyright (c) 2026 Aymix
 
-Applies to the workbook content: chapters/*.tex, frontmatter.tex,
-appendix.tex, README.md, and the compiled PDF
-(Java-SpringBoot-Backend-Engineer-14-Day-Companion-Workbook.pdf).
+Applies to the workbook content of BOTH volumes (backend/ and devops/):
+*/chapters/*.tex, */frontmatter.tex, */appendix.tex, */*.pdf and README.md.
 
-The LaTeX design system (preamble.tex, main.tex) is licensed separately under
-the MIT Licence — see LICENSE-CODE.
+The LaTeX design system (*/preamble.tex, */main.tex) is licensed separately
+under the MIT Licence — see LICENSE-CODE.
 
 
 YOU ARE FREE TO

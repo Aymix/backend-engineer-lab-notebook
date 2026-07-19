@@ -1,0 +1,737 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 11 ============================
+\daychapter{11}{Observability}{Monitoring, Logging \& Observability}{Metrics, logs, traces, SLOs and alerts a human will actually act on}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what metrics, logs and traces each answer that the other two cannot --- and why you need all three.
+  \item Describe how Prometheus really works: pull-based scraping, service discovery, and the on-disk time-series database.
+  \item Choose the right metric type, write correct PromQL, and read percentile latency without fooling yourself.
+  \item Emit structured JSON logs carrying a correlation ID that survives a multi-service incident.
+  \item Define an SLI, an SLO and an error budget, and build a burn-rate alert that pages a human only when it matters.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} Ten days of this book have been about \emph{building} a system: a hardened host, containers, a Kubernetes cluster, a CI/CD pipeline, Terraform-managed cloud infrastructure. None of it tells you whether the system is currently doing its job. Observability is the discipline of answering, from the outside and without redeploying anything, three escalating questions: \textbf{is it broken?}, \textbf{how badly, and for whom?}, and \textbf{where exactly?} A system you cannot ask those questions of is not production-ready --- it is a demo that happens to be running.
+
+\glabel{Why DevOps engineers need it.} You will be on call for systems you did not write. At 03:14 the only inputs you have are the signals the system emits. If those signals were designed by someone who understood distributed systems, you will find the cause in ten minutes. If they were not, you will spend two hours SSH-ing into pods reading unstructured text. The difference is entirely decided \emph{before} the incident, by whoever instrumented the code and wrote the alerts. Today you become that person.
+
+\begin{keyidea}
+Monitoring answers questions you thought of in advance. Observability is the property that lets you answer questions you did \emph{not} think of in advance, without shipping new code. The practical test: when a novel failure happens, can you form and check a new hypothesis using data you already have? If every new question needs a new deploy, you have monitoring, not observability.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Observability is not a layer on top of the stack --- it is a sideways plane that reads from every layer at once. The application exposes metrics and logs, the container runtime and kubelet expose their own, the node exposes hardware counters, and the cloud provider exposes load-balancer and database metrics. A collector pulls them together so one query can span all of them.
+
+\begin{wbfigure}{Fig 11.0 — The observability plane reads sideways across every layer you have built since Day 1.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=48mm, minimum height=7mm, align=left, text width=43mm}]
+  \node[lyr, wbboxgood] (app) {\textbf{CloudBase API} \hfill \scriptsize /metrics · JSON logs};
+  \node[lyr, wbboxk8s, below=of app] (k8s) {\textbf{Kubernetes} \hfill \scriptsize kube-state · cAdvisor};
+  \node[lyr, below=of k8s] (node) {\textbf{Nodes (Linux)} \hfill \scriptsize node-exporter};
+  \node[lyr, wbboxcloud, below=of node] (cloud) {\textbf{AWS} \hfill \scriptsize ALB · RDS metrics};
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(app)(k8s)(node)] (cl) {};
+    \node[wbzonelabelk8s, anchor=north west] at (cl.north west) {cluster (Day 5--6)};
+  \end{scope}
+  \node[wbboxops, right=16mm of k8s, minimum width=26mm, text width=22mm, align=center] (prom)
+    {\textbf{Prometheus}\\ scrape · store};
+  \node[wbboxops, above=8mm of prom, minimum width=26mm, text width=22mm, align=center] (graf)
+    {\textbf{Grafana}\\ dashboards};
+  \node[wbboxops, below=8mm of prom, minimum width=26mm, text width=22mm, align=center] (loki)
+    {\textbf{Loki}\\ log streams};
+  \foreach \x in {app,k8s,node,cloud}{\draw[wbarrowg] (\x.east)--(prom.west);}
+  \draw[wbarrow] (prom)--(graf); \draw[wbarrow] (loki)--(graf);
+  \draw[wbarrowg] (app.east) to[out=-20,in=180] (loki.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 taught you that a process writes to file descriptor 1 and that \code{journalctl} reads it --- structured logging is just deciding what bytes go into fd 1. Day 4's container gave every process an ephemeral filesystem, which is exactly why logs must leave the container. Day 5--6's Kubernetes gave you pods that come and go with new IPs every deploy, which is exactly why a monitoring system must \emph{discover} its targets instead of being handed a static list. Day 9's pipeline is what will ship the instrumentation. Day 10's cloud infrastructure is what you are now going to watch.
+
+\glabel{Where companies use it in production.} Cloudflare published that it runs approximately 916 Prometheus instances holding around 4.9 billion active time series --- roughly 5 million per instance, with the largest near 30 million --- deliberately as \emph{many small} Prometheus servers rather than one giant one, then joins them behind a single query layer (Thanos) for global questions. Uber built Jaeger and deployed a \code{jaeger-agent} on every host so application libraries only ever speak to a local UDP port, which removed the service-discovery dependency that was making tracing adoption painful for product teams. Both are the same architectural instinct: push the hard distributed-systems problem into the observability infrastructure so that application engineers can instrument their code in two lines.
+
+\glabel{Common misconceptions.} That collecting more data makes you more observable (it makes you poorer --- cardinality, not volume, is the cost driver); that a dashboard is monitoring (a dashboard nobody opens is a screensaver); that alerting on CPU is useful (users do not experience CPU); that average latency describes user experience (it describes nobody); and that tracing replaces logging (a trace tells you \emph{which} hop was slow, a log tells you \emph{what the code was doing} there).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 11.1 — The Day 11 territory. Instrumentation produces three signal types; a query layer joins them; SLOs decide what is worth waking a human for.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (inst) {Instrumentation\\client library · OTel};
+  \node[wbbox, right=12mm of inst] (met) {Metrics\\counter · gauge · histogram};
+  \node[wbbox, above=7mm of met] (log) {Logs\\structured JSON};
+  \node[wbbox, below=7mm of met] (tr) {Traces\\spans · traceparent};
+  \draw[wbarrow] (inst)--(log); \draw[wbarrow] (inst)--(met); \draw[wbarrow] (inst)--(tr);
+  \node[wbboxops, right=9mm of log] (loki) {Loki / ELK\\label index};
+  \node[wbboxops, right=9mm of met] (prom) {Prometheus\\TSDB · PromQL};
+  \node[wbboxops, right=9mm of tr] (jae) {Jaeger / Tempo\\span store};
+  \draw[wbarrow] (log)--(loki); \draw[wbarrow] (met)--(prom); \draw[wbarrow] (tr)--(jae);
+  \node[wbboxgood, right=9mm of prom] (graf) {Grafana\\correlated view};
+  \draw[wbarrowg] (loki)--(graf); \draw[wbarrow] (prom)--(graf); \draw[wbarrowg] (jae)--(graf);
+  \node[wbboxwarn, right=9mm of graf] (slo) {SLO + error budget\\burn-rate alert};
+  \draw[wbarrow] (graf)--(slo);
+  \node[wbcap, below=4mm of slo, text width=26mm] {the only thing allowed to page a human};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{instrumentation} $\rightarrow$ \keyterm{time series} $\rightarrow$ \keyterm{label / cardinality} $\rightarrow$ \keyterm{scrape} $\rightarrow$ \keyterm{PromQL} $\rightarrow$ \keyterm{histogram bucket} $\rightarrow$ \keyterm{correlation ID} $\rightarrow$ \keyterm{span} $\rightarrow$ \keyterm{SLI} $\rightarrow$ \keyterm{SLO} $\rightarrow$ \keyterm{error budget} $\rightarrow$ \keyterm{burn rate}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Three Pillars --- What Each One Actually Answers}
+
+\glabel{What is it?} Three different shapes of telemetry, each a lossy compression of reality chosen for a different question.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} X L{28mm}@{}}
+\wbtablehead{Signal} & \wbtablehead{What it is, and what it can answer} & \wbtablehead{Cost shape}\\
+Metrics & Numeric time series, aggregated at collection. Answers \emph{is it broken, how much, since when, trending which way}. Cannot answer "what happened to \emph{this} request". & Cheap per event, expensive per unique label combination.\\
+Logs & Discrete events with full context. Answers \emph{what exactly did the code do} for one request. Terrible at "what is the 99th percentile" --- you would have to read everything. & Expensive per event (bytes), cheap per dimension.\\
+Traces & A causally-linked tree of spans across services. Answers \emph{which hop was slow / which service failed} in a request that touched six services. & Expensive; nearly always sampled.\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why does it exist?} Before this vocabulary existed, operations meant Nagios-style \emph{check scripts}: a central server SSH-ing to a box every five minutes to run a script that returned OK, WARNING or CRITICAL. That model works when a service is a named machine. It collapses when a service is forty ephemeral pods that are replaced on every deploy: there is no stable host to check, five-minute resolution hides a two-minute outage entirely, and a boolean verdict cannot express "7\% of requests are failing". Metrics replaced the boolean with a number over time; structured logs replaced \code{grep} over free text with queryable fields; tracing replaced "which of these six services is at fault?" guesswork with a causal tree.
+
+\glabel{How does it work internally?} The three are not independent --- they are joined by \emph{shared identifiers}. A metric carries labels (\code{service}, \code{route}, \code{status}); a log line carries the same labels plus a \code{correlation\_id}; a span carries a \code{trace\_id} that the log line also carries. That shared vocabulary is what turns three tools into one investigation: a latency spike on a graph, click through to the logs for that exact time window and service, find a correlation ID, pivot to the trace, see the 4-second database span. Getting those identifiers consistent across services is 80\% of the engineering work in observability, and it is why OpenTelemetry's \emph{semantic conventions} exist at all.
+
+\begin{whyexists}
+Prometheus was written at SoundCloud in 2012 by engineers who had worked on Google's Borgmon. Borgmon's key insight, carried into Prometheus, was to stop treating a monitored thing as a \emph{host with checks} and start treating it as a \emph{multi-dimensional time series with labels you can query}. Everything else --- the pull model, service discovery, PromQL --- follows from that one reframing.
+\end{whyexists}
+
+\glabel{When should I use them?} Metrics: always, for everything, as the default signal. Logs: always, but structured and rate-limited. Traces: as soon as a single user request crosses more than two services --- and not before, because the instrumentation cost is real.
+
+\glabel{When should I \emph{not}?} Do not add tracing to a monolith to look modern; a well-instrumented histogram per endpoint tells you the same thing for a fraction of the effort. Do not ship every debug log to a hosted log platform "just in case" --- log ingestion bills are one of the most common surprise line items in cloud spend, and nobody ever reads \code{DEBUG} from three weeks ago.
+
+\wbsub{3.2\quad Prometheus Internals --- Pull, Discovery and the TSDB}
+
+\glabel{What is it?} A server that periodically fetches a plain-text page of numbers over HTTP from every target it knows about, stores those numbers as time series in a local database, and lets you query them with PromQL. That is genuinely all it is. An application "supports Prometheus" by serving text like this:
+
+\begin{outbox}[GET /metrics -- the entire exposition format]
+# HELP http_requests_total Total HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{route="/orders",method="POST",status="200"} 48123
+http_requests_total{route="/orders",method="POST",status="500"} 97
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="/orders",le="0.1"} 41022
+http_request_duration_seconds_bucket{route="/orders",le="0.3"} 47510
+http_request_duration_seconds_bucket{route="/orders",le="+Inf"} 48220
+http_request_duration_seconds_sum{route="/orders"} 5121.4
+http_request_duration_seconds_count{route="/orders"} 48220
+\end{outbox}
+
+\glabel{Why does it exist? (the pull model)} In a push model every application must know the address of the monitoring system, hold a connection to it, buffer on failure, and implement backoff --- and a misbehaving app can flood the collector with no way for the collector to say no. Prometheus inverts it: the \emph{server} decides when and how often to fetch, from a list of targets it builds itself. Three consequences matter operationally, and they are the real reason the model wins:
+
+\begin{wbitem}
+  \item \textbf{Target health is free.} If a scrape fails, that is itself a metric (\code{up} goes to 0). In a push model, silence is ambiguous --- did the app die, or is it just idle?
+  \item \textbf{Service discovery is the whole configuration.} Prometheus queries the Kubernetes API (or EC2, or Consul) for the current set of pods matching a selector, and rewrites that list into targets every few seconds. Pods created by a Day 6 rollout are scraped within seconds without anyone editing config.
+  \item \textbf{You can reproduce a scrape by hand.} \code{curl} the \code{/metrics} endpoint and you see exactly what the server sees. Debugging a push pipeline means debugging someone else's buffer.
+\end{wbitem}
+
+The Prometheus FAQ is honest about this: pulling is "slightly better" than pushing, not a religion. Short-lived batch jobs genuinely cannot be pulled, which is why the Pushgateway exists as a deliberate, narrow exception.
+
+\begin{wbfigure}{Fig 11.2 — The scrape loop. Discovery rewrites the target list continuously; the scrape itself is an ordinary HTTP GET.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 10mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxk8s] (api) {Kubernetes API\\pod list + labels};
+  \node[wbboxops, below=9mm of api] (sd) {Service discovery\\+ relabel\_configs};
+  \node[wbboxops, below=9mm of sd] (scr) {Scrape loop\\every 15s};
+  \node[wbboxops, below=9mm of scr] (tsdb) {TSDB\\head block $\rightarrow$ disk};
+  \draw[wbarrow] (api)--node[wbcap,right,xshift=1mm]{watch}(sd);
+  \draw[wbarrow] (sd)--node[wbcap,right,xshift=1mm]{target list}(scr);
+  \draw[wbarrow] (scr)--node[wbcap,right,xshift=1mm]{samples}(tsdb);
+  \node[wbboxgood, right=18mm of scr, text width=24mm, align=center] (pod) {pod: cloudbase-api\\:8080/metrics};
+  \draw[wbflow] (scr)--node[wbcap,above]{HTTP GET}(pod);
+  \draw[wbarrowg] (pod) to[out=200,in=-20] node[wbcap,below,yshift=-1mm]{text response} (scr.south east);
+  \node[wbboxwarn, right=18mm of tsdb, text width=24mm, align=center] (up) {up\{job="api"\}\\1 or 0};
+  \draw[wbarrowg] (scr.east) to[out=-40,in=90] (up.north);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally? (the TSDB)} Every unique combination of metric name and label values is one \keyterm{time series}, held in memory as a \code{memSeries} structure: a copy of its labels plus a chain of compressed chunks. Samples are appended to the active chunk; chunks are cut on two-hour wall-clock boundaries and eventually flushed to an immutable on-disk block alongside an inverted index mapping label pairs to series IDs. Two properties follow directly, and both bite people in production:
+
+\begin{wbitem}
+  \item \textbf{Memory scales with active series, not with sample volume.} Scraping the same 10{,}000 series twice as often roughly doubles disk, but barely moves memory. Adding one new label with 10{,}000 possible values multiplies your series count by 10{,}000 and can kill the server.
+  \item \textbf{Series that appear once are still expensive.} A series stays resident for the lifetime of its head chunk --- on the order of one to three hours --- even if it received exactly one sample and will never be seen again.
+\end{wbitem}
+
+\begin{behind}
+This is precisely why Cloudflare had to patch Prometheus rather than just add capacity. With 916 servers and 4.9 billion series, a single team labelling a metric with a raw URL path or an error string could take a server down. Their fix is layered and worth copying at any scale: per-scrape limits on sample and label counts (their published defaults are on the order of 200 samples and 64 labels per application), CI checks that estimate the cardinality impact of a change \emph{before} merge, and a global cap that degrades gracefully --- dropping the excess series rather than failing the entire scrape. Note the design philosophy: an application team that gets a metric wrong should get a warning, not an outage of the monitoring system.
+\end{behind}
+
+\begin{secwarn}[cardinality is the one thing that will take your monitoring down]
+Never put an unbounded value in a label: user ID, email, session ID, full URL path, raw error message, timestamp, container ID. A metric labelled with the request path lets \emph{any anonymous internet user} create unlimited time series by requesting random URLs --- a denial-of-service against your own monitoring. Always use the \emph{route template} (\code{/orders/\{id\}}), never the resolved path. High-cardinality identifiers belong in logs and traces, which are indexed for exactly that.
+\end{secwarn}
+
+\glabel{When should I \emph{not} use Prometheus?} It is not a log store --- the project's own FAQ says so and points you at Loki or OpenSearch. It is not durable long-term storage: a single server is local-disk, non-replicated, and losing it loses the data, which is why Thanos or Mimir exist for multi-year retention and global query. And it is not a billing system: samples are lossy and scrape-aligned, so never derive invoices from a counter.
+
+\wbsub{3.3\quad Metric Types, PromQL and Why p99 Beats the Average}
+
+\glabel{What is it?} Four instrument types, of which you will use three constantly.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} X L{32mm}@{}}
+\wbtablehead{Type} & \wbtablehead{Semantics} & \wbtablehead{Use it for}\\
+Counter & Monotonically increasing; resets to 0 on process restart. Never read the raw value --- always \code{rate()}. & Requests served, errors, bytes sent, retries.\\
+Gauge & Goes up and down freely. Read directly. & Queue depth, in-flight requests, memory in use, replica count.\\
+Histogram & Pre-defined cumulative buckets plus \code{\_sum} and \code{\_count}. Percentiles computed at query time. & Latency, payload size --- anything you need a percentile of.\\
+Summary & Quantiles computed \emph{in the client}. Cheap to read, but mathematically un-aggregatable across instances. & Rare. Prefer histograms.\\
+\end{tabularx}
+\end{center}
+
+\glabel{How does it work internally? (histograms)} A histogram does not store observations. It stores a set of counters, one per \emph{cumulative} bucket boundary: "how many requests took at most 0.1s", "at most 0.3s", and so on, ending at \code{+Inf}. At query time \code{histogram\_quantile(0.99, ...)} finds the bucket where the 99th percentile falls and linearly interpolates within it. Three implications you must internalise:
+
+\begin{wbitem}
+  \item \textbf{Your bucket boundaries decide your accuracy.} If your buckets jump from 1s to 10s, every p99 between them reports as an interpolation artefact. Choose buckets around your SLO threshold --- if the SLO is 300\,ms, you want boundaries at 0.1, 0.2, 0.3, 0.5, 1.
+  \item \textbf{Buckets are cheap in bytes and expensive in cardinality.} Ten buckets $\times$ twenty routes $\times$ five status codes is 1{,}000 series from one histogram. This is the single most common cause of accidental cardinality growth.
+  \item \textbf{Because buckets are counters, they aggregate correctly.} You can \code{sum} bucket counts across all pods and \emph{then} compute the quantile. You cannot do that with pre-computed quantiles --- and that is why summaries lose.
+\end{wbitem}
+
+\begin{wbfigure}{Fig 11.3 — A histogram stores cumulative bucket counters; the percentile is computed at query time, which is what makes it aggregatable across pods.}
+\wbscale{\begin{tikzpicture}[node distance=4mm, every node/.style={font=\sffamily\scriptsize},
+   b/.style={wbbox, minimum width=52mm, minimum height=6.6mm, align=left, text width=47mm}]
+  \node[b] (b1) {\code{le="0.1"} \hfill 41022};
+  \node[b, below=of b1] (b2) {\code{le="0.3"} \hfill 47510};
+  \node[b, wbboxwarn, below=of b2] (b3) {\code{le="1.0"} \hfill 48180 \ \ $\leftarrow$ p99 lands here};
+  \node[b, wbboxghost, below=of b3] (b4) {\code{le="+Inf"} \hfill 48220};
+  \node[wbboxgood, below=7mm of b4, minimum width=52mm, text width=47mm, align=left] (q)
+    {\textbf{histogram\_quantile(0.99, ...)} \hfill interpolate};
+  \draw[wbarrow] (b4)--(q);
+  \node[wbcap, right=4mm of b3, text width=22mm, anchor=west] {cumulative: each includes all below};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Why does p99 matter more than the average?} Because an average is a statement about a fictional user. Consider a service where 99 requests take 50\,ms and one takes 5\,s. The mean is 99.5\,ms --- a number that describes precisely zero of those requests, and which looks perfectly healthy on a dashboard. Meanwhile one user in a hundred waited five seconds. Now scale it: a page that makes 20 backend calls will hit the 99th percentile of at least one of them roughly 18\% of the time. \textbf{The tail is not an edge case; at scale the tail is the typical page load.} And the tail is systematically your most valuable users --- the ones with the largest carts, the most data, the fullest inboxes --- because their requests are the expensive ones.
+
+\begin{misconception}
+"We report p99, so we're fine." Not if you are averaging p99 across pods, or across a long window. \code{avg(p99)} is not a percentile of anything --- it is an average of maxima and it systematically understates the tail. Compute the quantile \emph{after} summing the buckets: \code{histogram\_quantile(0.99, sum by (le) (rate(...\_bucket[5m])))}. The \code{sum by (le)} before the quantile is the entire correctness of the query.
+\end{misconception}
+
+\begin{bashbox}[the four PromQL queries you will write most often]
+# 1. Request rate (per second, averaged over 5 minutes) -- the RED "Rate"
+sum by (route) (rate(http_requests_total[5m]))
+
+# 2. Error ratio -- the RED "Errors". Note: ratio, not count.
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  / sum(rate(http_requests_total[5m]))
+
+# 3. p99 latency, correctly aggregated across all pods -- the RED "Duration"
+histogram_quantile(0.99,
+  sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+
+# 4. Saturation: is the app running out of its cgroup memory limit? (Day 4)
+container_memory_working_set_bytes / container_spec_memory_limit_bytes
+\end{bashbox}
+
+\begin{seniornote}
+\code{rate()} is not "the derivative". It is a linear extrapolation over the window that is explicitly counter-reset aware: when it sees the value drop, it assumes a restart and treats the drop as a reset rather than a negative rate. This is why you must never apply \code{rate()} to a gauge (use \code{deriv()} or \code{delta()}) and never apply raw arithmetic to a counter. It is also why your range window must be at least 4x your scrape interval --- with a 15\,s scrape, \code{rate(x[20s])} may see only one sample in the window and return nothing, producing mysterious gaps in a dashboard that "worked yesterday" before someone raised the scrape interval.
+\end{seniornote}
+
+\begin{prodtip}
+Standardise on two dashboard vocabularies and you will never argue about dashboard layout again. \textbf{RED} for request-driven services: Rate, Errors, Duration. \textbf{USE} for resources: Utilisation, Saturation, Errors --- applied to CPU, memory, disk and network. Every CloudBase service dashboard should open with the same three RED panels in the same three positions, so an on-call engineer reads an unfamiliar service the way they read a familiar one.
+\end{prodtip}
+
+\begin{perfnote}
+Prometheus 3.0 (November 2024, the first major release in seven years) shipped changes worth knowing: full UTF-8 support in metric and label names, so OpenTelemetry metrics no longer need dots rewritten to underscores; Remote-Write 2.0, which uses string interning and a symbol table to cut wire volume substantially; and \emph{native histograms}, which replace fixed buckets with automatically-scaled exponential buckets at far lower cost. Native histograms are still stabilising --- check their current status before adopting them for anything you alert on.
+\end{perfnote}
+
+\wbsub{3.4\quad Structured Logging \& Correlation IDs}
+
+\glabel{What is it?} Emitting each log event as a machine-parseable object with named fields, instead of a sentence a human composed. The single most important field is a \keyterm{correlation ID} (equivalently, a trace ID) generated once at the edge and propagated to every downstream call.
+
+\begin{outbox}[one structured log event -- every field is queryable]
+{"timestamp":"2026-07-19T10:22:01.481Z","level":"ERROR",
+ "service":"order-api","version":"1.14.2","pod":"order-api-7d9f-xk2p",
+ "correlation_id":"a1b2c3d4e5f60718","trace_id":"a1b2c3d4e5f60718",
+ "route":"/orders","status":502,"duration_ms":4021,
+ "message":"payment gateway timeout","order_id":4821,
+ "upstream":"payments-api","attempt":3}
+\end{outbox}
+
+\glabel{Why does it exist?} Because free-text logging pushes the parsing cost from write time (once, cheaply, where the data is structured) to read time (repeatedly, expensively, with regexes, during an incident, at 3am). The regex approach also breaks silently: someone rewords a log message in a refactor, the parser stops matching, and the dashboard quietly shows zero errors forever. Structured logging makes the schema explicit and reviewable.
+
+The correlation ID exists because of a specific distributed-systems failure. With one service, "show me the logs around 10:22" works. With six services and 200 requests per second, the logs of one failing request are interleaved with thousands of unrelated lines across six different log streams --- and worse, the \emph{symptom} appears in the edge service while the \emph{cause} appears in a service three hops away. Without a shared identifier there is no join key, and reconstructing one request is genuinely impossible.
+
+\glabel{How does it work internally?} The edge (ingress, API gateway, or the outermost service) checks for an incoming \code{traceparent} header. If absent, it generates a new trace ID. That ID goes into a request-scoped context --- a thread-local, an async context, or an explicit parameter --- so the logging framework can inject it into every line automatically, and into an outbound HTTP header on every downstream call. The W3C Trace Context Recommendation standardises the header so that services written in different languages with different vendors interoperate:
+
+\begin{httpbox}[W3C traceparent -- version, trace-id, parent-id, flags]
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             ^   ^                                ^                ^
+             |   16-byte trace id (whole request) 8-byte span id   sampled=1
+             version
+\end{httpbox}
+
+\begin{wbfigure}{Fig 11.4 — One ID, generated at the edge, propagated by header, written into every log line. This is the join key that makes an incident tractable.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxsec] (ing) {Ingress\\generate trace id};
+  \node[wbboxgood, right=of ing] (api) {order-api};
+  \node[wbbox, right=of api] (pay) {payments-api};
+  \node[wbcyl, right=of pay] (db) {Postgres};
+  \draw[wbflow] (ing)--node[wbcap,above]{traceparent}(api);
+  \draw[wbflow] (api)--node[wbcap,above]{traceparent}(pay);
+  \draw[wbflow] (pay)--(db);
+  \node[wbboxops, below=10mm of api, text width=30mm, align=center] (l1) {log line\\correlation\_id=a1b2};
+  \node[wbboxops, below=10mm of pay, text width=30mm, align=center] (l2) {log line\\correlation\_id=a1b2};
+  \draw[wbarrowg] (api)--(l1); \draw[wbarrowg] (pay)--(l2);
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(l1)(l2)] (z) {};
+    \node[wbzonelabel, anchor=north west] at (z.north west) {one Loki query returns both};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does the log store work internally?} Loki was designed on a deliberate bet: that you almost always know \emph{roughly where} to look (which service, namespace, environment, time window) before you know \emph{what} to look for. So Loki indexes only a small set of \keyterm{labels} per log stream and stores the log lines themselves as compressed chunks that are never full-text indexed. A query first uses the label index to select a tiny subset of streams, then brute-force greps the compressed chunks in parallel. Elasticsearch takes the opposite bet: index every token, pay a large ingest and storage cost, get arbitrary full-text search back. Neither is wrong --- but the label index gives Loki a cost profile close to object storage, which is why it dominates at high log volume with predictable query patterns.
+
+\begin{tradeoff}
+The Loki design flips the cardinality rule you just learned for Prometheus --- but only halfway. Loki labels must stay \emph{low}-cardinality for exactly the Prometheus reason: each unique label combination is a separate stream with its own index entry and chunk. So \code{namespace}, \code{app}, \code{level} are labels; \code{correlation\_id} is emphatically \emph{not} a label --- it lives in the line body and is found by a filter expression after the label selector has narrowed the search. Making a correlation ID a Loki label is the classic first mistake, and it produces millions of one-line streams.
+\end{tradeoff}
+
+\begin{opsnote}
+Do not write logs to a file inside a container. Write JSON to stdout, let the container runtime capture it, and let a node-level agent (Promtail, Fluent Bit, Vector) ship it. This is a direct consequence of Day 4: a container filesystem is ephemeral, so a log file in a crashed pod is a log file you will never read --- and the crash is precisely the event you needed the logs for.
+\end{opsnote}
+
+\wbsub{3.5\quad Distributed Tracing \& OpenTelemetry}
+
+\glabel{What is it?} A \keyterm{trace} is a tree of \keyterm{spans}. Each span records one unit of work --- an inbound HTTP request, an outbound call, a database query --- with a name, a start timestamp, a duration, key/value attributes, and a parent span ID. Assembling the spans that share a trace ID reconstructs the causal structure and the exact timing of a distributed request.
+
+\glabel{Why does it exist?} A metric tells you p99 latency on \code{/checkout} rose from 200\,ms to 3\,s. In a six-service architecture that leaves six suspects, each of whom will look at their own dashboard and correctly report that their service is fine --- because the latency is in the \emph{aggregate path}, or in a retry loop, or in a service that is fast on average but occasionally serialises. Tracing turns a multi-team argument into a waterfall diagram with one obviously fat bar.
+
+\glabel{How does it work internally?} Instrumentation (usually automatic, via an OpenTelemetry agent or language SDK) starts a span on request entry, attaches the current trace context, and ends it on exit. Spans are batched and exported asynchronously --- never on the request's critical path. The volume is the problem: tracing every request at scale can generate more telemetry data than the application generates business data, so \keyterm{sampling} is mandatory. Head-based sampling decides at the edge (cheap, but you will discard the interesting slow requests). Tail-based sampling buffers complete traces and keeps the anomalous ones (correct, but requires holding traces in memory until all spans arrive).
+
+\begin{infranote}
+Uber's Jaeger architecture is instructive because the interesting decision is not the storage backend --- it is the \code{jaeger-agent} deployed on every host. Application libraries emit spans to a local UDP port and poll that same local agent for the current sampling strategy. Product engineers therefore never configure a collector address, never handle a network failure to the tracing backend, and never redeploy to change sampling rates. The infrastructure team can retune sampling globally without touching a single application. That pattern --- a local sidecar or DaemonSet absorbing all discovery, buffering and policy --- is the same reason you run a node-level log agent rather than a shipper in every container.
+\end{infranote}
+
+\glabel{When should I use it?} When requests cross service boundaries and you cannot attribute latency by inspection. Also when onboarding to an unfamiliar system: a handful of traces is the fastest architecture diagram you will ever get, and it is guaranteed current.
+
+\glabel{When should I \emph{not}?} On a single service with good histograms. Tracing has real costs --- SDK integration, context propagation through async code and message queues (where it usually breaks first), a storage backend, and sampling policy. Earn it.
+
+\begin{seniornote}
+OpenTelemetry's genuine contribution is not another tracing library --- it is the \emph{decoupling of instrumentation from vendor}. Before it, instrumenting for Datadog meant Datadog SDK calls compiled into your source, and migrating vendors meant touching every service. With OTel your code emits vendor-neutral spans and metrics to a Collector, and the Collector's configuration --- not your code --- decides where they go. Instrumentation becomes a durable asset instead of a vendor commitment. That is the property to argue for in a design review.
+\end{seniornote}
+
+\wbsub{3.6\quad SLIs, SLOs, Error Budgets and Alerts a Human Will Act On}
+
+\glabel{What is it?} An \keyterm{SLI} is a measured ratio of good events to valid events --- e.g. the proportion of HTTP requests that returned non-5xx in under 300\,ms. An \keyterm{SLO} is the target for that ratio over a window: 99.5\% over 30 rolling days. The \keyterm{error budget} is the remainder: 0.5\% of 30 days is approximately 3 hours 39 minutes of permitted badness per month. The \keyterm{burn rate} is how fast you are consuming it: burn rate 1 means you will spend exactly the whole budget in the window; burn rate 14.4 means you will spend it in about 50 hours.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} C{24mm} X@{}}
+\wbtablehead{SLO} & \wbtablehead{Budget / 30 days} & \wbtablehead{What it implies operationally}\\
+99\% & approx. 7h 18m & A generous internal or batch service.\\
+99.5\% & approx. 3h 39m & Sensible starting point for a new user-facing API.\\
+99.9\% & approx. 43m & Needs redundancy and automated rollback (Day 9).\\
+99.99\% & approx. 4m 20s & Multi-AZ, no manual step in the recovery path, at real cost.\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why does it exist?} Because "the site should be up" is not a decidable statement, and "100\% uptime" is not a goal --- it is a refusal to make a trade-off. An error budget converts reliability from an argument between engineering and product into a number both sides can read. Budget remaining $\rightarrow$ ship features. Budget exhausted $\rightarrow$ the next sprint is reliability work. The rule is agreed \emph{before} the incident, when everyone is calm, which is the only time such rules can be agreed honestly.
+
+\glabel{How does it work internally? (burn-rate alerting)} A naive alert --- "page if the error rate exceeds 1\% for 5 minutes" --- has two failure modes at once: it fires on a harmless 6-minute blip that consumes 0.01\% of the budget, and it stays silent through a slow 0.9\% bleed that will exhaust the budget in a week. Google's SRE Workbook answers both with \emph{multiwindow, multi-burn-rate} alerts. You require a high burn rate over a long window (proving it is a real, sustained problem) \emph{and} over a short window (proving it is still happening right now, so the alert resets promptly when it stops). The canonical configuration uses long windows of 1\,h, 6\,h and 3\,days with short windows one-twelfth as long, tuned to consumption of 2\%, 5\% and 10\% of the budget respectively --- the fast one pages, the slow ones open a ticket.
+
+\begin{wbfigure}{Fig 11.5 — A burn-rate alert fires only when a fast window and a slow window agree. That AND is what removes the noise.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox, text width=30mm, align=center] (long) {long window (1h)\\burn rate > 14.4};
+  \node[wbbox, below=9mm of long, text width=30mm, align=center] (short) {short window (5m)\\burn rate > 14.4};
+  \node[wbboxwarn, right=14mm of long, yshift=-9mm, text width=24mm, align=center] (and) {\textbf{AND}};
+  \draw[wbarrow] (long)--(and); \draw[wbarrow] (short)--(and);
+  \node[wbboxsec, right=12mm of and, text width=26mm, align=center] (page) {PAGE a human\\budget gone in ~2 days};
+  \draw[wbarrow] (and)--(page);
+  \node[wbcap, below=5mm of and, text width=34mm] {long window = "is it real?" \ \ short window = "is it still happening?"};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{yamlbox}[prometheus/rules/cloudbase-slo.yaml -- one SLO, one page]
+groups:
+  - name: cloudbase-slo
+    rules:
+      # Recording rule: the SLI error ratio, computed once, reused everywhere.
+      - record: job:slo_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{job="cloudbase-api",status=~"5.."}[5m]))
+            / sum(rate(http_requests_total{job="cloudbase-api"}[5m]))
+
+      - alert: CloudBaseErrorBudgetBurningFast
+        # 14.4x burn on a 99.5% SLO exhausts 30 days of budget in ~2 days.
+        expr: |
+          job:slo_errors:ratio_rate1h > (14.4 * 0.005)
+            and
+          job:slo_errors:ratio_rate5m > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "CloudBase API burning error budget 14.4x"
+          description: "Error ratio {{ $value | humanizePercentage }} over 1h and 5m."
+          runbook_url: "https://runbooks.internal/cloudbase/error-budget"
+\end{yamlbox}
+
+\glabel{How does it work internally? (why symptoms, not causes)} There are hundreds of possible causes of a bad user experience and only a handful of symptoms. Alerting on causes --- CPU at 90\%, a full disk on one node, a pod restart, a slightly elevated GC pause --- produces an alert per cause, most of which are individually harmless because the system is designed to tolerate them. That is how you get an on-call rotation with forty pages a week, of which two mattered. Alerting on symptoms --- error rate, latency, saturation of a user-facing queue --- produces one alert per \emph{actual user impact}, and the cause is then a diagnosis you perform with the dashboards and logs you already built.
+
+\begin{reliability}
+Alert fatigue is not a personality flaw --- it is a predictable systems failure with a measurable onset. Once an on-call engineer has learned that most pages are noise, their response time to \emph{all} pages degrades, including the real one. Treat it as an SLO of its own: track pages per on-call shift, and the fraction of pages that resulted in an action. If more than roughly a quarter of your pages are closed with "no action needed", the alerting configuration is broken and fixing it is higher-priority production work than any feature. Every alert must satisfy three tests: it is \emph{urgent} (cannot wait until morning), it is \emph{actionable} (a human can do something), and it points to a \emph{runbook}. Anything failing a test becomes a ticket or a dashboard panel, not a page.
+\end{reliability}
+
+\begin{costnote}
+Observability spend has a nasty shape: it grows with your fleet, not with your revenue, and it is invisible until the invoice. The three levers, in order of effect: drop unused high-cardinality labels at the collector (the biggest single win, usually 30--60\% of metric volume); set log retention by level, keeping ERROR for 90 days and DEBUG for 3; and sample traces aggressively while always keeping the errors and the slow tail. A useful discipline is to review the top ten metrics by series count monthly --- the list is almost always dominated by one or two accidental labels nobody has ever queried.
+\end{costnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Alert on symptoms tied to a user-facing SLO --- never on every metric that crosses a threshold.
+  \item Compute percentiles from summed histogram buckets; never average a p99 across pods or windows.
+  \item Generate a correlation ID at the edge, propagate it via \code{traceparent}, and inject it into every log line automatically.
+  \item Log JSON to stdout; let a node agent ship it. Never write log files inside a container.
+  \item Use the route \emph{template} in labels, never the resolved path, user ID or error string.
+  \item Give every paging alert a runbook URL in its annotations before it is allowed to page anyone.
+  \item Make \code{up == 0} and "no data" alert conditions too --- a silent monitoring system looks exactly like a healthy one.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Labelling a metric with something unbounded, then wondering why Prometheus was OOMKilled.
+  \item Reporting average latency, hiding the tail where the actual user pain lives.
+  \item Free-text logs with no correlation ID, making a cross-service incident unreconstructable.
+  \item Building dashboards nobody opens --- metrics collected but never consumed.
+  \item Paging on CPU, memory or pod restarts, then ignoring the pager within a month.
+  \item Setting an SLO of 100\%, which makes the error budget zero and the whole framework meaningless.
+  \item Applying \code{rate()} to a gauge, or using a range window shorter than 4x the scrape interval.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the scrape loop and the burn-rate alert without notes, you can design an observability stack in a whiteboard interview.
+
+\begin{writespace}[Redraw: service discovery $\rightarrow$ scrape loop $\rightarrow$ TSDB, and where the \code{up} metric comes from]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: a request crossing three services, showing where the trace ID is generated and every place it appears]
+\reflectionlines[5]
+\end{writespace}
+
+\begin{writespace}[Write out: the SLI, SLO, error budget and burn-rate alert for a service you have worked on]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Make CloudBase Observable}
+
+\textbf{Goal.} Take the CloudBase API running on the Day 10 infrastructure and give it the three signals, one dashboard and one alert that make it operable by someone who has never seen the code.
+
+\resetlab
+\labstep{Expose a \code{/metrics} endpoint with the right instruments}
+Add a client library and register exactly three things: a counter \code{http\_requests\_total} labelled by route template, method and status; a histogram \code{http\_request\_duration\_seconds} with buckets straddling your intended SLO; and a gauge for in-flight requests. Then \code{curl} the endpoint and read the raw text.
+\labwhy{Reading the exposition format by hand demystifies the entire system --- you see that "supporting Prometheus" means serving a text file, and you can immediately count how many series each metric will create.}
+
+\labstep{Audit your own cardinality before deploying}
+Multiply out every label's possible values. Routes $\times$ methods $\times$ status codes $\times$ histogram buckets. If any label can take an unbounded value, remove it now.
+\labwhy{Cardinality is the one mistake that takes down the monitoring system for everyone, not just you. Doing this arithmetic before merge is exactly the CI check Cloudflare built --- you are doing it manually, once, to learn what it feels like.}
+
+\labstep{Deploy Prometheus with Kubernetes service discovery}
+Configure the \code{kubernetes\_sd\_configs} pod role and use \code{relabel\_configs} to keep only pods carrying a \code{prometheus.io/scrape} annotation. Delete a pod and watch the target list change on its own.
+\labwhy{This is the moment the pull model justifies itself. You never enumerate a pod IP; the cluster's own API is the source of truth, so a Day 6 rolling update needs no monitoring change at all.}
+
+\labstep{Verify the scrape, then break it deliberately}
+Check the Targets page, then change the container port so the scrape fails. Query \code{up\{job="cloudbase-api"\}} and confirm it returns 0.
+\labwhy{You are proving that failure is observable as data. In a push system this failure is silence, and silence is indistinguishable from health --- which is how outages go unnoticed for hours.}
+
+\labstep{Build the RED dashboard in Grafana}
+Three panels, in this order: request rate by route, error ratio as a percentage, p99 latency computed with \code{sum by (le)} inside \code{histogram\_quantile}. Add a fourth panel showing the average latency next to the p99.
+\labwhy{Putting the average beside the p99 under load is the single most convincing demonstration in this chapter. Generate a few slow requests and watch the average barely move while the p99 doubles.}
+
+\labstep{Add structured JSON logging with a correlation ID}
+Switch the log encoder to JSON. Add middleware that reads \code{traceparent}, generates an ID when absent, stores it in request context, and injects it into every log line and every outbound HTTP header.
+\labwhy{The value is entirely in the propagation, not the format. A correlation ID that stops at the first service boundary is decoration; one that survives three hops is a join key.}
+
+\labstep{Ship logs to Loki and query one request end to end}
+Deploy Promtail (or Fluent Bit) as a DaemonSet with the pod's namespace, app and level as labels --- and the correlation ID deliberately \emph{not} as a label. Then find one request across both services with a single query.
+\labwhy{You are internalising the Loki bet: labels narrow the search space cheaply, the filter expression greps the compressed chunks. Making the correlation ID a label would create one stream per request and defeat the entire design.}
+
+\labstep{Define one SLO and one burn-rate alert}
+Write the SLI as a recording rule, pick a 99.5\% target, and write the multiwindow burn-rate alert from section 3.6. Give it a \code{runbook\_url} annotation pointing at a document you actually write.
+\labwhy{Recording rules pre-compute the expensive expression so the alert evaluation is cheap and every dashboard uses the identical definition. And an alert without a runbook is a request for a stranger to improvise at 3am.}
+
+\begin{prodtip}
+Test the alert by causing the condition, not by editing the threshold until it fires. Inject a 20\% error rate with a feature flag or a fault-injection sidecar and confirm the page arrives, the annotations render usefully, and the alert \emph{resolves} on its own afterwards. An alert nobody has ever seen fire is an untested code path in the most safety-critical part of your system --- and the classic failure is discovering during a real incident that the alert fires correctly but never clears, so the next incident is masked.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Prometheus stores data on local disk with no replication, and a server that dies loses its data. Yet it is the default choice at companies operating hundreds of thousands of machines. What property are they buying that outweighs durability --- and what does that tell you about how the reliability of a monitoring system should differ from the reliability of the system it monitors?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your team's SLO is 99.9\% and you have consumed only 4\% of the monthly error budget with a week to go. An engineer proposes shipping a risky migration \emph{because} of the surplus. Is that a correct use of the error budget or an abuse of it? What does your answer imply about whether the SLO was set at the right level?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Tail-based trace sampling keeps the slow and failed traces --- exactly the ones you want --- but requires buffering every span of every request until the trace is complete. Head-based sampling decides at the edge and is nearly free, but discards most of the interesting requests. Where does that trade-off actually sit for a service doing 50{,}000 requests per second, and what hybrid would you build?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Prometheus was OOMKilled an hour after a routine deploy}
+\textbf{Symptom.} The monitoring pod entered \code{CrashLoopBackOff} with exit code 137 (Day 1: 128 + 9 = SIGKILL). Grafana shows a wall of "no data". The application deploy that preceded it was reviewed and looked harmless.
+
+\begin{outbox}[kubectl describe pod prometheus-0 and a TSDB status query]
+    Last State:   Terminated
+      Reason:     OOMKilled
+      Exit Code:  137
+  Memory Limits:  8Gi
+
+# topk(5, count by (__name__)({__name__=~".+"}))
+http_requests_total                          4812004
+http_request_duration_seconds_bucket          291177
+container_memory_working_set_bytes              8140
+node_cpu_seconds_total                          2304
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} One metric holds 4.8 million series while everything else is in the thousands. Memory, not disk, is what failed --- and Prometheus memory scales with \emph{active series}.
+  \item \textbf{Hypothesise.} A label on \code{http\_requests\_total} started taking unbounded values in the new build.
+  \item \textbf{Investigate.} Inspect the label sets: \code{count by (route) (http\_requests\_total)}. The \code{route} label now contains resolved paths --- \code{/orders/4821}, \code{/orders/4822} --- instead of the template \code{/orders/\{id\}}.
+  \item \textbf{Root cause.} A refactor replaced the framework's route-template accessor with the raw request URI. Every distinct order ID now creates a permanent-for-three-hours time series, and any client requesting random paths can create more without limit.
+  \item \textbf{Fix.} Restore the template accessor and redeploy. To recover immediately, add a \code{metric\_relabel\_configs} drop rule at the scrape config so the bad series are discarded at ingestion, then restart Prometheus to clear the head block.
+  \item \textbf{Prevent.} Add a CI check that scrapes the built image's \code{/metrics} under synthetic load and fails the build if any metric exceeds a series budget. Set \code{sample\_limit} and \code{label\_limit} on the scrape config so a single misbehaving app degrades instead of taking down monitoring for every team --- the graceful-degradation principle Cloudflare built into their fork.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The dashboard says p99 is 120\,ms; users say the app is unusable}
+\textbf{Symptom.} Support tickets describe multi-second waits on checkout. The latency panel is flat and green all week. No alert has fired.
+
+\begin{outbox}[the panel query, and the same data queried correctly]
+# Panel query (as built by a well-meaning engineer)
+avg(histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m])))
+  -> 0.118
+
+# Same window, aggregating buckets BEFORE the quantile
+histogram_quantile(0.99,
+  sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+  -> 3.940
+
+# And per pod:
+{pod="api-7d9f-xk2p"}  0.104
+{pod="api-7d9f-m4kv"}  0.098
+{pod="api-7d9f-q8zt"}  4.021   # <-- one pod
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Two queries over identical data differ by a factor of 33. The panel averages a per-pod quantile; the correct form sums buckets first.
+  \item \textbf{Hypothesise.} \code{avg} of a percentile is not a percentile. One slow pod is being diluted by two fast ones, so its pain is arithmetically erased from the graph.
+  \item \textbf{Investigate.} Break the query down per pod. One replica is at 4\,s. Check it: it is scheduled on a node with a saturated disk, or it lost its connection-pool warm-up, or it is the only replica on an older instance type.
+  \item \textbf{Root cause.} Two compounding faults --- a genuinely degraded replica, and a dashboard query whose aggregation order guaranteed nobody would ever see it. Approximately a third of traffic was affected the whole time.
+  \item \textbf{Fix.} Correct the query to \code{histogram\_quantile(0.99, sum by (le) (rate(...)))}. Then address the replica: cordon the node, let the Day 6 scheduler reschedule, verify recovery.
+  \item \textbf{Prevent.} Alert on the SLI ratio (requests under 300\,ms as a fraction of all requests), which is immune to aggregation-order mistakes because it counts events rather than averaging statistics. Add a per-pod latency heatmap so a single bad replica is visible as a stripe rather than dissolved into an average.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Instrument a small HTTP service and scrape it with a local Prometheus.\\
+\textbf{Business context.} Your team has no metrics at all and needs a first, credible dashboard this week.\\
+\textbf{Architecture.} One app container exposing \code{/metrics}, one Prometheus container, a static scrape config.\\
+\textbf{Requirements.} A counter labelled by route template and status; a latency histogram; both visible in the Prometheus expression browser.\\
+\textbf{Constraints.} No label may take more than 20 distinct values --- prove it by enumeration before you deploy.\\
+\textbf{Hints.} Generate load with a loop of \code{curl}; set the scrape interval to 5\,s so graphs move while you watch.\\
+\textbf{Expected outcome.} \code{rate(http\_requests\_total[1m])} produces a sensible graph and \code{up} equals 1.\\
+\textbf{Production considerations.} Decide now what your histogram buckets should be, given the latency you intend to promise.\\
+\textbf{Common pitfalls.} A range window shorter than 4x the scrape interval, producing empty graphs; reading a counter's raw value instead of its rate.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~70 min}
+\textbf{Goal.} Propagate one correlation ID across a two-service call chain and reconstruct a single request from logs.\\
+\textbf{Business context.} An intermittent 502 appears at the edge; the downstream team insists their service is healthy.\\
+\textbf{Architecture.} Service A calls service B; both log JSON to stdout; a log collector ships both streams.\\
+\textbf{Requirements.} A generates the ID when \code{traceparent} is absent, forwards it downstream, and every log line in both services carries it. One query returns the full story of one failing request.\\
+\textbf{Constraints.} The ID must be injected by middleware, not passed by hand to each log call.\\
+\textbf{Hints.} Store it in request-scoped context and register a log-field hook; the correlation ID is a field, never a Loki label.\\
+\textbf{Expected outcome.} A written incident narrative for one request, assembled purely from queries.\\
+\textbf{Production considerations.} Where does propagation break --- async work, message queues, thread pools, retries?\\
+\textbf{Common pitfalls.} Losing the context across an async boundary; making the ID a stream label and creating millions of streams.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2 hours}
+\textbf{Goal.} Define an SLO for CloudBase and build a multiwindow burn-rate alert that survives a chaos test.\\
+\textbf{Business context.} The team currently gets 30 pages a week and has started muting the channel.\\
+\textbf{Architecture.} Recording rule for the SLI $\rightarrow$ burn-rate alert rules $\rightarrow$ Alertmanager routing $\rightarrow$ one notification channel.\\
+\textbf{Requirements.} One SLI (availability or latency), one SLO with an explicit window, a fast burn-rate rule at \code{severity: page} and a slow one at \code{severity: ticket}, each with a runbook URL.\\
+\textbf{Constraints.} Exactly one alert may page. Everything else routes to a ticket. Justify each removal from the existing set in writing.\\
+\textbf{Hints.} Start from the Google SRE Workbook's 2/5/10\% budget-consumption thresholds; use Alertmanager inhibition so a page suppresses its dependent tickets.\\
+\textbf{Expected outcome.} Injected errors produce exactly one page; a 60-second blip produces none; the alert resolves automatically.\\
+\textbf{Production considerations.} Who receives the page, what the escalation is after 15 minutes, and what happens when Prometheus itself is down (a dead-man's-switch alert that fires when it \emph{stops} being sent).\\
+\textbf{Common pitfalls.} Alerting on the raw error count instead of the ratio; forgetting that "no data" is not "no errors".
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{opsnote}
+The best measure of an observability stack is not coverage --- it is \keyterm{time to first useful hypothesis} during an incident. Time yourself in a game day: from page received to a stated, checkable hypothesis. If it exceeds five minutes, the problem is almost never missing data; it is that the data is not organised around the question a responder actually asks first, which is "who is affected and by how much?"
+\end{opsnote}
+
+\begin{scalenote}
+Cloudflare's architecture is the scaling lesson: they run 916 \emph{small} Prometheus servers rather than a few large ones, then federate for global queries. A single Prometheus is vertically limited by memory, which is bounded by active series --- so the scaling unit is a shard, usually per cluster or per region, with a query layer (Thanos, Mimir, Cortex) fanning out. Design for that shape from the start: never let a query depend on all your metrics living in one process, because one day they will not.
+\end{scalenote}
+
+\begin{drtip}
+Your monitoring must not share a failure domain with what it monitors. Prometheus running inside the cluster it watches cannot alert you that the cluster is gone. The standard answer is a dead-man's switch: an alert rule that fires \emph{continuously} into an external service configured to notify you when the stream \emph{stops}. It is the only alert whose absence is the emergency, and it is usually the first thing missing from an otherwise excellent setup.
+\end{drtip}
+
+\begin{autotip}
+Alert rules are code and belong in the Day 9 pipeline. Cloudflare wrote \code{pint} specifically to lint Prometheus rules in CI --- catching queries that reference metrics which no longer exist, selectors that match nothing, and syntax that is valid but semantically dead. A rule referencing a renamed metric silently never fires, which is worse than a rule that errors, because it looks exactly like a system that is healthy. Lint your rules; unit-test them with \code{promtool test rules}.
+\end{autotip}
+
+\begin{interview}
+Expect: \emph{"Walk me through how you would debug a latency spike in a microservice architecture."} A weak answer lists tools. A strong answer names the sequence and the reason for each step: check the SLO burn rate to size the impact; check the RED dashboard to find which service and route; check whether it is all requests or a tail; pull a trace for a slow request to find the hop; read the logs for that correlation ID at that hop; then form the hypothesis. You are demonstrating that you narrow the search space before you start reading text.
+\end{interview}
+
+\begin{misconception}
+"We should collect everything and figure out what we need later." Storage is cheap; \emph{cardinality} is not, and neither is the human attention required to navigate a thousand dashboards. Teams that instrument everything reliably end up with worse observability than teams that instrument the four golden signals well --- latency, traffic, errors, saturation --- because the signal is buried. Start narrow, and add a metric only when you can name the question it answers.
+\end{misconception}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a hardened host; Day 4 containerised it; Days 5--6 put it on Kubernetes with rolling updates and probes; Day 7--8 declared its infrastructure and configuration; Day 9 built the pipeline that ships it; Day 10 put it on real cloud infrastructure. Today CloudBase stops being a black box.
+
+\begin{buildalong}[Day 11 — make CloudBase observable]
+\begin{wbitem}
+  \item Instrument the API: \code{/metrics} exposing a request counter (route template, method, status), a latency histogram with buckets straddling 300\,ms, and an in-flight gauge. Record your cardinality arithmetic in \code{docs/metrics.md}.
+  \item Deploy Prometheus into the Day 6 cluster using Kubernetes service discovery, with \code{sample\_limit} and \code{label\_limit} set so no single app can take monitoring down.
+  \item Scrape the cluster too: node-exporter as a DaemonSet and kube-state-metrics, so CloudBase has both application and infrastructure signals in one query language.
+  \item Build one Grafana dashboard, \code{CloudBase / API — RED}, with request rate, error ratio and correctly-aggregated p99 --- plus an average-latency panel beside the p99 as a permanent reminder of why you use percentiles.
+  \item Switch logging to JSON on stdout, add correlation-ID middleware reading and emitting \code{traceparent}, and ship logs with a Promtail DaemonSet labelled by namespace, app and level.
+  \item Define exactly one SLO --- 99.5\% of requests non-5xx and under 300\,ms over 30 days --- as a recording rule, and one multiwindow burn-rate alert at \code{severity: page} with a \code{runbook\_url}.
+  \item Write \code{docs/runbooks/error-budget-burn.md}: what the alert means, the first three queries to run, and the two most likely causes.
+  \item Add a dead-man's-switch alert so the failure of monitoring itself is detectable, and commit every rule file to the Day 9 pipeline with \code{promtool check rules} in CI.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} injecting a sustained 20\% error rate into CloudBase produces exactly one page within five minutes, carrying a runbook link; a 60-second blip produces none; the alert resolves by itself; and using only the dashboard and a Loki query you can name the affected route and produce the full log trail of one failing request by its correlation ID --- without SSH-ing into anything.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Metrics say \emph{that} something is wrong; traces say \emph{where}; logs say \emph{what}. You need all three, joined by shared identifiers.
+  \item Prometheus pulls over HTTP, discovers targets from the Kubernetes API, and stores series in a local TSDB whose memory scales with \emph{active series count}.
+  \item Cardinality --- not sample volume --- is what kills a monitoring system. Never label with an unbounded value.
+  \item Counters need \code{rate()}; gauges are read directly; histograms store cumulative buckets so percentiles can be computed \emph{after} aggregation.
+  \item \code{avg(p99)} is not a percentile. Always \code{sum by (le)} before \code{histogram\_quantile}.
+  \item An SLO plus an error budget turns reliability from an opinion into a number, and a burn-rate alert is how that number reaches a human.
+  \item Alert on symptoms with runbooks; everything else is a ticket or a dashboard panel.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item 99.5\% over 30 days is approximately 3h 39m of error budget; 99.9\% is approximately 43 minutes.
+  \item Burn rate 14.4 exhausts a 30-day budget in about two days --- the canonical fast-page threshold.
+  \item The range window in \code{rate()} must be at least 4x the scrape interval.
+  \item \code{up == 0} is a metric. "No data" is not "no errors" --- alert on both.
+  \item A correlation ID is a log \emph{field}, never a Loki label.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Unbounded labels \quad$\bullet$\quad \code{avg} of a percentile \quad$\bullet$\quad alerting on CPU
+  \item Log files inside containers \quad$\bullet$\quad an SLO of 100\% \quad$\bullet$\quad an alert with no runbook
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Three pillars}{metrics = is it broken; traces = which hop; logs = what happened. Joined by trace/correlation ID.}
+\cheatitem{Pull model}{server scrapes targets it discovered itself; failure is visible as \code{up == 0}.}
+\cheatitem{Cardinality}{series = unique label-value combination; memory scales with active series, not samples.}
+\cheatitem{Metric types}{counter (rate it) · gauge (read it) · histogram (bucket it, quantile at query time).}
+\cheatitem{RED / USE}{Rate-Errors-Duration for services; Utilisation-Saturation-Errors for resources.}
+\cheatitem{Percentiles}{\code{histogram\_quantile(0.99, sum by (le) (rate(x\_bucket[5m])))} --- sum before quantile.}
+\cheatitem{SLO maths}{budget = (1 - SLO) x window; burn rate = actual error ratio / budgeted error ratio.}
+\cheatitem{Alerting}{symptom + urgent + actionable + runbook. Anything else is a ticket.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 11 commands and queries worth memorising]
+# see exactly what Prometheus sees
+curl -s localhost:8080/metrics | head -40
+curl -s localhost:8080/metrics | grep -c '^http_requests_total'
+
+# validate and unit-test rules before they ever reach production
+promtool check config prometheus.yml
+promtool check rules rules/*.yaml
+promtool test rules tests/slo_test.yaml
+
+# find your worst cardinality offenders (expression browser)
+topk(10, count by (__name__)({__name__=~".+"}))
+count(count by (route) (http_requests_total))
+
+# the RED three
+sum by (route) (rate(http_requests_total[5m]))
+sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+
+# is anything even being scraped?
+up{job="cloudbase-api"}
+sum(scrape_samples_scraped) by (job)
+
+# Loki: narrow by label, then filter the line body
+{namespace="cloudbase",app="order-api"} |= "a1b2c3d4" | json | level="ERROR"
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the practical difference between metrics, logs and traces --- what can each answer that the others cannot?}
+\iq{Why is p99 latency more useful than average latency for finding real problems?}
+\iq{What is an error budget, and how should it change a team's priorities?}
+\iq{Why does a correlation ID matter more as you add services?}
+\iq{Counter vs gauge vs histogram --- when would you use each?}
+\iq{How would you design alerting that does not cause fatigue?}
+\iq{Why does Prometheus pull rather than push, and when does that model break down?}
+\iq{What is cardinality explosion, how does it happen, and how would you prevent it in CI?}
+\iq{Why can you not average a p99 across pods?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Prometheus documentation --- \code{prometheus.io/docs}, especially the FAQ's honest treatment of pull vs push and its statement that Prometheus is \emph{not} a log aggregation system.
+  \item "Announcing Prometheus 3.0" (prometheus.io blog, November 2024) --- UTF-8 metric names, Remote-Write 2.0, native histograms.
+  \item Google SRE Workbook, "Alerting on SLOs" --- \code{sre.google/workbook/alerting-on-slos} --- the source of multiwindow, multi-burn-rate alerting.
+  \item Google SRE Book, "Monitoring Distributed Systems" --- the four golden signals.
+  \item "How Cloudflare runs Prometheus at scale" (blog.cloudflare.com) --- 916 instances, 4.9 billion series, and the cardinality controls that make it survivable.
+  \item Grafana Loki architecture --- \code{grafana.com/docs/loki/latest/get-started/architecture} --- why indexing labels instead of full text changes the cost profile.
+  \item W3C Trace Context Recommendation --- \code{w3.org/TR/trace-context} --- the \code{traceparent} header format.
+  \item OpenTelemetry specification and semantic conventions --- \code{opentelemetry.io/docs} --- vendor-neutral instrumentation.
+  \item "Evolving Distributed Tracing at Uber Engineering" (uber.com blog) --- the local-agent architecture behind Jaeger.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Every service exposes \code{/metrics} with a request counter and a latency histogram.
+  \item No metric label can take an unbounded value; cardinality is checked in CI.
+  \item Scrape configs set \code{sample\_limit} and \code{label\_limit} so one app cannot break monitoring for all.
+  \item Every service has a RED dashboard with the same panels in the same order.
+  \item Logs are JSON on stdout, shipped by a node agent, carrying a correlation ID from the edge.
+  \item At least one SLO exists, is written down, and has an agreed error-budget policy.
+  \item Paging alerts are symptom-based, burn-rate driven, and every one has a runbook URL.
+  \item A dead-man's-switch alert detects the failure of monitoring itself.
+  \item Alert rules are version-controlled, linted and unit-tested in the pipeline.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 12).} You can now see what your system is doing. Tomorrow you decide who is allowed to do it: least-privilege IAM, secrets that never touch a Git repository, image and dependency scanning in the pipeline, and the security controls that turn a working platform into one you would let a stranger audit. The instinct is the one you met with \code{chmod 777} on Day 1 --- grant to an identity, not to everyone --- moved up to the cloud control plane.
+\end{keyidea}

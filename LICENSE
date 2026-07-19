@@ -1,19 +1,22 @@
-Licensing — The Backend Engineer's Lab Notebook
-==============================================
+Licensing — The Engineer's Lab Notebooks
+=======================================
 
 Copyright (c) 2026 Aymix
 
 This repository is dual-licensed. Which licence applies depends on which part
-of the repository you are using.
+of the repository you are using. It applies identically to both volumes:
+
+    backend/    Volume I  — The Backend Engineer's Lab Notebook
+    devops/     Volume II — The DevOps Engineer's Lab Notebook
 
 
 1. THE CODE — MIT Licence  (see LICENSE-CODE)
 ---------------------------------------------
-The LaTeX design system and build machinery:
+The LaTeX design system and build machinery, in either volume:
 
-    preamble.tex        the design system: colours, callout boxes, code boxes,
+    */preamble.tex      the design system: colours, callout boxes, code boxes,
                         diagram styles, chapter opener, layout macros
-    main.tex            the master document / build entry point
+    */main.tex          the master document / build entry point
     .gitignore
 
 You may use, copy, modify, merge, publish, distribute, sublicense and sell
@@ -23,24 +26,24 @@ Reuse the design system for your own book or documentation freely.
 
 2. THE CONTENT — CC BY-NC-ND 4.0  (see LICENSE-CONTENT)
 -------------------------------------------------------
-The workbook itself — all written material, exercises, labs, diagrams and the
-compiled book:
+The workbooks themselves — all written material, exercises, labs, diagrams and
+the compiled books:
 
-    chapters/*.tex      the fourteen chapters
-    frontmatter.tex     cover, how-to-use, callout legend, the 14-day arc
-    appendix.tex        interview cheat sheet, build tracker, glossary
-    Java-SpringBoot-Backend-Engineer-14-Day-Companion-Workbook.pdf
+    */chapters/*.tex    the fourteen chapters of each volume
+    */frontmatter.tex   cover, how-to-use, callout legend, the 14-day arc
+    */appendix.tex      interview cheat sheet, build tracker, glossary
+    */*.pdf             the compiled workbooks
     README.md
 
 Licensed under Creative Commons Attribution-NonCommercial-NoDerivatives 4.0
-International. You may share the workbook for non-commercial purposes with
-attribution, but you may not sell it or distribute modified versions.
+International. You may share the workbooks for non-commercial purposes with
+attribution, but you may not sell them or distribute modified versions.
 
 
 In short
 --------
 Build your own book with the design system. Read, share and study the
-workbook, but do not sell it or republish altered versions of it.
+workbooks, but do not sell them or republish altered versions of them.
 
 Individual source files carry an SPDX-License-Identifier comment stating which
 licence governs that file.

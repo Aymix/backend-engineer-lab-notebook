@@ -1,0 +1,680 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 02 ============================
+\daychapter{02}{Foundations}{Git \& Version Control Mastery}{The object graph underneath every command --- and how not to lose work}{7--8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain Git's object model --- blobs, trees, commits, refs --- well enough to reason about any command you have never run.
+  \item Choose a branching strategy that matches your team's release cadence, and say why the others would hurt.
+  \item State precisely when \code{rebase} is safe, when it destroys other people's work, and how \code{--force-with-lease} differs from \code{--force}.
+  \item Make good practice the default with hooks, CODEOWNERS and branch protection --- and know which of those is real enforcement.
+  \item Execute a leaked-secret response end to end: rotate first, purge history second, prevent third.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} On Day 1 you wrote \code{bootstrap.sh} and a systemd unit. Right now they exist as bytes on one host, in one person's home directory, with no answer to three questions every operations team must be able to answer instantly: \emph{what exactly is running in production, who changed it and why, and how do we get back to the version that worked?} Version control is the mechanism that turns "the state of our infrastructure" from tribal memory into a queryable, auditable, reversible artifact.
+
+\glabel{Why DevOps engineers need it.} Everything you build for the remaining twelve days is text in a repository. Terraform state comes from \code{.tf} files (Day 7). Ansible converges hosts from playbooks (Day 8). CI pipelines are YAML (Day 9). GitOps controllers reconcile a Kubernetes cluster against a Git commit (Day 13). In every one of those systems, \keyterm{the commit hash is the deployment identity}. If you cannot reason about what a commit \emph{is}, you cannot reason about what is deployed.
+
+\begin{keyidea}
+Git is not a tool for storing files. It is a \keyterm{content-addressable object database} with a small key-value store (refs) layered on top. Once you see that, every command stops being a spell to memorise and becomes an obvious manipulation of a graph: \code{commit} adds a node, \code{branch} adds a pointer, \code{merge} adds a node with two parents, \code{rebase} copies nodes and moves a pointer.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Git sits at the top of the delivery chain as the single source of truth. Every automated system downstream is, structurally, a function of a commit.
+
+\begin{wbfigure}{Fig 2.0 — Git is the input to every automated system you will build. The commit hash is the identity that flows all the way to production.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[lyr, wbboxaccent] (git) {\textbf{Git repository --- commits, refs, tags} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxops, below=of git] (ci) {\textbf{CI: build · test · scan} \hfill \scriptsize Day 9};
+  \node[lyr, below=of ci] (art) {\textbf{Artifacts: image tagged with the SHA} \hfill \scriptsize Day 4};
+  \node[lyr, wbboxcloud, below=of art] (iac) {\textbf{Terraform / Ansible apply} \hfill \scriptsize Day 7--8};
+  \node[lyr, wbboxk8s, below=of iac] (cd) {\textbf{GitOps reconcile to cluster} \hfill \scriptsize Day 13};
+  \node[lyr, wbboxghost, below=of cd] (host) {\textbf{Linux hosts \& containers} \hfill \scriptsize Day 1, 4};
+  \foreach \a/\b in {git/ci,ci/art,art/iac,iac/cd,cd/host}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=5mm of art, text width=26mm, anchor=west] {rollback = point a ref at an older commit};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 gave you a host you could rebuild by hand. Today makes that rebuild \emph{reviewable and recoverable}: the same script, but with a history, an owner, a required review and a check that refuses to let a secret leave your laptop. From tomorrow onward, "it works on my machine" stops being a defence because the machine is described in the repository.
+
+\glabel{Where companies use it in production.} Microsoft moved the Windows source tree --- over 3.5 million files and more than 270\,GB --- into a single Git repository, which vanilla Git could not handle: a clone took over twelve hours and \code{git status} took roughly ten minutes. Their answer, GVFS (later generalised as Scalar and upstreamed into core Git), virtualises the working tree so files are fetched on first read; clone dropped to minutes and \code{status} to a few seconds. Google went the other way: unable to find any system that would scale to a billion-file repository, they built the proprietary \keyterm{Piper} monorepo on Spanner across ten data centres, and practise trunk-based development with essentially no branches other than release branches. Two opposite engineering choices, one shared conclusion --- the version-control model determines the shape of the whole delivery process.
+
+\glabel{Common misconceptions.} That Git stores diffs (it stores whole snapshots, deduplicated by hash --- diffs are computed on demand); that a branch is a copy of the code (it is a file containing one hash); that deleting a file removes it from history (the old object is still there, still reachable, still fetchable); and that a commit is "saved work" (until it is referenced by a ref \emph{and} pushed, it is a garbage-collection candidate on one laptop).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 2.1 — The Day 2 territory: a content-addressed object store, pointers into it, and the social machinery teams build on top.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (hash) {Content hash\\SHA-1 / SHA-256};
+  \node[wbbox, right=11mm of hash] (obj) {Objects\\blob · tree · commit};
+  \node[wbbox, above=8mm of obj] (idx) {Index\\staging area};
+  \node[wbbox, below=8mm of obj] (refs) {Refs\\branch · tag · HEAD};
+  \draw[wbarrow] (hash)--(obj); \draw[wbarrow] (hash)--(idx); \draw[wbarrow] (hash)--(refs);
+  \node[wbboxops, right=9mm of idx] (hist) {History ops\\merge · rebase};
+  \node[wbboxops, right=9mm of obj] (remote) {Remotes\\fetch · push};
+  \node[wbbox, right=9mm of refs] (reflog) {Reflog\\local safety net};
+  \draw[wbarrow] (idx)--(hist); \draw[wbarrow] (obj)--(remote); \draw[wbarrow] (refs)--(reflog);
+  \node[wbboxsec, right=9mm of hist] (prot) {Protection\\hooks · CODEOWNERS};
+  \node[wbboxgood, right=9mm of reflog] (rec) {Recovery\\revert · purge · rotate};
+  \draw[wbarrow] (hist)--(prot); \draw[wbarrow] (remote)--(prot); \draw[wbarrow] (reflog)--(rec);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{content addressing} $\rightarrow$ \keyterm{blob} $\rightarrow$ \keyterm{tree} $\rightarrow$ \keyterm{commit} $\rightarrow$ \keyterm{ref} $\rightarrow$ \keyterm{HEAD} $\rightarrow$ \keyterm{index} $\rightarrow$ \keyterm{merge base} $\rightarrow$ \keyterm{reflog} $\rightarrow$ \keyterm{branch protection}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Object Model --- Content, Addressed by Its Own Hash}
+
+\glabel{What is it?} Git stores four kinds of object in \code{.git/objects}, and every one of them is named by the cryptographic hash of its own contents:
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} X@{}}
+\wbtablehead{Object} & \wbtablehead{What it holds}\\
+blob & The raw bytes of one file version. No filename, no path, no history --- just content.\\
+tree & A directory listing: mode, type, hash and \emph{name} for each entry. Trees reference blobs and other trees.\\
+commit & One root tree hash, zero or more parent commit hashes, author, committer, timestamps, message.\\
+tag & An annotated tag: a named, optionally signed pointer to another object.\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why does it exist?} Earlier centralised systems --- CVS, then Subversion --- modelled history as a sequence of \emph{changes} to files on a server. That made three operations expensive or impossible: branching copied the tree, history was only complete on the server, and verifying that what you received was what was sent required trusting the server. Linus Torvalds's design inverted it: name every piece of content by its hash, and integrity becomes structural. If a single byte of an old file changes, its blob hash changes, so every tree containing it changes, so every commit above it changes. \keyterm{You cannot silently alter history in Git; you can only replace it with a visibly different history.}
+
+\glabel{How does it work internally?} A commit is a small text object. Reading one is the fastest way to demolish the "commits are diffs" misconception:
+
+\begin{outbox}[git cat-file -p HEAD]
+tree 4d5e9f1a3c2b7e08f6a1d94c3b2e5f7a0c8d6b41
+parent 9a3f2c81b04e7d6a5f39c2b81e0d47a6f3c95b2e
+author  Amine <amine@cloudbase.dev> 1752921600 +0100
+committer Amine <amine@cloudbase.dev> 1752921600 +0100
+
+feat(bootstrap): fail fast on unset ENVIRONMENT
+\end{outbox}
+
+That is the entire commit. There is no diff in it. When you run \code{git show}, Git loads this commit's tree and its parent's tree, walks both, and computes the difference \emph{at that moment}. Because identical content yields an identical hash, a file unchanged across a thousand commits is stored exactly once and referenced a thousand times --- this is why a repository with deep history is far smaller than the naive sum of its versions.
+
+\begin{wbfigure}{Fig 2.2 — Two commits, one changed file. The unchanged blob is shared; only the objects on the path to the change are new.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 12mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxghost] (c1) {commit C1\\tree T1};
+  \node[wbboxaccent, right=of c1] (c2) {commit C2\\tree T2 · parent C1};
+  \draw[wbarrowg] (c2)--node[wbcap,above]{parent}(c1);
+  \node[wbboxghost, below=9mm of c1] (t1) {tree T1};
+  \node[wbboxaccent, below=9mm of c2] (t2) {tree T2};
+  \draw[wbarrowg] (c1)--(t1); \draw[wbarrow] (c2)--(t2);
+  \node[wbbox, below=9mm of t1] (b1) {blob: README\\(unchanged)};
+  \node[wbboxgood, below=9mm of t2] (b2) {blob: bootstrap.sh\\(new content)};
+  \draw[wbarrowg] (t1)--(b1); \draw[wbarrow] (t2)--(b2);
+  \draw[wbarrow] (t2.south west) to[out=200,in=20] node[wbcap,above,pos=0.5]{same hash, stored once} (b1.north east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+\code{git commit} does not "save your files". It writes any new blobs, builds the tree objects that describe the staged directory structure, writes a commit object pointing at the root tree and the current \code{HEAD}, and finally rewrites one small file --- the branch ref --- to contain the new commit's hash. The last step is the only mutation; everything before it is append-only. That is why interrupted Git operations rarely corrupt anything.
+\end{behind}
+
+\glabel{When should I use it?} This mental model pays off every time a command surprises you. "Where did my commit go?" becomes "which ref used to point at it?" --- a question with an answer (\code{git reflog}), rather than a panic.
+
+\glabel{When should I \emph{not} lean on it?} Git is a terrible database for large binaries. Every version of a 200\,MB video is a full blob that every clone must download forever. Use Git LFS or an artifact store; do not commit build outputs, and never commit \code{terraform.tfstate} (Day 7 explains what belongs in remote state instead).
+
+\begin{misconception}
+"SHA-1 is broken, so Git is insecure." The SHAttered attack of February 2017 produced a real SHA-1 collision, and Git responded by shipping a hardened SHA-1 that detects collision attempts. The object format is nevertheless migrating: \code{extensions.objectFormat = sha256} exists today, and the Git project's stated plan is for SHA-256 to become the default in Git 3.0. For your purposes the practical consequence is small --- but knowing \emph{why} the transition is hard (every hash in every object of every clone would change) is a good demonstration of what content addressing costs you.
+\end{misconception}
+
+\wbsub{3.2\quad Refs, HEAD and the Index --- the Three Trees}
+
+\glabel{What is it?} A \keyterm{ref} is a file under \code{.git/refs} whose contents are one object hash. A branch ref for a SHA-1 repository is exactly 41 bytes: forty hexadecimal characters and a newline. \code{HEAD} is one indirection above that --- normally the text \code{ref: refs/heads/main}, telling Git which branch you are "on".
+
+\glabel{Why does it exist?} Because branching had to become free. In Subversion, creating a branch meant a server-side copy and switching meant a network round trip, so teams branched rarely and merged painfully. When a branch costs 41 bytes and a local write, developers branch per task --- and the entire pull-request workflow the industry now runs on becomes possible.
+
+\glabel{How does it work internally?} Three trees are in play at all times, and almost every confusing Git message is about a disagreement between them.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{26mm} X L{34mm}@{}}
+\wbtablehead{Tree} & \wbtablehead{What it is} & \wbtablehead{Moved by}\\
+Working directory & The actual files on disk you edit & Your editor\\
+Index (staging) & A binary file listing paths, modes and blob hashes for the \emph{next} commit & \code{git add}, \code{git restore --staged}\\
+HEAD & The commit your branch currently points at & \code{git commit}, \code{git checkout}, \code{git reset}\\
+\end{tabularx}
+\end{center}
+
+\code{git status} is nothing more than two comparisons: HEAD versus index ("changes to be committed") and index versus working directory ("changes not staged"). \code{git reset} takes a target commit and a flag saying how far the reset propagates --- \code{--soft} moves HEAD only, \code{--mixed} (the default) also rewrites the index, \code{--hard} additionally overwrites the working directory. That is the whole model, and it explains why only \code{--hard} can destroy uncommitted work.
+
+\begin{wbfigure}{Fig 2.3 — Local repository versus remote. A push moves objects and then updates a ref; a fetch does the same in reverse, into a remote-tracking ref you do not edit.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 10mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox] (wd) {Working dir};
+  \node[wbbox, right=of wd] (ix) {Index};
+  \node[wbboxaccent, right=of ix] (head) {HEAD\\refs/heads/main};
+  \draw[wbarrow] (wd)--node[wbcap,above]{git add}(ix);
+  \draw[wbarrow] (ix)--node[wbcap,above]{git commit}(head);
+  \node[wbboxops, right=14mm of head] (rem) {origin/main\\(remote-tracking)};
+  \draw[wbarrow] (head)--node[wbcap,above]{push}(rem);
+  \draw[wbarrowg] ([yshift=-3mm]rem.west)--node[wbcap,below]{fetch}([yshift=-3mm]head.east);
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(wd)(ix)(head)] (loc) {};
+    \node[wbzonelabel, anchor=north west] at (loc.north west) {your laptop --- everything here is local and cheap};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{seniornote}
+\code{git pull} is \code{git fetch} followed by an integration step, and the second half is where teams hurt themselves. \code{fetch} is always safe: it only downloads objects and moves remote-tracking refs. Configure the integration deliberately --- \code{pull.rebase=true} for a linear history, or \code{pull.ff=only} so that a pull which cannot fast-forward stops and makes you choose. The default silent merge commit is how repositories accumulate a hundred "Merge branch 'main' of github.com/..." commits that carry no information.
+\end{seniornote}
+
+\wbsub{3.3\quad Branching Strategies --- Match the Cadence, Not the Fashion}
+
+\glabel{What is it?} A branching strategy is a team agreement about which branches exist, how long they live, and what merging into each one means. It is a \emph{social} protocol enforced by \emph{technical} controls.
+
+\glabel{Why does it exist?} Because integration cost grows superlinearly with divergence time. Two branches that diverged an hour ago almost never conflict; two that diverged three weeks ago conflict semantically even when Git reports no textual conflict --- your colleague renamed the function you built on top of, and the merge succeeds into code that no longer compiles. Branching strategy is fundamentally a lever on how long divergence is allowed to last.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{28mm} X L{40mm}@{}}
+\wbtablehead{Strategy} & \wbtablehead{Model} & \wbtablehead{Fits a team that\ldots}\\
+Trunk-based & Everyone commits small changes to \code{main} daily; unfinished work hides behind feature flags & Deploys many times a day and has fast, trustworthy CI\\
+GitHub Flow & Short-lived branch $\rightarrow$ pull request $\rightarrow$ review $\rightarrow$ merge to \code{main} $\rightarrow$ deploy & Runs continuous deployment; the common default for SaaS\\
+Git Flow & Long-lived \code{develop}, plus \code{release/*} and \code{hotfix/*} branches & Ships versioned artifacts on a schedule, supports old versions\\
+\end{tabularx}
+\end{center}
+
+\glabel{Production example.} Google's monorepo paper describes trunk-based development at extreme scale: tens of thousands of engineers, over a billion files, and effectively no branches except release branches --- every change goes to trunk, guarded by mandatory review and a very large automated test system. That only works because the safety net is strong enough to make trunk always releasable. Adopt trunk-based development without that test coverage and you have not adopted a strategy; you have removed one.
+
+\begin{tradeoff}
+Git Flow gets mocked, but it exists for a real constraint: if you must patch version 2.3 for a customer who will not upgrade while 3.0 is in development, you need a long-lived branch, and no amount of feature-flagging removes that need. The mistake is not using Git Flow --- it is using Git Flow when you deploy continuously from \code{main} and therefore maintain a \code{develop} branch that has no distinct meaning. Choose the strategy from your \emph{release cadence}, not from a blog post.
+\end{tradeoff}
+
+\begin{scalenote}
+Strategy interacts with repository scale. Microsoft could not run trunk-based development on Windows until Git itself got faster --- when \code{git status} takes ten minutes, developers batch work into long-lived branches out of self-defence. Their fix was engineering (GVFS, then Scalar: lazy file hydration, sparse checkout, commit-graph and multi-pack indexes now in core Git), not process. When a process convention keeps failing, check whether a tool is making the good path slow.
+\end{scalenote}
+
+\glabel{When should I \emph{not} enforce a strategy hard?} A two-person prototype does not need a release-branch policy; the ceremony will cost more than the conflicts it prevents. Introduce controls when the cost of a mistake exceeds the cost of the process --- which for anything touching production is essentially immediately.
+
+\wbsub{3.4\quad Merge vs Rebase --- Same Destination, Different History}
+
+\glabel{What is it?} Both integrate one line of work into another. \code{git merge} finds the \keyterm{merge base} (the most recent common ancestor of the two branches), performs a three-way merge, and records a \emph{new commit with two parents}. Nothing existing is touched. \code{git rebase} instead takes each of your commits, computes its diff against its parent, and re-applies it onto a new base --- producing \emph{new commits with new hashes} and moving your branch pointer to the last of them. The old commits still exist, briefly, but nothing references them.
+
+\glabel{Why does it exist?} Merge preserves the literal truth of what happened; rebase preserves the \emph{readability} of what you meant. A history of forty commits including "wip", "fix typo" and "actually fix typo" is an honest record of your afternoon and a useless record for the engineer bisecting a production regression in eight months. Interactive rebase is how you turn the first into the second before anyone else sees it.
+
+\begin{wbfigure}{Fig 2.4 — Rebase does not move commits; it copies them. The originals become unreferenced, which is exactly why rebasing shared work is dangerous.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox] (m1) {main: A};
+  \node[wbbox, right=of m1] (m2) {B};
+  \node[wbboxaccent, right=of m2] (m3) {C (new on main)};
+  \draw[wbarrowg] (m1)--(m2); \draw[wbarrowg] (m2)--(m3);
+  \node[wbboxghost, below=10mm of m2] (f1) {X};
+  \node[wbboxghost, right=of f1] (f2) {Y};
+  \draw[wbarrowg] (m2.south)--(f1); \draw[wbarrowg] (f1)--(f2);
+  \node[wbcap, left=3mm of f1, text width=17mm] {originals: now unreferenced};
+  \node[wbboxgood, right=16mm of m3] (n1) {X'};
+  \node[wbboxgood, right=of n1] (n2) {Y'\\branch tip};
+  \draw[wbarrow] (m3)--(n1); \draw[wbarrow] (n1)--(n2);
+  \draw[wbflow] (f2.east) to[out=0,in=270] node[wbcap,below,pos=0.6]{replayed: new hashes} (n1.south);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{secwarn}[the one rule that prevents rebase disasters]
+Never rebase commits that have been pushed and pulled by someone else. Their clone still references the \emph{old} commits; when you force-push the rewritten ones, their next pull produces a history with both copies, and the "fix" they reach for --- merging --- duplicates every commit. Rebase freely on your own unpublished branch; use \code{merge} or \code{revert} on anything shared. If you must rewrite a shared branch, that is an announced, coordinated operation, not a Tuesday afternoon.
+\end{secwarn}
+
+\begin{bashbox}[cleaning up a feature branch before opening a PR]
+git fetch origin
+git rebase -i origin/main     # squash wip commits, reword, reorder
+git push --force-with-lease   # NOT --force
+\end{bashbox}
+
+\glabel{How does \code{--force-with-lease} work internally?} A plain \code{--force} tells the server "set this ref to my hash, whatever it currently is". \code{--force-with-lease} sends an additional expectation: "set it to my hash \emph{only if} it currently equals the value my remote-tracking ref recorded when I last fetched." The server performs a compare-and-swap and rejects the push if anyone else advanced the branch in the meantime. It is optimistic concurrency control on a ref --- the same pattern as a conditional \code{PUT} with an ETag, or a DynamoDB conditional write.
+
+\begin{misconception}
+\code{--force-with-lease} is not magic protection. If your tooling (or an IDE, or a background \code{git fetch}) updates your remote-tracking ref without you looking at the new commits, the lease now matches and the force succeeds --- overwriting work you never saw. The robust form pins the expected value explicitly: \code{git push --force-with-lease=refs/heads/main:<sha>}. Newer Git also offers \code{--force-if-includes}, which additionally requires that the commits you are about to overwrite are reachable from your local branch.
+\end{misconception}
+
+\glabel{Production example.} On GitHub, high-traffic repositories use a \keyterm{merge queue} rather than letting each pull request merge directly. The queue groups pending pull requests with the latest base branch, runs the required checks against that combined candidate, and merges only if it passes. This exists to close a specific gap: two pull requests can each pass CI in isolation and still break \code{main} together --- for example, one renames a function while the other adds a new call to it. Testing the branch, rather than the merge result, is a false sense of safety at high merge rates.
+
+\wbsub{3.5\quad Making the Right Thing the Easy Thing --- Hooks, CODEOWNERS, Protection}
+
+\glabel{What is it?} Three layers of control with very different strength. \keyterm{Hooks} are executable scripts in \code{.git/hooks} that Git runs at defined points --- \code{pre-commit} before a commit is created, \code{commit-msg} to validate the message, \code{pre-push} before objects are sent. \keyterm{CODEOWNERS} is a file mapping path patterns to teams, so the right reviewers are requested automatically. \keyterm{Branch protection} is a server-side rule: this branch cannot be pushed to directly, requires N approving reviews, requires named status checks to pass, and cannot be force-pushed or deleted.
+
+\glabel{Why does it exist?} Because process documents do not execute. "Everyone should run the linter" is a wish; a \code{pre-commit} hook that runs it is a mechanism. But note the asymmetry that matters most:
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{30mm} X C{22mm}@{}}
+\wbtablehead{Control} & \wbtablehead{Where it runs} & \wbtablehead{Bypassable?}\\
+\code{pre-commit} hook & Your laptop, from a directory not under version control & Yes --- \code{--no-verify}\\
+CODEOWNERS & The forge, when a PR is opened & Advisory unless paired with protection\\
+Required review & The forge, server-side & Only by an admin, and it is logged\\
+Required status check & The forge, server-side & Only by an admin, and it is logged\\
+\end{tabularx}
+\end{center}
+
+\begin{seniornote}
+Local hooks are a \emph{fast feedback} mechanism, not a security control. They live in \code{.git/hooks}, which is not cloned, so a new teammate has none until something installs them; and any developer can skip them with \code{--no-verify}. Treat them as the ten-second version of a check whose authoritative copy runs in CI (Day 9). The correct architecture is: same check, two places --- locally for speed, server-side for truth.
+\end{seniornote}
+
+\begin{bashbox}[.githooks/pre-commit — block obvious secrets before they leave the laptop]
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Scan only what is STAGED, not the working tree.
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+patterns='AKIA[0-9A-Z]{16}|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|xox[baprs]-'
+
+if git diff --cached -U0 -- $staged | grep -nEq "$patterns"; then
+  echo "BLOCKED: a credential-shaped string is staged." >&2
+  echo "Remove it, use an env var or a secrets manager, then re-commit." >&2
+  exit 1
+fi
+\end{bashbox}
+
+\begin{bashbox}[making the hook survive a fresh clone]
+# .git/hooks is not versioned, so version the hooks elsewhere
+# and point Git at that directory (Git 2.9+):
+git config core.hooksPath .githooks
+chmod +x .githooks/*
+# Put this line in bootstrap/setup so nobody has to remember it.
+\end{bashbox}
+
+\glabel{How does branch protection work internally?} The forge intercepts the ref update. A push to a protected branch is a request to move \code{refs/heads/main}; the server evaluates its rules against that update and rejects it with a message rather than writing the ref. Required status checks work the same way at merge time --- the merge button is disabled until a check run with the configured name reports success for the head commit. This is why the check must be named exactly and must actually run on pull requests: a required check that never reports simply blocks the branch forever, which is the single most common configuration mistake.
+
+\begin{autotip}
+Commit message conventions become useful the moment a machine reads them. Conventional Commits (\code{feat:}, \code{fix:}, \code{chore:}, \code{feat!:} for a breaking change) lets tooling derive the next semantic version and generate a changelog from history alone. Enforce it in \code{commit-msg} locally and as a required check on the pull-request title. The real payoff arrives on Day 9, when the pipeline tags an image from the commit rather than from a human typing a version number.
+\end{autotip}
+
+\begin{propsbox}[CODEOWNERS — last matching pattern wins]
+# Default owner for everything not matched below
+*                       @cloudbase/platform
+
+# Infrastructure needs a platform reviewer, always
+/terraform/             @cloudbase/platform @cloudbase/security
+/.github/workflows/     @cloudbase/platform
+
+# Anything security-relevant pulls in the security team
+/scripts/bootstrap.sh   @cloudbase/platform @cloudbase/security
+/SECURITY.md            @cloudbase/security
+\end{propsbox}
+
+\begin{opsnote}
+CODEOWNERS only creates real accountability when the protected branch also requires review \emph{from code owners}. Without that box ticked, it merely suggests reviewers, and a pull request touching \code{/terraform/} can be approved by anyone. Audit this: pick a protected repository and check whether the owner requirement is actually enforced, or only implied.
+\end{opsnote}
+
+\wbsub{3.6\quad When a Secret Is Committed --- Rotate, Purge, Prevent (in That Order)}
+
+\glabel{What is it?} A credential reaches a commit --- an AWS access key, a private key, a database URL with a password. This will happen to you or your team. What separates a senior response from a junior one is the ordering.
+
+\glabel{Why does the ordering matter?} Because the moment a secret is pushed to a shared remote you must assume it is compromised. Public repositories are scraped by automated harvesters within seconds of a push. Purging history is \emph{cleanup}; it does not un-disclose anything. If you spend forty minutes rewriting history before revoking the key, you have spent forty minutes leaving a live credential in the hands of whoever already copied it.
+
+\begin{wbfigure}{Fig 2.5 — Incident order for a leaked credential. Step 1 is the one that stops the bleeding; the rest is hygiene.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.4mm, align=left, text width=56mm}]
+  \node[stg, wbboxwarn] (a) {\textbf{1 · Revoke and rotate} \hfill \scriptsize the only step that stops access};
+  \node[stg, wbboxops, below=of a] (b) {\textbf{2 · Check the audit logs} \hfill \scriptsize was it used, and by whom?};
+  \node[stg, below=of b] (c) {\textbf{3 · Purge from history} \hfill \scriptsize git filter-repo, then force-push};
+  \node[stg, below=of c] (d) {\textbf{4 · Re-clone everywhere} \hfill \scriptsize stale clones still hold the object};
+  \node[stg, wbboxsec, below=of d] (e) {\textbf{5 · Ask the forge to expire caches} \hfill \scriptsize old objects stay reachable};
+  \node[stg, wbboxgood, below=of e] (f) {\textbf{6 · Prevent} \hfill \scriptsize push protection + hook + secrets manager};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f}{\draw[wbarrow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does the purge work internally?} You cannot delete a commit from the middle of history, because every later commit's hash is derived from it. What history rewriting actually does is \emph{replay} the whole history, applying a filter to each commit, producing an entirely new chain of objects with new hashes. The tool the Git project recommends today is \code{git filter-repo}; \code{git filter-branch} is documented as slow and error-prone and should not be used. The BFG Repo-Cleaner is a faster alternative for the narrow case of deleting files or replacing strings.
+
+\begin{bashbox}[purging a file from all history with git filter-repo]
+# Always work on a fresh mirror clone, never your working repo
+git clone --mirror git@github.com:cloudbase/platform.git
+cd platform.git
+
+# Remove one path from every commit in every branch and tag
+git filter-repo --invert-paths --path scripts/.env.production
+
+# Rewritten history is a different history: this must be forced
+git push --force --all
+git push --force --tags
+\end{bashbox}
+
+\begin{secwarn}[what the purge does not accomplish]
+The old objects remain reachable for a while even after a successful force-push: the forge keeps them behind pull-request refs and internal caches, teammates' clones still contain them, and any fork made before the rewrite retains the full original history --- forks are outside your control entirely. This is precisely why revocation comes first. Ask your provider to expire cached views, and treat the secret as public regardless of how clean the history looks afterwards.
+\end{secwarn}
+
+\begin{prodtip}
+Server-side push protection is the control that would have prevented the incident. GitHub's secret scanning push protection inspects incoming pushes for known credential formats --- provider partners register their token patterns --- and blocks the push, telling the developer why. It can be bypassed with a stated reason, and each bypass raises an alert and is logged. That design is worth studying: an unbypassable control gets disabled by a team under deadline pressure; a bypassable-but-loud control survives contact with reality and still produces the audit trail.
+\end{prodtip}
+
+\begin{reliability}
+Prevention beats detection beats response, but you should still rehearse the response. Run the whole drill once on a throwaway repository --- commit a fake key, push it, revoke it, purge it, re-clone --- so that the first time you do it is not at 2am with an active credential in a public repository. A runbook nobody has executed is a hypothesis.
+\end{reliability}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Write commit messages that explain \emph{why}; the diff already says what.
+  \item Keep feature branches short-lived --- days, not weeks. Divergence is the cost driver.
+  \item Use \code{--force-with-lease}, never bare \code{--force}, and never on a shared branch.
+  \item Protect \code{main}: no direct pushes, required review, required status checks, no force-push.
+  \item Run the same secret scan locally (fast) and in CI (authoritative).
+  \item Revoke and rotate a leaked credential \emph{before} touching history.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Believing a later commit that deletes a file removes it from history.
+  \item Rebasing a branch other people have already pulled, then force-pushing over their work.
+  \item \code{git reset --hard} on a branch with uncommitted or unpushed work.
+  \item Treating a local hook as a security control instead of a fast first check.
+  \item Committing generated artifacts, large binaries or \code{terraform.tfstate}.
+  \item Configuring a required status check whose name never reports, blocking every merge.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. Reproducing a diagram is what moves it from "I recognise that" to "I can explain that under pressure."
+
+\begin{writespace}[Redraw: commit $\rightarrow$ tree $\rightarrow$ blob for two commits where one file changed. Mark which objects are new and which are shared.]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: a rebase. Show the original commits, the copies, the moved branch pointer --- and mark the moment where a teammate's clone diverges.]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Repository Conventions for CloudBase}
+
+\textbf{Goal.} Take the loose \code{bootstrap.sh} from Day 1 and put it behind a real engineering process: conventions, ownership, automated checks and a protected branch. You are designing the guardrails, not typing commands --- decide \emph{what} each control must guarantee before you configure it.
+
+\resetlab
+\labstep{Inspect the object graph you already have}
+Use \code{git cat-file -p HEAD} to print your latest commit, then follow the tree hash, then a blob hash. Do it by hand once.
+\labwhy{Reading the raw objects converts the model from something you read about into something you have seen. Every later command becomes predictable.}
+
+\labstep{Choose the branching strategy and write down why}
+Decide between trunk-based and GitHub Flow for CloudBase and record the decision in \code{docs/branching.md}, naming the release cadence that justifies it.
+\labwhy{An undocumented convention is not a convention. Writing the justification forces you to notice if you are copying a strategy rather than choosing one.}
+
+\labstep{Establish a commit-message convention}
+Adopt Conventional Commits and add a \code{commit-msg} hook that rejects a message not matching the pattern.
+\labwhy{You are creating machine-readable history now so that Day 9's pipeline can derive versions and changelogs without a human deciding them.}
+
+\labstep{Write the pre-commit secret-blocking hook}
+Scan the \emph{staged} diff for AWS access-key IDs, private-key headers and provider token prefixes. Exit non-zero with an actionable message.
+\labwhy{Scanning the staged diff (not the working tree) is the correct scope: it is exactly the content about to become an immutable object.}
+
+\labstep{Make the hooks survive a fresh clone}
+Move the hooks to a versioned \code{.githooks/} directory and set \code{core.hooksPath}. Add that line to the repository setup script.
+\labwhy{\code{.git/hooks} is never cloned. A control that only exists on the machine of whoever wrote it protects nobody.}
+
+\labstep{Add CODEOWNERS with meaningful boundaries}
+Map \code{/terraform/}, \code{/.github/workflows/} and any bootstrap or security path to the teams that must see changes there.
+\labwhy{Reviewer selection is a risk control. The people who understand the blast radius of a change should be the ones asked to approve it.}
+
+\labstep{Protect \code{main}}
+Require a pull request, at least one approving review, review from code owners, a named passing status check, and disallow force-push and deletion.
+\labwhy{This is the first control in the chapter that a determined developer cannot bypass silently. Everything else is speed; this is truth.}
+
+\labstep{Try to break each control, deliberately}
+Push directly to \code{main}. Commit with \code{--no-verify} and a fake AWS key. Open a pull request touching \code{/terraform/} without a code owner.
+\labwhy{You must know which of your controls are advisory and which are enforced. Discovering that during an incident is expensive; discovering it now is free.}
+
+\begin{prodtip}
+Make the required status check a real job that runs on every pull request --- even if today it only runs the secret scan and \code{shellcheck}. Protection rules that reference a check name which never reports leave the branch permanently unmergeable, and the usual "fix" is an admin turning protection off. Configure the check first, make it green, then require it.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Git recomputes diffs on demand from full snapshots rather than storing diffs. Storing diffs would obviously use less space for text. What does Git buy with that trade, and which operations would become expensive in the diff-based design?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A local \code{pre-commit} hook can be skipped with \code{--no-verify}, and push protection can be bypassed with a stated reason. Both are deliberately defeatable. Argue the case for and against making them impossible to bypass, and say what you would do for a repository holding production infrastructure.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Google runs trunk-based development across a billion files with almost no branches; Microsoft had to rewrite parts of Git before Windows could work that way at all. What does that suggest about the relationship between tooling performance and team process --- and where in your current workflow is a slow tool quietly shaping behaviour?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{"My commits vanished after a rebase"}
+\textbf{Symptom.} An engineer ran \code{git rebase -i} on a feature branch, hit a conflict, panicked, ran \code{git rebase --abort} and then \code{git reset --hard origin/feature}. Three commits of work are gone from \code{git log}.
+
+\begin{outbox}[git reflog]
+a91c4de HEAD@{0}: reset: moving to origin/feature
+7f2b8c1 HEAD@{1}: rebase (abort): returning to refs/heads/feature
+3e5d902 HEAD@{2}: rebase (start): checkout origin/main
+3e5d902 HEAD@{3}: commit: feat(hooks): block AWS key patterns
+b04a7f6 HEAD@{4}: commit: feat(hooks): add commit-msg validation
+c72e15a HEAD@{5}: commit: chore: add .githooks directory
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} \code{git log} shows nothing, but the reflog still lists the three commits at \code{HEAD@\{3\}} and below.
+  \item \textbf{Hypothesise.} The commit objects were never deleted --- the branch ref was moved, so nothing points at them any more.
+  \item \textbf{Investigate.} \code{git show 3e5d902} still prints the commit. The objects are intact; only reachability was lost. \code{git fsck --lost-found} would find them too.
+  \item \textbf{Root cause.} \code{reset --hard} moved the ref; unreferenced commits become invisible to \code{log} but survive until garbage collection (default expiry is 30 days for unreachable objects, 90 for reflog entries).
+  \item \textbf{Fix.} \code{git branch rescue 3e5d902}, verify the content, then reset the feature branch to it or cherry-pick what is needed.
+  \item \textbf{Prevent.} Before any history-rewriting operation, tag the current tip: \code{git tag backup/pre-rebase}. It costs nothing and turns recovery from archaeology into a one-liner.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The secret was removed from the repo, but the key is still being used}
+\textbf{Symptom.} An AWS access key was committed. The developer deleted the file, committed the deletion, and reported it fixed. Two days later CloudTrail shows API calls from an unfamiliar IP using that key.
+
+\begin{outbox}[git log --all --oneline -- scripts/.env.production]
+d19f4a3 chore: remove accidentally committed env file
+7c02b5e feat(bootstrap): add production environment file
+
+# the blob is still fully reachable from the earlier commit:
+$ git show 7c02b5e:scripts/.env.production | head -1
+AWS_ACCESS_KEY_ID=AKIA................
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Deleting a file adds a commit whose tree omits it; every earlier commit still references the blob, and \code{git show} retrieves it in one command.
+  \item \textbf{Hypothesise.} The credential was never revoked, so removal from \code{HEAD} changed nothing about its validity --- and it was public for two days regardless.
+  \item \textbf{Investigate.} Deactivate the key in IAM, then read CloudTrail for every call made with that access-key ID: which principal, which region, which resources.
+  \item \textbf{Root cause.} A secret in source control plus a response that treated a disclosure incident as a file-management problem.
+  \item \textbf{Fix.} Revoke and rotate first. Then purge with \code{git filter-repo} on a mirror clone, force-push, have everyone re-clone, and ask the forge to expire cached views of the old objects.
+  \item \textbf{Prevent.} Enable server-side push protection, ship the \code{pre-commit} scan via \code{core.hooksPath}, move real values into a secrets manager, and commit only a \code{.env.example} with placeholder values.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~35 min}
+\textbf{Goal.} Read Git's object database by hand and prove that commits are snapshots.\\
+\textbf{Business context.} You are about to be responsible for a repository whose history is an audit record.\\
+\textbf{Architecture.} One local repository, four commits, one file edited twice.\\
+\textbf{Requirements.} Use \code{cat-file -p} to walk commit $\rightarrow$ tree $\rightarrow$ blob for two commits; record which blob hashes are identical across them.\\
+\textbf{Constraints.} No GUI, no \code{git log -p} --- follow the hashes manually.\\
+\textbf{Hints.} \code{git rev-parse HEAD} for the hash; \code{git cat-file -t <sha>} tells you the object type.\\
+\textbf{Expected outcome.} A written explanation of exactly which objects a commit creates and which it reuses.\\
+\textbf{Production considerations.} Explain from this why committing a 200\,MB binary is permanent.\\
+\textbf{Common pitfalls.} Assuming the tree hash changes when only the message changes (it does not --- but the commit hash does).
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~55 min}
+\textbf{Goal.} Cause a rebase disaster in a controlled environment, then recover from it.\\
+\textbf{Business context.} You want to be the person who fixes this calmly, not the person who caused it.\\
+\textbf{Architecture.} One bare repo as "origin", two clones acting as two developers.\\
+\textbf{Requirements.} Both clones push to a shared branch; clone A rebases and force-pushes; observe what clone B sees on the next pull, then recover B's lost commit via the reflog.\\
+\textbf{Constraints.} Recover without asking A for anything --- work only from B's local objects.\\
+\textbf{Hints.} Compare a plain \code{--force} with \code{--force-with-lease} after B has pushed; note which is rejected.\\
+\textbf{Expected outcome.} A short runbook: symptom, three commands, recovery, and the rule that prevents it.\\
+\textbf{Production considerations.} Which branch protection setting would have made this impossible?\\
+\textbf{Common pitfalls.} Fixing the divergence with a merge, which duplicates every rewritten commit.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~95 min}
+\textbf{Goal.} Build the full guardrail set for CloudBase and prove each control by attacking it.\\
+\textbf{Business context.} The repository will soon hold Terraform that can create and destroy real cloud resources.\\
+\textbf{Architecture.} Repository $\rightarrow$ versioned \code{.githooks/} $\rightarrow$ CODEOWNERS $\rightarrow$ protected \code{main} $\rightarrow$ required check.\\
+\textbf{Requirements.} Conventional-commit validation, staged-diff secret scan, CODEOWNERS with at least three meaningful path rules, protection requiring one review plus code-owner review plus one named check.\\
+\textbf{Constraints.} A fresh clone must acquire every local control by running one setup command --- no manual instructions.\\
+\textbf{Hints.} \code{core.hooksPath} for distribution; make the required check green \emph{before} you require it.\\
+\textbf{Expected outcome.} A table of every control, where it runs, and the exact command that defeats it (or "cannot be defeated silently").\\
+\textbf{Production considerations.} Which of these should be organisation-wide policy rather than per-repository settings?\\
+\textbf{Common pitfalls.} Requiring a status check that never reports; assuming CODEOWNERS is enforced without the matching protection option.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{infranote}
+Git's design choice --- distributed, content-addressed, append-only --- is why GitOps works at all. A Kubernetes controller can reconcile a cluster against a commit hash precisely because that hash is a cryptographic statement about exact content, verifiable without trusting the transport. Day 13's GitOps model is this chapter's object model applied to cluster state.
+\end{infranote}
+
+\begin{drtip}
+Every developer's clone is a full backup of the history --- but not of the metadata your team actually depends on: pull requests, reviews, issues, CI configuration, protection rules and secrets all live in the forge, not in the repository. Ask what your recovery plan is if the forge account is lost. Mirroring the repository is easy; reconstructing four years of review context is not.
+\end{drtip}
+
+\begin{costnote}
+Repository hygiene is a real cost line. Committed build artifacts and large binaries are downloaded by every clone, every CI job and every container build, forever --- history cannot be slimmed without a coordinated rewrite. On a pipeline running hundreds of jobs a day, a 500\,MB history is measurable egress and measurable runner minutes. Enforce a size limit in CI before the repository grows, not after.
+\end{costnote}
+
+\begin{interview}
+Expect: \emph{"A secret was committed three commits ago and already pushed --- what is your process?"} The answer that fails starts with \code{filter-repo}. The answer that lands starts with: assume it is compromised, revoke and rotate immediately, then check the audit logs for use, \emph{then} purge history, then re-clone everywhere, then close the gap with push protection and a secrets manager. Ordering demonstrates that you understand it is a disclosure incident, not a Git problem.
+\end{interview}
+
+\begin{behind}
+\code{git bisect} is the object model paying dividends. Because commits form a directed acyclic graph with full snapshots, Git can binary-search the history for the commit that introduced a regression, checking out arbitrary points in constant time. With a scripted test, \code{git bisect run ./test.sh} finds a bad commit among a thousand in about ten steps --- which is why atomic, self-contained commits are an operational asset, not an aesthetic preference.
+\end{behind}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 left you with a base Linux host: a strict-mode \code{bootstrap.sh}, a dedicated service user, and a \code{systemd} unit that restarts on failure. All of it exists on one machine and in one person's head. Today you make everything that follows \emph{versioned, reviewable and recoverable} --- so that from Day 3 onward, every artifact you add inherits these guarantees for free.
+
+\begin{buildalong}[Day 02 — repository conventions and guardrails]
+\begin{wbitem}
+  \item Move Day 1's \code{scripts/bootstrap.sh}, the \code{systemd} unit and \code{docs/host-baseline.md} into a clean CloudBase repository with a \code{README} stating what the project is and how to set it up.
+  \item Record the branching decision in \code{docs/branching.md}: strategy chosen, release cadence it serves, maximum branch lifetime the team accepts.
+  \item Adopt Conventional Commits and enforce it with a versioned \code{commit-msg} hook.
+  \item Write \code{.githooks/pre-commit} that scans the \emph{staged} diff for AWS access-key IDs, private-key headers and provider token prefixes, and blocks the commit with an actionable message.
+  \item Distribute the hooks with \code{core.hooksPath} wired into a \code{make setup} (or \code{scripts/setup.sh}) so a fresh clone is protected in one command.
+  \item Add \code{CODEOWNERS} routing infrastructure, workflow and security-relevant paths to the teams that must review them.
+  \item Protect \code{main}: no direct pushes, one approving review, code-owner review required, one named required status check, force-push and deletion disabled.
+  \item Add \code{.gitignore} and a \code{.env.example} with placeholders only; enable server-side push protection if your forge offers it.
+  \item Rehearse the incident: commit a fake key to a throwaway branch, then run the full drill --- rotate (simulated), purge with \code{git filter-repo} on a mirror clone, re-clone --- and write it up as \code{docs/runbooks/leaked-secret.md}.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a fresh clone of CloudBase becomes fully protected by running one setup command; a direct push to \code{main} is rejected by the server; a commit containing \code{AKIA}-shaped text is blocked locally; a pull request touching \code{/terraform/} automatically requests the platform and security owners; and \code{docs/runbooks/leaked-secret.md} describes a drill you have actually performed, rotation first.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Git is a content-addressed object store: blobs, trees, commits and tags, each named by the hash of its own content.
+  \item A commit is a full snapshot plus parent pointers --- diffs are computed on demand, never stored.
+  \item A branch is a 41-byte file holding one hash. That is why branching is instant and why rebasing rewrites rather than moves.
+  \item \code{merge} adds a commit and touches nothing; \code{rebase} copies commits with new hashes and abandons the originals.
+  \item \code{--force-with-lease} is compare-and-swap on a ref; bare \code{--force} is an unconditional overwrite.
+  \item Local hooks are speed; server-side branch protection is enforcement. Ship both.
+  \item A leaked secret is a disclosure incident: rotate first, purge second, prevent third.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{git reflog} is the local safety net --- almost nothing is truly lost for weeks.
+  \item Deleting a file in a new commit leaves the blob fully reachable from every earlier commit.
+  \item Forks made before a history rewrite keep the original objects, permanently, outside your control.
+  \item A required status check whose name never reports blocks every merge forever.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Bare \code{--force} on a shared branch \quad$\bullet$\quad rebasing published commits \quad$\bullet$\quad purging before rotating
+  \item Hooks that a fresh clone never gets \quad$\bullet$\quad committing state files and build artifacts
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Objects}{blob = file bytes; tree = directory listing; commit = tree + parents + metadata; all named by content hash.}
+\cheatitem{Refs}{a branch is a file containing one hash (41 bytes for SHA-1); \code{HEAD} points at the current branch.}
+\cheatitem{Three trees}{working directory $\rightarrow$ index $\rightarrow$ HEAD; \code{reset} propagates as far as \code{--soft}, \code{--mixed} or \code{--hard} says.}
+\cheatitem{Merge vs rebase}{merge = new commit, two parents, safe on shared branches; rebase = new hashes, local-only work.}
+\cheatitem{Force safety}{\code{--force-with-lease} is a conditional update; add \code{--force-if-includes} for stronger guarantees.}
+\cheatitem{Undo}{\code{revert} adds a commit and is always safe when shared; \code{reset --hard} rewrites and is local-only.}
+\cheatitem{Secret leak}{rotate $\rightarrow$ audit logs $\rightarrow$ \code{git filter-repo} on a mirror $\rightarrow$ re-clone $\rightarrow$ push protection.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 2 commands worth memorising]
+# read the object graph directly
+git rev-parse HEAD                    # hash of the current commit
+git cat-file -p <sha>                 # print any object: commit, tree, blob
+git cat-file -t <sha>                 # what type is this object?
+
+# history that is actually readable
+git log --oneline --graph --decorate --all
+git log -S 'AKIA' --all               # which commit introduced this string?
+
+# integrate work
+git fetch origin                      # always safe: no working tree changes
+git rebase -i origin/main             # clean up YOUR unpublished commits
+git push --force-with-lease           # conditional overwrite, never bare --force
+
+# undo, safely
+git revert <sha>                      # new commit undoing it: safe when shared
+git reset --soft HEAD~1               # uncommit, keep index and files
+git reflog                            # every position HEAD has held; your net
+
+# guardrails
+git config core.hooksPath .githooks   # versioned, cloneable hooks
+git commit --no-verify                # proves local hooks are NOT enforcement
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What actually happens under the hood when you create a branch?}
+\iq{Merge vs rebase --- when is each the right call, and what exactly does rebase rewrite?}
+\iq{Why is \code{--force-with-lease} safer than \code{--force}, and when does it still fail to protect you?}
+\iq{A secret was committed three commits ago and already pushed --- walk me through your process.}
+\iq{What is the difference between \code{git revert} and \code{git reset}?}
+\iq{How would you enforce that nobody merges to \code{main} without a passing test suite?}
+\iq{Why does Git store snapshots rather than diffs, and what does that buy you?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item \emph{Pro Git} (Chacon \& Straub), chapter 10 "Git Internals" --- the authoritative walkthrough of objects, refs and packfiles. Free at git-scm.com/book.
+  \item Git documentation: \code{hash-function-transition} --- the official SHA-1 to SHA-256 migration design, and why it is hard.
+  \item \code{man git-filter-repo} and the GitHub Docs page "Removing sensitive data from a repository" --- the recommended purge procedure, which begins with revoking the credential.
+  \item GitHub Docs: "About protected branches", "Available rules for rulesets" and "Managing a merge queue" --- what each server-side control actually enforces.
+  \item GitHub Docs: "About push protection" --- how server-side secret scanning blocks a push, and how bypasses are logged.
+  \item Potvin \& Levenberg, "Why Google Stores Billions of Lines of Code in a Single Repository", \emph{Communications of the ACM}, 2016 --- trunk-based development at extreme scale.
+  \item The GitHub Blog, "The Story of Scalar", and the Azure DevOps blog posts on GVFS --- how Microsoft made Git viable for the Windows repository.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item \code{main} rejects direct pushes and force-pushes, and cannot be deleted.
+  \item Every merge to \code{main} requires an approving review and a named passing status check.
+  \item \code{CODEOWNERS} exists \emph{and} code-owner review is a required protection option.
+  \item Secret scanning runs locally (fast) and server-side (authoritative); pushes with credentials are blocked.
+  \item Hooks are versioned and installed by the setup script --- not left in \code{.git/hooks}.
+  \item A leaked-secret runbook exists, starts with rotation, and has been rehearsed at least once.
+  \item No state files, build artifacts or large binaries are tracked; a size check runs in CI.
+  \item Commit messages follow a machine-readable convention so tooling can derive versions.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 3).} Your code and your host baseline are now versioned, reviewed and recoverable. Next you take that repository off your laptop: cloud fundamentals --- regions and availability zones, the shared responsibility model, VPCs and subnets, and the identity model that decides which of your automated systems is allowed to touch which resource. The guardrails you built today are the pattern; from tomorrow the enforcement point moves into the cloud provider.
+\end{keyidea}

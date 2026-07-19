@@ -1,0 +1,678 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 03 ============================
+\daychapter{03}{Networking}{Networking \& Linux Systems for DevOps}{TCP/IP, DNS, CIDR, firewalls and TLS --- the layer every outage eventually reaches}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Reason about TCP/IP, ports and the three-way handshake well enough to debug a connectivity incident from first principles.
+  \item Read and \emph{design} CIDR blocks fluently, and size a real VPC that will not need re-architecting in a year.
+  \item Trace the DNS resolution chain end to end, and treat TTL as a decision you make days before a migration.
+  \item State the practical difference between stateful security groups and stateless network ACLs --- and write correct rules for both.
+  \item Configure SSH key-based authentication with a bastion and \code{ProxyJump}, and say precisely what TLS does and does not guarantee.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} Two computers that have never met must exchange bytes reliably, across equipment owned by strangers, without a central coordinator, and must survive links going down mid-conversation. Networking is the stack of agreements that makes this work. For you it solves something narrower and more urgent: when a deploy succeeds but the service is unreachable, the network is where the answer is --- and "the network" is not a black box. It is four or five mechanisms you can enumerate, each of which fails in a recognisable way.
+
+\glabel{Why DevOps engineers need it.} Almost every production incident you will ever debug is, at some layer, a networking incident. A pod cannot reach a database (security group, or CoreDNS). A certificate expired (TLS and automation). A cutover took six hours instead of six minutes (TTL). A "random" 5xx spike traces to one availability zone (routing, or a NAT gateway). Tools change; the packet does not. Day 1 gave you the host. Today gives you what happens the moment a process on that host opens a socket.
+
+\begin{keyidea}
+Networking is the only Day in this book where you design something before you can run it. Every other topic you can try, break and retry. A VPC CIDR block is chosen once and lives for years --- AWS will not let you shrink it, and overlapping ranges block the VPC peering and Transit Gateway connections you will want later. That is why today's build-along is done on paper, and why Day 7 (Terraform) and Day 10 (AWS) only \emph{transcribe} what you decide now.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Read the diagram from the bottom. Every layer above depends on the address and the route below it resolving correctly.
+
+\begin{wbfigure}{Fig 3.0 — Where today sits. A request crosses every one of these boundaries before your application code sees a single byte.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=66mm, minimum height=7.2mm, align=left, text width=60mm}]
+  \node[lyr, wbboxk8s] (app) {\textbf{Application \& service mesh} \hfill \scriptsize Day 5--6};
+  \node[lyr, wbboxsec, below=of app] (tls) {\textbf{TLS} --- encryption, integrity, identity \hfill \scriptsize \textbf{today}};
+  \node[lyr, below=of tls] (dns) {\textbf{DNS} --- name $\rightarrow$ address, with a TTL \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxaccent, below=of dns] (tcp) {\textbf{TCP} --- ports, handshake, reliability \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxsec, below=of tcp] (fw) {\textbf{Firewalls} --- SG · NACL · nftables \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxcloud, below=of fw] (ip) {\textbf{IP \& routing} --- CIDR, subnets, gateways \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxghost, below=of ip] (linux) {\textbf{Linux host} --- sockets, file descriptors \hfill \scriptsize Day 1};
+  \foreach \a/\b in {app/tls,tls/dns,dns/tcp,tcp/fw,fw/ip,ip/linux}{\draw[wbarrowg] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 taught you that a process holds file descriptors; a socket is just another one, and \code{ss -tlnp} is the network's \code{ps aux}. Day 2 gave you a repository and review discipline --- today's network design is a document that belongs \emph{in} that repository, reviewed like code, because it is about to become Terraform on Day 7.
+
+\glabel{Where companies use it in production.} Slack rebuilt its AWS network in a project called Whitecastle: two \code{/16} CIDR ranges per region (over 130{,}000 addresses), all inside the \code{10.0.0.0/8} summary route so that nothing overlaps, with a Transit Gateway in each region and inter-region peering between them; every VPC route table points \code{10.0.0.0/8} at its local Transit Gateway. Their subnets come in two flavours --- public ones carrying a \code{0.0.0.0/0} route to an internet gateway, and private ones with no such route at all; private workloads that need the internet egress through a Squid proxy stack in the public subnets, which Slack built instead of NAT instances specifically to satisfy internal logging and compliance requirements. That is the same public/private split you are about to design, at a scale where getting the CIDR plan wrong costs years.
+
+\glabel{Common misconceptions.} That a successful \code{telnet host 443} means the service works (it means a socket accepted a connection). That security groups behave like \code{iptables} (they do not --- they are stateful and have no deny rules). That lowering a DNS TTL takes effect immediately (it takes effect one old-TTL later). That TLS proves the server is trustworthy (it proves you reached the name on the certificate --- nothing about what that server does with your data).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 3.1 — The Day 3 territory. A name becomes an address, an address becomes a route, a route crosses filters, and a socket becomes an encrypted session.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox] (name) {DNS name\\A · CNAME · TTL};
+  \node[wbboxcloud, right=of name] (addr) {IP address\\+ port};
+  \node[wbboxcloud, right=of addr] (cidr) {CIDR \& subnet\\route table};
+  \draw[wbarrow] (name)--(addr); \draw[wbarrow] (addr)--(cidr);
+  \node[wbboxsec, below=9mm of addr] (fw) {Firewall\\SG · NACL · nftables};
+  \node[wbboxaccent, below=9mm of name] (tcp) {TCP handshake\\SYN · SYN-ACK · ACK};
+  \node[wbboxsec, below=9mm of cidr] (tls) {TLS session\\cert · cipher · keys};
+  \draw[wbarrow] (cidr)--(fw); \draw[wbarrow] (fw)--(tcp); \draw[wbarrow] (tcp)--(tls);
+  \node[wbboxops, below=9mm of tcp] (ssh) {SSH \& bastion\\keys · ProxyJump};
+  \node[wbboxgood, below=9mm of tls] (health) {App health\\probe, not port};
+  \draw[wbarrowg] (tcp)--(ssh); \draw[wbarrowg] (tls)--(health);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{packet} $\rightarrow$ \keyterm{IP address} $\rightarrow$ \keyterm{port} $\rightarrow$ \keyterm{socket} $\rightarrow$ \keyterm{three-way handshake} $\rightarrow$ \keyterm{CIDR block} $\rightarrow$ \keyterm{route table} $\rightarrow$ \keyterm{security group} $\rightarrow$ \keyterm{resolver} $\rightarrow$ \keyterm{TTL} $\rightarrow$ \keyterm{certificate chain}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad TCP/IP in the Amount of Depth You Will Actually Use}
+
+\glabel{What is it?} IP gets a packet to the right \emph{host}. TCP gets a byte stream to the right \emph{process} on that host, in order, without gaps, retransmitting what the network dropped. The port number is the process address: \code{10.20.34.7:8080} identifies not a machine but a listening socket on a machine.
+
+\glabel{Why does it exist?} Before TCP, an application that wanted reliable delivery had to implement sequencing, acknowledgement, retransmission and flow control itself --- badly, and differently every time. TCP factors that work out of every application and into the kernel, once. UDP still exists precisely because that reliability costs latency, and some workloads (DNS queries, video frames, QUIC's own reliability layer) would rather handle loss themselves.
+
+\glabel{How does it work internally?} A connection is established with a three-way exchange. The client sends \code{SYN} carrying an initial sequence number; the server replies \code{SYN-ACK} with its own sequence number and an acknowledgement of the client's; the client sends \code{ACK}. Only now does the kernel move the connection from the \emph{SYN queue} to the \emph{accept queue}, and only when the application calls \code{accept()} does it leave that queue.
+
+That last sentence is the whole lesson of today. \textbf{The handshake is completed by the kernel, not by your application.} A process that is deadlocked, out of database connections, or stuck in a garbage-collection pause still has a kernel that answers \code{SYN} with \code{SYN-ACK}. Your connection succeeds. Your request then hangs.
+
+\begin{wbfigure}{Fig 3.2 — The three-way handshake, and the exact point where "connected" stops meaning "working".}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=60mm, minimum height=7mm, align=left, text width=54mm}]
+  \node[stg] (a) {\textbf{1 · client $\rightarrow$ SYN} \hfill \scriptsize seq=x, "can we talk?"};
+  \node[stg, below=of a] (b) {\textbf{2 · server $\rightarrow$ SYN-ACK} \hfill \scriptsize seq=y, ack=x+1};
+  \node[stg, below=of b] (c) {\textbf{3 · client $\rightarrow$ ACK} \hfill \scriptsize ack=y+1 · ESTABLISHED};
+  \node[stg, wbboxghost, below=of c] (d) {\textbf{kernel accept queue} \hfill \scriptsize app has not been involved yet};
+  \node[stg, wbboxwarn, below=of d] (e) {\textbf{app calls accept() and replies} \hfill \scriptsize \emph{this} is what health means};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=4mm of d, text width=26mm, anchor=west] {a hung app still gets to here};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{misconception}
+\code{nc -zv db.internal 5432} returning "succeeded" proves three things: the route exists, the firewall allows it, and something is bound to that port. It proves nothing about whether the database can answer a query. This is exactly why Kubernetes distinguishes a TCP socket probe from an HTTP probe on Day 6 --- and why a \code{/health} endpoint that returns \code{200} without touching its dependencies is only marginally better than the port check.
+\end{misconception}
+
+\glabel{When should I use it?} TCP for anything where losing a byte is unacceptable and a few milliseconds of setup are not: HTTP, SSH, database protocols, replication.
+
+\glabel{When should I \emph{not}?} When head-of-line blocking hurts more than loss does. DNS uses UDP for a single-packet query because retrying is cheaper than a handshake. HTTP/3 runs over QUIC on UDP for the same reason: one lost packet in TCP stalls every stream sharing the connection.
+
+\begin{behind}
+\code{netstat} and \code{ss} do not query the network. They read \code{/proc/net/tcp} --- the kernel's socket table, rendered as text on demand, exactly like the \code{/proc} you met on Day 1. When you see a pile of sockets in \code{TIME\_WAIT}, that is the kernel deliberately holding the four-tuple for twice the maximum segment lifetime so a late-arriving packet from the closed connection cannot be mistaken for data on a new one. It is correctness, not a leak.
+\end{behind}
+
+\begin{bashbox}[socket-level triage on a Linux host]
+ss -tlnp                       # what is listening, and which PID owns it
+ss -tn state established '( dport = :5432 )'   # live conns to Postgres
+nc -zv db.internal 5432        # can I complete a handshake? (NOT health)
+curl -sS -o /dev/null -w '%{http_code} %{time_total}\n' https://api.internal/health
+ip route get 10.20.34.7        # which interface and gateway would be used
+traceroute -T -p 443 api.internal   # TCP traceroute; ICMP is often blocked
+\end{bashbox}
+
+\wbsub{3.2\quad Subnetting \& CIDR --- Reading and Designing the Notation}
+
+\glabel{What is it?} \code{10.20.32.0/20} means: the first 20 bits are the fixed network prefix; the remaining 12 bits identify hosts inside it. That is $2^{12} = 4096$ addresses, spanning \code{10.20.32.0} to \code{10.20.47.255}. The slash number is a count of fixed bits --- nothing more.
+
+\glabel{Why does it exist?} The original internet allocated addresses in classes: a Class A was a fixed \code{/8} (16.7 million addresses), a Class B a \code{/16}, a Class C a \code{/24}. An organisation needing 300 addresses had to take a Class B and waste 65{,}000, or take two Class Cs and route them separately. Classless Inter-Domain Routing (RFC 4632, 1993) replaced the classes with an arbitrary prefix length, which both stopped the waste and let providers \emph{aggregate} many customer prefixes into one routing-table entry --- the reason the global routing table is merely large rather than impossible.
+
+\glabel{How does it work internally?} A router does a longest-prefix match. It masks the destination address against every route's prefix and picks the most specific route that matches. This is why \code{0.0.0.0/0} works as a default route (it matches everything, with zero specificity, so it loses to any other match), and why a \code{/32} host route always wins. In AWS the same rule governs your VPC route tables: the implicit local route for the VPC CIDR is more specific than \code{0.0.0.0/0}, so intra-VPC traffic never leaves via the gateway.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{16mm} C{20mm} C{20mm} X@{}}
+\wbtablehead{CIDR} & \wbtablehead{Addresses} & \wbtablehead{Usable (AWS)} & \wbtablehead{Typical use}\\
+/32 & 1 & --- & A single host route or a one-address SG rule\\
+/28 & 16 & 11 & Smallest subnet AWS allows; a NAT or endpoint subnet\\
+/24 & 256 & 251 & A classic application subnet\\
+/20 & 4{,}096 & 4{,}091 & A roomy per-AZ tier subnet\\
+/16 & 65{,}536 & 65{,}531 & An entire VPC (AWS maximum for one block)\\
+\end{tabularx}
+\end{center}
+
+\begin{infranote}
+The "usable" column is smaller in AWS than the textbook figure because AWS reserves \textbf{five} addresses in every subnet, not two: the network address, the VPC router, the DNS resolver, one address reserved for future use, and the broadcast address. In a \code{/28} that is five of sixteen --- nearly a third gone. Beginners size a \code{/28} for a fourteen-instance service and are surprised when the eleventh launch fails.
+\end{infranote}
+
+\glabel{Designing rather than reading.} A usable VPC plan answers four questions before it assigns a single address. \textbf{One:} which private range, and does it collide with anything you might ever peer with (your office, a partner VPC, your Kubernetes pod CIDR)? \textbf{Two:} how many availability zones --- and reserve for one more than you use today. \textbf{Three:} how many \emph{tiers} per AZ (public edge, private application, private data)? \textbf{Four:} how much space stays unallocated for growth. Here is the CloudBase plan you will build on Day 7.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} L{24mm} C{16mm} X@{}}
+\wbtablehead{Block} & \wbtablehead{CIDR} & \wbtablehead{Addresses} & \wbtablehead{Purpose}\\
+VPC & 10.20.0.0/16 & 65{,}536 & The whole CloudBase network\\
+public-a & 10.20.0.0/20 & 4{,}096 & ALB, NAT gateway, bastion (AZ a)\\
+public-b & 10.20.16.0/20 & 4{,}096 & ALB, NAT gateway (AZ b)\\
+app-a & 10.20.32.0/20 & 4{,}096 & Application instances / nodes (AZ a)\\
+app-b & 10.20.48.0/20 & 4{,}096 & Application instances / nodes (AZ b)\\
+data-a & 10.20.64.0/20 & 4{,}096 & RDS, cache (AZ a)\\
+data-b & 10.20.80.0/20 & 4{,}096 & RDS, cache (AZ b)\\
+unallocated & 10.20.96.0/19 \newline 10.20.128.0/17 & 40{,}960 & A third AZ and future tiers\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why these boundaries.} Each \code{/20} starts on a multiple of 16 in the third octet, so the maths is readable at a glance: public tiers occupy 0--31, app 32--63, data 64--95. Anyone can see from an address which tier it is in --- which matters enormously at 3am. More than half the VPC is deliberately unspent, because AWS permits adding a secondary CIDR to a VPC but never shrinking or renumbering the primary one, and because your future Kubernetes cluster (Day 5) will want addresses per \emph{pod}, not per node.
+
+\begin{tradeoff}
+Big subnets waste nothing --- private address space is free --- but they encourage flat, permissive networks where a single security-group mistake exposes everything. Small subnets force explicit boundaries but run out. The resolution most teams land on: generous subnets, strict security groups. Space is cheap; blast radius is not.
+\end{tradeoff}
+
+\wbsub{3.3\quad DNS --- The Lookup Chain, and TTL as a Planning Decision}
+
+\glabel{What is it?} A globally distributed, hierarchical, cached key--value store mapping names to records. \code{A} gives an IPv4 address, \code{AAAA} an IPv6 one, \code{CNAME} aliases one name to another, \code{MX} routes mail, \code{TXT} carries arbitrary strings (domain verification, SPF), \code{NS} delegates a zone to nameservers.
+
+\glabel{Why does it exist?} In the early ARPANET every host downloaded a single file, \code{HOSTS.TXT}, maintained by one organisation and distributed by FTP. It did not scale: one authority, one bottleneck, no delegation, and updates measured in days. DNS (RFCs 1034 and 1035, 1987) replaced it with \emph{delegated} authority --- the root delegates \code{.com} to registry operators, who delegate \code{example.com} to whoever runs it --- and \emph{caching}, so that the vast majority of lookups never leave your ISP.
+
+\glabel{How does it work internally?} Your machine asks a \keyterm{recursive resolver} (your ISP's, or \code{1.1.1.1}, or \code{169.254.169.253} inside an AWS VPC). If the answer is not cached, the resolver walks the hierarchy: it asks a root server, which does not know the answer but returns the nameservers for \code{.com}; it asks those, which return the nameservers for \code{example.com}; it asks those, which are \emph{authoritative} and return the record. Every answer carries a TTL, and the resolver caches it for that many seconds.
+
+\begin{wbfigure}{Fig 3.3 — The resolution chain. Each step returns a delegation, not an answer, until the last one.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=64mm, minimum height=7mm, align=left, text width=58mm}]
+  \node[stg, wbboxghost] (s) {\textbf{stub resolver} (your host) \hfill \scriptsize /etc/resolv.conf};
+  \node[stg, wbboxaccent, below=of s] (r) {\textbf{recursive resolver} \hfill \scriptsize cache hit ends the walk here};
+  \node[stg, below=of r] (root) {\textbf{root servers} \hfill \scriptsize "ask the .com servers"};
+  \node[stg, below=of root] (tld) {\textbf{TLD servers (.com)} \hfill \scriptsize "ask ns1.example.com"};
+  \node[stg, wbboxgood, below=of tld] (auth) {\textbf{authoritative nameserver} \hfill \scriptsize returns A record + TTL};
+  \foreach \x/\y in {s/r,r/root,root/tld,tld/auth}{\draw[wbarrow] (\x)--(\y);}
+  \draw[wbflow] (auth.east) to[out=0,in=0] node[wbcap,right=1mm]{answer, cached for TTL seconds} (r.east);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{bashbox}[tracing a resolution yourself]
+dig +trace api.cloudbase.example      # walk root -> TLD -> authoritative
+dig +noall +answer api.cloudbase.example   # just the record and its TTL
+dig @1.1.1.1 api.cloudbase.example    # bypass your local resolver's cache
+dig +nssearch cloudbase.example       # who is authoritative for the zone
+dig -x 10.20.34.7                     # reverse lookup (PTR)
+resolvectl status                     # what systemd-resolved is actually using
+\end{bashbox}
+
+\glabel{Production example.} Cloudflare's public resolver \code{1.1.1.1} is announced by anycast from hundreds of cities: the same address is advertised from every point of presence, and BGP routes each client to the topologically nearest one. Cloudflare runs it on the same network that already hosts authoritative records for millions of domains, so a large fraction of recursive walks terminate locally instead of crossing the internet. It also applies aggressive negative caching and query-name minimisation, and offers DNS over TLS and DNS over HTTPS so the query itself is not readable in transit. The architectural lesson: DNS latency is dominated by \emph{distance and cache hit rate}, not by protocol overhead.
+
+\begin{secwarn}[why TTL is an incident-prevention decision, not an afterthought]
+If a record's TTL is 86400, resolvers all over the internet may hold the old answer for up to 24 more hours. Lowering the TTL five minutes before a cutover changes nothing --- caches already populated do not re-check early. The correct sequence is: lower the TTL to 60 several days ahead, wait for the \emph{old} TTL to fully expire everywhere, then cut over, verify, and raise the TTL again once traffic has settled. A low TTL is not free: it multiplies query volume against your authoritative servers, so you lower it deliberately and put it back.
+\end{secwarn}
+
+\begin{misconception}
+A CNAME cannot coexist with other records at the same name, which is why you cannot put a CNAME at a zone apex (\code{example.com} must carry SOA and NS records). Providers solve this with non-standard record types --- Route~53's ALIAS, others' ANAME --- that resolve server-side and return an A record. If you have ever wondered why the apex is configured differently from \code{www}, that is why.
+\end{misconception}
+
+\wbsub{3.4\quad Firewalls, Security Groups \& Network ACLs}
+
+\glabel{What is it?} Three different filters, applied at three different places, that beginners routinely conflate. \code{nftables} (which replaced \code{iptables} as the Linux kernel's packet-filter framework) filters on the host itself. An AWS \keyterm{security group} filters at the elastic network interface of an individual instance. A \keyterm{network ACL} filters at the subnet boundary.
+
+\glabel{Why does it exist?} Filtering at the host alone means every host must be configured correctly, forever, by whoever last touched it --- Day 1's config-drift problem, now with a security blast radius. Cloud security groups move the control plane off the host: the rule is declared once, applied by the hypervisor's network stack, and cannot be disabled by someone with root on the instance. That is the real argument for them, and it is a good one.
+
+\glabel{How does it work internally --- the difference that matters.} A security group is \keyterm{stateful}: it tracks connections. If you allow inbound \code{tcp/443}, the response packets are automatically permitted outbound, because the group remembers the flow. A network ACL is \keyterm{stateless}: it evaluates each packet independently, so allowing inbound \code{443} without also allowing outbound to the client's \emph{ephemeral} port range simply drops the reply. On Linux, \code{nftables} can do either, and in practice you write a stateful ruleset using connection tracking (\code{ct state established,related accept}) --- exactly what a security group does for you.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{30mm} X X@{}}
+\wbtablehead{Property} & \wbtablehead{Security group} & \wbtablehead{Network ACL}\\
+Stateful? & Yes --- return traffic is automatic & No --- both directions explicit\\
+Applies to & An instance / ENI & An entire subnet\\
+Rule types & Allow only & Allow \emph{and} deny\\
+Evaluation & All rules evaluated; any match allows & Ordered by number; first match wins\\
+Can reference & Other security groups & CIDR blocks only\\
+Typical use & Day-to-day least privilege & Coarse subnet-wide guardrails\\
+\end{tabularx}
+\end{center}
+
+\begin{seniornote}
+The most powerful security-group feature is not the CIDR field --- it is that a rule can reference \emph{another security group} as its source. \code{sg-data} allows \code{tcp/5432} from \code{sg-app}, not from \code{10.20.32.0/20}. Now autoscaling can replace every application instance, addresses can change hourly, and the rule stays correct. You have written an identity-based rule instead of a location-based one, which is the same conceptual move as Day 12's IAM roles versus long-lived keys.
+\end{seniornote}
+
+\begin{wbfigure}{Fig 3.4 — Every filter a packet crosses on its way from the internet to the database. Each one can silently drop it.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=58mm, minimum height=6.8mm, align=left, text width=52mm}]
+  \node[stg, wbboxcloud] (igw) {\textbf{internet gateway} \hfill \scriptsize public subnet route 0.0.0.0/0};
+  \node[stg, wbboxsec, below=of igw] (nacl1) {\textbf{NACL (subnet, stateless)} \hfill \scriptsize both directions needed};
+  \node[stg, wbboxsec, below=of nacl1] (sg1) {\textbf{SG on the load balancer} \hfill \scriptsize allow 443 from 0.0.0.0/0};
+  \node[stg, below=of sg1] (app) {\textbf{SG on the app instance} \hfill \scriptsize allow 8080 from sg-alb};
+  \node[stg, wbboxwarn, below=of app] (db) {\textbf{SG on the database} \hfill \scriptsize allow 5432 from sg-app};
+  \node[stg, wbboxghost, below=of db] (host) {\textbf{nftables on the host} \hfill \scriptsize last line of defence};
+  \foreach \x/\y in {igw/nacl1,nacl1/sg1,sg1/app,app/db,db/host}{\draw[wbflow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{bashbox}[a minimal deny-by-default nftables ruleset]
+#!/usr/bin/env nft -f
+flush ruleset
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept   # stateful: replies to our traffic
+    ct state invalid drop
+    iif lo accept                         # loopback is always fine
+    ip protocol icmp accept               # keep ping and PMTU working
+    tcp dport 22 ip saddr 10.20.0.0/20 accept   # SSH only from the bastion subnet
+    tcp dport 8080 ip saddr 10.20.0.0/16 accept # app port only from inside the VPC
+  }
+  chain forward { type filter hook forward priority 0; policy drop; }
+  chain output  { type filter hook output  priority 0; policy accept; }
+}
+\end{bashbox}
+
+\glabel{When should I \emph{not} use host firewalls?} When the cloud control plane already expresses the rule. Maintaining a hand-written \code{nftables} file on every instance \emph{in addition} to security groups gives you two sources of truth that will disagree, and the one that drops your traffic will be the one nobody remembers. Use host firewalls for defence in depth on things the cloud cannot see (containers sharing a host, on-premises machines), and let the security group be the primary control.
+
+\begin{costnote}
+The permissive-rule reflex has a bill attached. A security group open to \code{0.0.0.0/0} on a database port invites internet-wide scanners, and every one of those probes crossing a NAT gateway is billed per gigabyte processed. Worse, the private-subnet-plus-NAT-gateway pattern charges both an hourly rate per gateway per AZ and a data-processing rate --- which is why Slack's proxy stack and AWS's own VPC endpoints exist: keep S3 and internal traffic off the NAT path entirely.
+\end{costnote}
+
+\wbsub{3.5\quad SSH, Key-Based Authentication \& the Bastion Pattern}
+
+\glabel{What is it?} SSH gives you an authenticated, encrypted channel to a remote shell. Key authentication is asymmetric: you hold a private key; the server holds only the matching public key in \code{\textasciitilde/.ssh/authorized\_keys}.
+
+\glabel{Why does it exist?} Its predecessors --- \code{telnet}, \code{rlogin}, \code{rsh}, \code{ftp} --- sent passwords in cleartext across shared networks. Anyone on the path read them. SSH replaced the entire family in the late 1990s. Key auth then removed the password itself, because a password is a shared secret the server must store and a human must remember, and humans reuse them.
+
+\glabel{How does it work internally?} After the transport layer negotiates session keys (an ephemeral Diffie--Hellman exchange, so recording the traffic today and stealing the host key tomorrow does not decrypt it --- forward secrecy), the client offers a public key. The server checks \code{authorized\_keys}, and if the key is listed, sends a challenge; the client signs it with the private key; the server verifies the signature. \textbf{The private key never crosses the wire, and the server never learns it.} That is why a compromised server cannot replay your credential against another server --- the crucial property a password does not have.
+
+\begin{bashbox}[~/.ssh/config — jump through a bastion transparently]
+Host bastion
+  HostName bastion.cloudbase.example
+  User ops
+  IdentityFile ~/.ssh/cloudbase_ed25519
+  IdentitiesOnly yes
+
+Host app-prod-*
+  User deploy
+  IdentityFile ~/.ssh/cloudbase_ed25519
+  IdentitiesOnly yes
+  ProxyJump bastion            # hop via the bastion, no agent forwarding
+
+Host app-prod-1
+  HostName 10.20.34.7
+
+# ssh app-prod-1     <- one command; the hop is invisible
+\end{bashbox}
+
+\glabel{Why ProxyJump and not agent forwarding.} \code{ProxyJump} (\code{-J}) opens a TCP tunnel through the bastion and completes the SSH handshake \emph{end to end with the target}. The bastion sees encrypted bytes and never handles your key. The older \code{ssh -A} agent forwarding, by contrast, exposes a socket on the bastion that anyone with root there can use to sign challenges as you. If you take one operational habit from this section: stop using \code{-A}.
+
+\begin{wbfigure}{Fig 3.5 — The bastion pattern. One audited door; private subnets have no route to the internet at all.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxghost] (eng) {engineer\\laptop};
+  \node[wbboxsec, right=14mm of eng] (bast) {bastion\\public subnet};
+  \node[wbbox, right=of bast] (app) {app node\\10.20.34.7};
+  \node[wbboxdb, below=8mm of app] (db) {database\\10.20.66.9};
+  \draw[wbflow] (eng)--node[wbcap,above]{22}(bast);
+  \draw[wbflow] (bast)--node[wbcap,above]{22}(app);
+  \draw[wbarrowg] (app)--node[wbcap,right=1mm]{5432}(db);
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(app)(db)] (priv) {};
+    \node[wbzonelabel, anchor=north west] at (priv.north west) {private subnets --- no 0.0.0.0/0 route};
+    \node[wbzonesec, fit=(bast)] (pub) {};
+    \node[wbzonelabelsec, anchor=north west] at (pub.north west) {public};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Production example.} Netflix gives every engineer SSH access to production instances --- and solved the credential problem by removing long-lived keys entirely. Their open-source tool BLESS (Bastion's Lambda Ephemeral SSH Service) runs an SSH certificate authority as an AWS Lambda function, with the CA private key protected by KMS. An engineer authenticates through SSO, and the Lambda issues a \emph{short-lived SSH certificate} rather than installing a key on any host. Because it depends only on AWS services, the CA can be brought up without circular dependencies on Netflix's own infrastructure --- a genuine bootstrapping concern for any auth system. Netflix pairs this with automated scanning of SSH usage and alerting on anomalies. The pattern to internalise: \emph{credentials that expire in minutes turn key management from a revocation problem into a non-problem}, and \code{authorized\_keys} files scattered across a fleet are exactly the thing you are trying to eliminate.
+
+\begin{secwarn}[hardening the door]
+Disable password authentication (\code{PasswordAuthentication no}) and root login (\code{PermitRootLogin no}) in \code{sshd\_config}, and prefer \code{ed25519} keys over RSA. Note the ordering trap: verify that key auth works in a \emph{second, still-open} session before you disable passwords, or you will lock yourself out of a host whose only access path you just removed. Moving SSH to a non-standard port is not security --- it reduces log noise from scanners and nothing more.
+\end{secwarn}
+
+\wbsub{3.6\quad TLS --- What It Actually Guarantees}
+
+\glabel{What is it?} A protocol that wraps a TCP connection in three guarantees: \keyterm{confidentiality} (an observer sees ciphertext), \keyterm{integrity} (tampering is detected, because every record is authenticated), and \keyterm{authentication} (the server proves it controls the name on its certificate, via a signature chaining to a CA your system already trusts).
+
+\glabel{Why does it exist?} HTTP, SMTP and everything else were designed for a network of mutually trusting research institutions. Once the path between client and server ran through arbitrary ISPs, coffee-shop access points and border routers, "nobody on the path is hostile" stopped being a defensible assumption. SSL, and then TLS, retrofitted the missing properties without changing the applications above them.
+
+\glabel{How does it work internally?} In TLS 1.3 the handshake costs one round trip. The client sends \code{ClientHello} with its supported cipher suites \emph{and} a Diffie--Hellman key share, guessing the group the server will pick. The server replies \code{ServerHello} with its own key share --- at which point both sides can derive the shared secret --- then sends its certificate chain and a \code{CertificateVerify} signature over the transcript, all already encrypted. The client validates the chain to a trusted root, checks the name and the validity dates, and both sides send \code{Finished}. TLS 1.3 (RFC 8446) also removed the legacy weak options that made earlier versions negotiable into insecurity: no RSA key transport, no static DH, no renegotiation, no compression.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{40mm} X@{}}
+\wbtablehead{TLS guarantees} & \wbtablehead{TLS does \emph{not} guarantee}\\
+The path cannot read the bytes & That the operator is honest --- a phishing site can hold a perfectly valid certificate\\
+Tampering is detected & That the data is safe once it lands --- encryption at rest is Day 12's problem\\
+You reached the name on the certificate & That the software behind the name is patched, or that it is who you meant to visit\\
+\end{tabularx}
+\end{center}
+
+\glabel{What changed recently.} Certificate lifetimes are collapsing. Let's Encrypt made 90-day, automatically renewed certificates normal; in January 2025 it announced six-day certificates and certificates for IP addresses, and in January 2026 both became generally available --- the short-lived profile is valid for 160 hours, just over six days, and IP certificates are required to use it because addresses change hands more readily than domain names. The engineering consequence is unambiguous: \textbf{manual renewal is no longer a viable operating model}. If your renewal is not automated and monitored, a certificate whose lifetime is measured in days will expire during a holiday. Automate issuance with ACME, alert on days-to-expiry well ahead of time, and treat an expiring certificate as a failing pipeline, not a calendar reminder.
+
+\begin{reliability}
+Certificate expiry is one of the most predictable outages in the industry --- and one of the most common, because the failure is silent until the exact second it is total. Monitor the expiry date as a metric with an alert threshold, not as a ticket. On Day 11 you will scrape exactly this as a Prometheus gauge; the alert should fire with enough runway for a human to act during working hours.
+\end{reliability}
+
+\begin{bashbox}[inspecting what a server actually presents]
+openssl s_client -connect api.cloudbase.example:443 -servername api.cloudbase.example </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer -dates
+curl -vI https://api.cloudbase.example 2>&1 | grep -Ei 'subject|issuer|expire|TLS'
+openssl s_client -connect api.cloudbase.example:443 -tls1_2 </dev/null   # is old TLS still allowed?
+\end{bashbox}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Design the CIDR plan before provisioning anything, and leave over half the VPC unallocated.
+  \item Reference security groups from other security groups instead of hardcoding CIDR blocks.
+  \item Default every security group to deny-all, then open the single port the single caller needs.
+  \item Lower DNS TTLs days before a planned migration, and raise them again after it settles.
+  \item Disable SSH password auth and root login; use \code{ProxyJump}, never \code{ssh -A}.
+  \item Automate certificate issuance and renewal, and alert on days-to-expiry as a metric.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Opening \code{0.0.0.0/0} "to make it work," then never closing it.
+  \item Assuming a successful TCP connect means the application behind it is healthy.
+  \item Writing NACL rules that allow inbound but forget the outbound ephemeral port range.
+  \item Sizing subnets from today's instance count with no headroom for a third AZ or per-pod addressing.
+  \item Leaving the TTL high right up until a cutover, then wondering why traffic did not move.
+  \item Treating "it has HTTPS" as evidence that a service is trustworthy.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the CloudBase network with correct CIDR arithmetic on a whiteboard, you can defend it in a design review --- which is the actual test.
+
+\begin{writespace}[Redraw: the CloudBase VPC — one /16, three tiers, two AZs. Write each subnet's CIDR and its first and last address.]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the DNS resolution chain, and mark every point where an answer can be served from cache instead.]
+\reflectionlines[4]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Design the CloudBase Network on Paper}
+
+\textbf{Goal.} Produce a network design document good enough that Day 7 can transcribe it into Terraform without a single new decision. Nothing is provisioned today; nothing costs money today. Every choice you make here is one you would otherwise make badly under deadline pressure in three weeks.
+
+\resetlab
+\labstep{Choose the private range and prove it does not collide}
+Pick \code{10.20.0.0/16} from RFC 1918 space. Write down every other network CloudBase might ever need to reach: the office VPN, a partner VPC, the Kubernetes pod and service CIDRs from Day 5. Confirm no overlap.
+\labwhy{Overlapping CIDRs make VPC peering and Transit Gateway attachments impossible --- the routing table cannot decide which side of the peering owns an address. This is the mistake that forces a full re-numbering later, and it is entirely avoidable with ten minutes of arithmetic now.}
+
+\labstep{Decide the AZ count and reserve for one more}
+Design for two availability zones and leave enough address space for a third.
+\labwhy{Two AZs is the minimum for surviving a zone failure. A third is what you add when a regional service requires it or a quorum-based datastore needs an odd number --- and adding it should be an address allocation, not a redesign.}
+
+\labstep{Carve the tiers}
+Split the \code{/16} into six \code{/20} subnets: public, app and data, in each of two AZs. Write out the first and last address of each by hand, without a calculator.
+\labwhy{Doing the bit arithmetic once, manually, is what converts CIDR from notation you look up into notation you read. In a review you will be asked "does that overlap?" and be expected to answer in seconds.}
+
+\labstep{Write the route tables}
+Public subnets get \code{0.0.0.0/0} to an internet gateway. Private subnets get \code{0.0.0.0/0} to a NAT gateway --- \emph{one per AZ}. Data subnets may get no default route at all.
+\labwhy{A single NAT gateway shared across AZs is both a single point of failure and a cross-AZ data-transfer charge on every packet. One per AZ costs more per hour and less per outage. Data subnets with no egress route cannot exfiltrate to the internet even if compromised.}
+
+\labstep{Design the security groups as a chain, not a list}
+Four groups: \code{sg-alb} (443 from the internet), \code{sg-app} (8080 from \code{sg-alb}), \code{sg-data} (5432 from \code{sg-app}), \code{sg-bastion} (22 from your corporate range only). Each references the previous group, never a CIDR.
+\labwhy{This makes the security groups a readable dependency graph of who may talk to whom. Anyone can audit it in thirty seconds, and it stays correct through autoscaling because it names identities rather than addresses.}
+
+\labstep{Place the bastion and define the SSH policy}
+Bastion in \code{public-a}. No other instance accepts port 22 from anywhere except \code{sg-bastion}. Write the \code{\textasciitilde/.ssh/config} with \code{ProxyJump}.
+\labwhy{One audited door means one place to collect session logs, one place to rotate access, and one place an attacker must get through. Notice you have made access an \emph{identity} question again --- the same principle as the security group chain and Day 12's IAM.}
+
+\labstep{Plan the DNS records and their TTLs}
+Decide the names: \code{api.cloudbase.example} (the ALB), \code{db.internal} (private zone). Write the record types and, for each, the steady-state TTL and the pre-migration TTL.
+\labwhy{Writing the migration TTL now, while calm, is the only time you will get it right. During an incident you cannot retroactively shorten a cached answer.}
+
+\labstep{Write down the failure modes}
+For each design choice, note what breaks if it is wrong: overlapping CIDR, subnet too small, NACL missing the ephemeral range, TTL too high, certificate not automated.
+\labwhy{A design document that lists its own failure modes is a runbook in advance. This section is what your future on-call self will actually read.}
+
+\begin{prodtip}
+Commit the design as \code{docs/network-design.md} in the CloudBase repository with the CIDR table, an ASCII diagram and the security-group chain, and open it as a pull request. Day 2 gave you review discipline for exactly this: a network design reviewed by a second engineer catches the overlapping-CIDR mistake in five minutes, where the alternative is catching it in five months.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Security groups have no deny rules --- only allows, all evaluated together. NACLs have both, evaluated in order. Why would AWS deliberately remove the ability to express "deny" from the control most engineers use every day? What class of mistake does that design prevent, and what does it make harder?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+DNS caching is what makes the system scale, and it is also what makes migrations slow and stale answers possible. Suppose you could redesign DNS with instant global invalidation. What would that cost --- in infrastructure, in failure modes, and in who would have to be trusted?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Certificate lifetimes have gone from years, to 90 days, to six. Each reduction makes automation mandatory rather than optional. Is forcing automation by shortening a deadline a legitimate engineering strategy, or is it externalising cost onto operators? Where else in this book does the same pattern appear?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The cutover that only half moved}
+\textbf{Symptom.} You migrated \code{api.cloudbase.example} to a new load balancer at 09:00 and updated the A record. Two hours later the new target is serving traffic, but roughly 30\% of requests are still hitting the old one, and the old one is due to be terminated at noon.
+
+\begin{outbox}[dig from two vantage points]
+$ dig +noall +answer api.cloudbase.example
+api.cloudbase.example. 43012 IN A 203.0.113.10     # OLD address, 11h left
+
+$ dig @1.1.1.1 +noall +answer api.cloudbase.example
+api.cloudbase.example. 58 IN A 198.51.100.24       # NEW address
+
+$ dig +noall +answer +ttlunits api.cloudbase.example @ns1.cloudbase.example
+api.cloudbase.example. 1m IN A 198.51.100.24       # authoritative: new, TTL 60
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The authoritative server returns the new address with TTL 60. One resolver already has the new answer; another is holding the old one with eleven hours remaining on a 12-hour TTL.
+  \item \textbf{Hypothesise.} The TTL was lowered to 60 at the same time as the record change, so resolvers that had already cached the answer under the \emph{old} 43200-second TTL never re-queried.
+  \item \textbf{Investigate.} Query several public resolvers directly and compare remaining TTLs; check the zone's change history for when the TTL was actually reduced.
+  \item \textbf{Root cause.} TTL reduction and record change were done in the same operation. Lowering a TTL only affects answers cached \emph{after} the change.
+  \item \textbf{Fix.} Do not terminate the old target. Keep both endpoints serving until the longest old TTL has fully expired --- here, until roughly 21:00 --- then decommission.
+  \item \textbf{Prevent.} Make "lower TTL to 60" a step executed at least one full old-TTL period before any cutover, tracked as its own change ticket. Add a pre-cutover check that queries several public resolvers and confirms the observed TTL is already low.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The subnet where connections hang instead of failing}
+\textbf{Symptom.} After a security review added a network ACL to the app subnet, the application can no longer reach an external payment API. Connections do not get refused --- they hang for 30 seconds and time out. The security group is unchanged and permits all outbound.
+
+\begin{outbox}[from an app instance]
+$ curl -v https://payments.example.com
+* Trying 198.51.100.77:443...
+* connect to 198.51.100.77 port 443 failed: Connection timed out
+
+$ aws ec2 describe-network-acls --network-acl-id acl-0ab1  # abridged
+Inbound   100  allow  tcp 443  0.0.0.0/0
+Inbound   *    deny   all
+Outbound  100  allow  tcp 443  0.0.0.0/0
+Outbound  *    deny   all
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Timeout, not "connection refused". A refusal means a RST came back; a timeout means the packet vanished --- the signature of a silent drop by a filter.
+  \item \textbf{Hypothesise.} The NACL is stateless. Outbound \code{443} is allowed, so the \code{SYN} leaves; the \code{SYN-ACK} returns to the client's \emph{ephemeral} source port, which the inbound rules do not permit, so the reply is dropped.
+  \item \textbf{Investigate.} Enable VPC flow logs and look for \code{REJECT} entries on the return path with a high destination port. Confirm the instance's local ephemeral range with \code{sysctl net.ipv4.ip\_local\_port\_range} (commonly 32768--60999).
+  \item \textbf{Root cause.} An inbound NACL rule allowing the ephemeral port range for return traffic is missing. The security group masked the concept because it is stateful and needed no such rule.
+  \item \textbf{Fix.} Add an inbound allow for \code{tcp/1024--65535} from the required destinations, and an outbound allow for the same range so inbound connections' replies also work.
+  \item \textbf{Prevent.} Treat NACLs as coarse subnet guardrails only, express least privilege in security groups, and add a review checklist item: "for every NACL rule, name the return-path rule that pairs with it."
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Trace a full DNS resolution from the root to the authoritative answer and explain every hop.\\
+\textbf{Business context.} Your team is about to migrate a domain and nobody can say where the caching actually happens.\\
+\textbf{Architecture.} One Linux host, \code{dig}, and a domain you do not control.\\
+\textbf{Requirements.} Run \code{dig +trace}, annotate each delegation, then re-query and show the TTL counting down in a resolver cache.\\
+\textbf{Constraints.} Explain the difference between the answer from your stub resolver and the answer from the authoritative server.\\
+\textbf{Hints.} \code{dig +trace} bypasses your recursive resolver; \code{dig @1.1.1.1} does not bypass \emph{its} cache.\\
+\textbf{Expected outcome.} A one-page annotated trace naming root, TLD and authoritative servers, and the TTL on each record.\\
+\textbf{Production considerations.} Note where a private hosted zone (Day 10) would short-circuit this chain entirely.\\
+\textbf{Common pitfalls.} Confusing the TTL as configured at the authority with the TTL remaining in a cache.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~60 min}
+\textbf{Goal.} Write and test a deny-by-default \code{nftables} ruleset allowing only SSH and HTTPS.\\
+\textbf{Business context.} A host outside the cloud (a build runner) needs the same posture as your VPC instances.\\
+\textbf{Architecture.} One VM you can reach out-of-band, plus a second host to test from.\\
+\textbf{Requirements.} Policy \code{drop} on input, connection-tracking accept for established traffic, SSH restricted by source CIDR, HTTPS open, everything else dropped.\\
+\textbf{Constraints.} You must not lock yourself out --- keep a second session open and use a timed rollback.\\
+\textbf{Hints.} \code{ct state established,related accept} must come first; test with \code{nc -zv} from the other host for both an allowed and a blocked port.\\
+\textbf{Expected outcome.} A committed \code{nft} file, plus evidence that a blocked port times out while an allowed one connects.\\
+\textbf{Production considerations.} Compare, line by line, with the equivalent security group. Which rules disappear, and why?\\
+\textbf{Common pitfalls.} Forgetting the loopback rule; dropping ICMP entirely and breaking path-MTU discovery.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~90 min}
+\textbf{Goal.} Produce the CloudBase network design document that Day 7 will implement verbatim.\\
+\textbf{Business context.} A design review with a second engineer is scheduled; overlapping CIDRs must be caught now, not after provisioning.\\
+\textbf{Architecture.} One \code{/16} VPC, three tiers, two AZs, one bastion, four security groups, per-AZ NAT.\\
+\textbf{Requirements.} A CIDR table with first and last address per subnet, route tables per subnet, the security-group chain, the SSH policy, the DNS records with steady-state and migration TTLs.\\
+\textbf{Constraints.} Over half the VPC must remain unallocated; no security group may reference a CIDR except the bastion's corporate source and the ALB's \code{0.0.0.0/0} on 443.\\
+\textbf{Hints.} Do the bit arithmetic by hand first, then verify with \code{ipcalc}. Draw the diagram before writing the table.\\
+\textbf{Expected outcome.} \code{docs/network-design.md} merged via pull request, with a failure-mode list.\\
+\textbf{Production considerations.} Where would VPC endpoints remove NAT gateway cost? What changes if a third AZ is added?\\
+\textbf{Common pitfalls.} Allocating the whole \code{/16} immediately; sizing subnets from today's instance count; forgetting AWS reserves five addresses per subnet.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{infranote}
+Network topology is the one part of your infrastructure that is genuinely hard to change after the fact. Compute is disposable --- terminate an instance and launch a new one. Address space is not: it is baked into route tables, peering connections, firewall rules, allow-lists held by third parties and, eventually, into someone's spreadsheet. Spend disproportionate care here relative to how little of the fourteen days it occupies.
+\end{infranote}
+
+\begin{reliability}
+Design the network so that losing an availability zone is a capacity event, not an outage. That means per-AZ NAT gateways, subnets in at least two zones for every tier, and no single-AZ dependency hidden inside a "temporary" resource. The test is simple and worth writing down: if AZ \emph{a} vanished right now, name every component that would stop working. If you cannot answer in under a minute, the design is not understood well enough.
+\end{reliability}
+
+\begin{secwarn}[the two rules that cause most cloud breaches]
+An inbound \code{0.0.0.0/0} on a management or database port, and a long-lived credential with more permission than its task needs. Both are shortcuts taken to unblock something at 6pm on a Friday, and both survive because nothing subsequently fails. Automated detection is the only reliable control --- a scheduled check that flags any security group open to the internet on a port other than 80 or 443, reported as a failing build rather than an email.
+\end{secwarn}
+
+\begin{costnote}
+NAT gateways are one of the most common surprises on an AWS bill: charged per hour \emph{per gateway} and per gigabyte processed. A private subnet whose instances pull container images from a public registry on every deploy sends all of that through NAT. VPC endpoints for S3 and ECR remove that path entirely, and gateway endpoints for S3 carry no hourly charge. Design the egress path deliberately, not as whatever happens by default.
+\end{costnote}
+
+\begin{interview}
+Expect: \emph{"Walk me through what happens between typing a URL and the page loading."} The answer that lands is a chain with no gaps: browser cache, then OS stub resolver, then recursive resolver walking root $\rightarrow$ TLD $\rightarrow$ authoritative, TTL governing all of it; then a TCP handshake to port 443; then a TLS 1.3 handshake with certificate validation; then the HTTP request, which crosses a load balancer, a security group, and finally the application. Naming the layer where each thing can fail is what separates a senior answer from a memorised one.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a bootstrapped host with a service user, a systemd unit and a strict-mode provisioning script. Day 2 gave it a repository with branch protection, commit conventions and review. Today CloudBase gets the thing that is hardest to change later and cheapest to get right now: its network, designed completely, on paper, before a single dollar of cloud spend. Day 7 turns this document into Terraform; Day 10 applies it to AWS.
+
+\begin{buildalong}[Day 03 — the network design]
+\begin{wbitem}
+  \item Create \code{docs/network-design.md} in the CloudBase repository (the one Day 2 set up) and open it as a pull request --- this design gets reviewed like code.
+  \item Allocate the VPC \code{10.20.0.0/16} and record why: an RFC 1918 range that collides with nothing CloudBase may peer with.
+  \item Carve six \code{/20} subnets across two AZs --- \code{public-a/b}, \code{app-a/b}, \code{data-a/b} --- and tabulate the first and last address of each, computed by hand.
+  \item Leave \code{10.20.96.0/19} and \code{10.20.128.0/17} explicitly unallocated, labelled "third AZ and future tiers".
+  \item Write route tables: public $\rightarrow$ internet gateway; app $\rightarrow$ per-AZ NAT gateway; data $\rightarrow$ no default route.
+  \item Define the security-group chain: \code{sg-alb} 443 from the internet; \code{sg-app} 8080 from \code{sg-alb}; \code{sg-data} 5432 from \code{sg-app}; \code{sg-bastion} 22 from the corporate range only. No CIDR sources anywhere else.
+  \item Place the bastion in \code{public-a}, and commit the \code{ssh/config} fragment using \code{ProxyJump} with agent forwarding explicitly disabled.
+  \item Record the DNS plan: \code{api.cloudbase.example} with a steady-state TTL of 300 and a documented pre-migration TTL of 60, plus the private zone for \code{db.internal}.
+  \item Add a "failure modes" section naming what breaks for each wrong choice, and a "cost notes" section identifying where VPC endpoints would remove NAT charges.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{docs/network-design.md} is merged after review; every subnet CIDR is stated with its first and last address and none overlap; the security-group chain contains no CIDR source except the ALB's \code{0.0.0.0/0} on 443 and the bastion's corporate range; over half the VPC is documented as unallocated; and a second engineer can read the document and provision the network without asking a single question.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The three-way handshake is completed by the kernel; a successful connect proves reachability, never application health.
+  \item CIDR is a count of fixed prefix bits, and routers choose by longest-prefix match --- which is why \code{0.0.0.0/0} loses to everything.
+  \item AWS reserves five addresses in every subnet, and a VPC CIDR can be extended but never shrunk or renumbered.
+  \item DNS answers are cached for their TTL; lowering the TTL only affects lookups made \emph{after} the change.
+  \item Security groups are stateful and allow-only; NACLs are stateless and ordered, and need explicit return-path rules.
+  \item SSH key auth never sends the private key; \code{ProxyJump} keeps the bastion out of the authentication path entirely.
+  \item TLS guarantees confidentiality, integrity and name authentication --- not that the operator deserves your data.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Timeout means a silent drop by a filter; "connection refused" means a RST came back and something answered.
+  \item A security group referencing another security group survives autoscaling; a hardcoded CIDR does not.
+  \item Certificate lifetimes are shrinking --- Let's Encrypt's short-lived profile is 160 hours --- so renewal must be automated and monitored.
+  \item Design for two availability zones and leave address space for a third.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item \code{0.0.0.0/0} left open \quad$\bullet$\quad TTL lowered too late \quad$\bullet$\quad NACL return path forgotten
+  \item Subnets sized from today's count \quad$\bullet$\quad \code{ssh -A} habit \quad$\bullet$\quad manual certificate renewal
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{TCP handshake}{SYN $\rightarrow$ SYN-ACK $\rightarrow$ ACK, completed by the kernel. Connect $\neq$ healthy.}
+\cheatitem{CIDR}{\code{/n} = n fixed bits; \code{/24}=256 addrs (251 usable in AWS), \code{/20}=4096, \code{/16}=65536.}
+\cheatitem{Routing}{Longest-prefix match wins; \code{0.0.0.0/0} is the default route of last resort.}
+\cheatitem{DNS}{stub $\rightarrow$ recursive $\rightarrow$ root $\rightarrow$ TLD $\rightarrow$ authoritative; TTL governs every cache on the path.}
+\cheatitem{SG vs NACL}{SG: stateful, per-ENI, allow-only. NACL: stateless, per-subnet, ordered, allow+deny.}
+\cheatitem{SSH}{public key in \code{authorized\_keys}; private key never transmitted; use \code{ProxyJump}, never \code{-A}.}
+\cheatitem{TLS 1.3}{one round trip, forward secrecy, encrypted certificate; proves the name, nothing more.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 3 commands worth memorising]
+# sockets & reachability
+ss -tlnp                              # listening sockets and owning PIDs
+nc -zv host 5432                      # handshake test (not a health check)
+ip route get 10.20.34.7               # which route would this address take
+traceroute -T -p 443 host             # TCP traceroute; ICMP is often blocked
+
+# DNS
+dig +trace name                       # walk root -> TLD -> authoritative
+dig +noall +answer name               # the record and its remaining TTL
+dig @1.1.1.1 name                     # ask a specific resolver
+
+# firewalling
+nft list ruleset                      # current nftables rules
+nft -f /etc/nftables.conf             # load a ruleset atomically
+
+# ssh
+ssh -J bastion app-prod-1             # one-off ProxyJump
+ssh-keygen -t ed25519 -C "ops@cloudbase"
+
+# tls
+openssl s_client -connect host:443 -servername host </dev/null | openssl x509 -noout -dates
+\end{bashbox}
+
+\begin{iqbox}
+\iq{Walk me through what happens between typing a URL and the page loading.}
+\iq{What is the difference between a security group and a network ACL?}
+\iq{Why can a TCP handshake succeed while the application is still broken?}
+\iq{How would you safely cut a domain over to a new server with minimal downtime?}
+\iq{Explain \code{/24} versus \code{/16} in terms of usable hosts --- and how many AWS actually gives you.}
+\iq{Why disable SSH password authentication in production, and why prefer \code{ProxyJump} over agent forwarding?}
+\iq{What does TLS guarantee, and what does it not?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item RFC 9293 --- \emph{Transmission Control Protocol}, August 2022. The consolidated TCP specification; it obsoletes RFC 793 and folds in decades of piecemeal updates.
+  \item RFC 4632 --- \emph{Classless Inter-Domain Routing (CIDR)}, and RFC 1918 --- private address allocation.
+  \item RFC 1034 and RFC 1035 --- the DNS concepts and specification; RFC 2308 for negative caching and TTL semantics.
+  \item RFC 8446 --- \emph{TLS 1.3}. Read the handshake section; it explains why the round-trip count dropped.
+  \item AWS VPC User Guide --- "Subnets for your VPC" and "Subnet CIDR blocks", at \code{docs.aws.amazon.com/vpc/latest/userguide/}, for the five reserved addresses and the \code{/16}--\code{/28} size limits.
+  \item Cloudflare's introduction to the \code{1.1.1.1} resolver --- anycast, negative caching and DNS over TLS/HTTPS, at \code{blog.cloudflare.com/dns-resolver-1-1-1-1/}.
+  \item Slack Engineering, "Building the Next Evolution of Cloud Networks at Slack" and its retrospective --- the Whitecastle VPC and Transit Gateway design.
+  \item Let's Encrypt, "Announcing Six Day and IP Address Certificate Options in 2025" and the January 2026 general-availability post; plus Netflix's BLESS, an SSH certificate authority on AWS Lambda that issues short-lived certificates instead of distributing keys.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item The VPC CIDR is documented, non-overlapping with every network you may ever peer with, and over half unallocated.
+  \item Every tier has a subnet in at least two availability zones, with a per-AZ NAT gateway.
+  \item No security group allows \code{0.0.0.0/0} on any port except 80 and 443 on the load balancer.
+  \item Security groups reference other security groups, not CIDR blocks, wherever an identity exists.
+  \item SSH password authentication and root login are disabled; access is through one audited bastion.
+  \item DNS records have a documented steady-state TTL and a rehearsed pre-migration TTL procedure.
+  \item Certificate issuance and renewal are automated, and days-to-expiry is monitored with an alert.
+  \item A written failure-mode list exists for the network design, and someone other than the author has reviewed it.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 4).} You now have a host and a network design. Tomorrow you package the thing that runs on them: containers --- what an image layer actually is, how namespaces and cgroups make a process believe it owns the machine, why a container's networking is a Linux bridge and a virtual interface pair, and why the CIDR arithmetic you just did reappears the moment a container needs an address of its own.
+\end{keyidea}

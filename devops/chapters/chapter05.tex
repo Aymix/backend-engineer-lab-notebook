@@ -1,0 +1,723 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 05 ============================
+\daychapter{05}{Orchestration}{Kubernetes Fundamentals}{Control plane, scheduling, and the reconciliation loop that runs everything}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what each control-plane component does, and why the API server is the only writer to \code{etcd}.
+  \item Describe the reconciliation loop precisely enough to predict what the cluster will do next.
+  \item Write a Deployment, Service, ConfigMap and Secret that a reviewer would approve.
+  \item Trace how a Service finds its Pods through labels, EndpointSlices and \code{kube-proxy} --- not a fixed IP list.
+  \item Separate liveness from readiness correctly, and explain why confusing them causes fleet-wide restart storms.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} On Day 4 you produced a hardened container image. An image is inert. To run it in production you must answer questions a container runtime does not answer: which machine should this run on, how many copies, what happens when the machine dies at 3am, how does traffic find the copies when every restart gives them a new IP, how do I change the image version without dropping requests, and how does configuration reach the process without being baked into the image. Kubernetes exists to answer exactly that list, once, for every workload, in a way that survives the humans who wrote it leaving the company.
+
+\glabel{Why DevOps engineers need it.} Before orchestrators, the answers were a pile of bespoke glue: a Jenkins job that SSHed into a named host, a load balancer config edited by hand, a spreadsheet mapping services to machines, a pager rotation whose job was to be the failover mechanism. That glue is unversioned, untested and known only to its author. Kubernetes replaces "a human executes a procedure" with "a controller enforces a declaration" --- and once you understand that substitution, every object in the API stops being trivia and becomes an instance of the same idea.
+
+\begin{keyidea}
+Kubernetes is not a deployment tool. It is a database of desired state (\code{etcd}, behind an API server) plus a set of programs that continuously work to make reality match that database. Everything else --- Deployments, Services, probes, autoscalers, operators you have never heard of --- is a controller playing that same game. Learn the game once; the objects become vocabulary.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Kubernetes sits directly above the container runtime you met yesterday and directly below the delivery pipeline you will wire up later. It consumes images and declarations; it produces running, addressable, self-healing workloads.
+
+\begin{wbfigure}{Fig 5.0 — Where today sits. Kubernetes turns a static image plus a declaration into a running, addressable, self-healing workload.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[lyr, wbboxops] (cd) {\textbf{CI/CD delivers manifests} \hfill \scriptsize Day 9};
+  \node[lyr, wbboxk8s, below=of cd] (api) {\textbf{Kubernetes API + controllers} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxk8s, below=of api] (sched) {\textbf{Scheduler places Pods on nodes} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, below=of sched] (kubelet) {\textbf{kubelet + container runtime} \hfill \scriptsize Day 4 images};
+  \node[lyr, wbboxcloud, below=of kubelet] (vm) {\textbf{Cloud VMs, VPC, subnets} \hfill \scriptsize Day 3, 10};
+  \node[lyr, wbboxghost, below=of vm] (lin) {\textbf{Linux: namespaces · cgroups · signals} \hfill \scriptsize Day 1};
+  \foreach \a/\b in {cd/api,api/sched,sched/kubelet,kubelet/vm,vm/lin}{\draw[wbarrowg] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 gave you processes, signals and the SIGTERM-then-SIGKILL shutdown path --- Kubernetes uses precisely that path when it evicts a Pod. Day 3 taught you that a TCP handshake completing tells you a socket is listening and nothing more; today that lesson becomes the difference between a probe that protects users and a probe that lies. Day 4 gave you an immutable image with a non-root user and a small attack surface; today that image finally gets somewhere to run.
+
+\glabel{Where companies use it in production.} Spotify ran a homegrown orchestrator called Helios on top of Docker for years, then migrated to Kubernetes from late 2018 onward --- explicitly because a small internal team could not keep pace with the feature velocity of the wider community. Their published case study reports service provisioning dropping from roughly an hour to seconds or minutes, and CPU utilisation improving by a factor of two to three through bin-packing and multi-tenancy. That second number is the whole economic argument for orchestration: a scheduler packing many workloads onto shared nodes uses hardware far better than one-service-per-VM ever could. Airbnb runs a multi-cluster fleet and introduced a \emph{cluster type} abstraction so that clusters of the same type share one configuration, letting heterogeneous workloads share nodes for better bin-packing while upgrades roll one cluster at a time.
+
+\glabel{Common misconceptions.} That Kubernetes "runs your containers" (the \code{kubelet} does; Kubernetes decides \emph{what should be running}); that \code{kubectl apply} deploys (it writes a desired state and returns --- controllers do the work asynchronously); that a Secret is encrypted (by default it is base64-encoded and stored in plain text in \code{etcd}); that a Service is a load balancer process traffic flows through (it is usually a set of packet-rewriting rules on every node).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 5.1 — The Day 5 territory. Everything on the right is a consequence of the loop in the middle.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (api) {API server\\the only writer};
+  \node[wbcyl, left=9mm of api] (etcd) {etcd\\desired state};
+  \draw[wbarrow] (api)--(etcd);
+  \node[wbboxk8s, above right=4mm and 9mm of api] (ctrl) {Controllers\\reconcile};
+  \node[wbboxk8s, right=9mm of api] (sched) {Scheduler\\filter · score};
+  \node[wbboxk8s, below right=4mm and 9mm of api] (kubelet) {kubelet\\node agent};
+  \draw[wbarrow] (api)--(ctrl); \draw[wbarrow] (api)--(sched); \draw[wbarrow] (api)--(kubelet);
+  \node[wbbox, right=9mm of ctrl] (dep) {Deployment\\ReplicaSet · Pod};
+  \node[wbbox, right=9mm of sched] (svc) {Service\\label selector};
+  \node[wbboxgood, right=9mm of kubelet] (probe) {Probes\\ready · live};
+  \draw[wbarrow] (ctrl)--(dep); \draw[wbarrow] (sched)--(svc); \draw[wbarrow] (kubelet)--(probe);
+  \node[wbboxops, right=9mm of svc] (cfg) {ConfigMap\\Secret};
+  \draw[wbarrowg] (dep)--(cfg); \draw[wbarrowg] (probe)--(cfg);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{desired state} $\rightarrow$ \keyterm{API server} $\rightarrow$ \keyterm{etcd} $\rightarrow$ \keyterm{watch} $\rightarrow$ \keyterm{controller} $\rightarrow$ \keyterm{reconciliation} $\rightarrow$ \keyterm{scheduler} $\rightarrow$ \keyterm{kubelet} $\rightarrow$ \keyterm{label selector} $\rightarrow$ \keyterm{EndpointSlice} $\rightarrow$ \keyterm{probe}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The Control Plane: Who Decides, Who Runs}
+
+\glabel{What is it?} A Kubernetes cluster splits into two halves. The \keyterm{control plane} decides what should be running. The \keyterm{worker nodes} run it. A node can host control-plane components too, but the responsibilities never blur: nothing on a worker node ever decides where a Pod belongs.
+
+\glabel{Why does it exist?} Because the alternative --- every machine deciding for itself --- has no way to answer global questions. "Are three replicas running?" is unanswerable if there is no single place that knows what "three replicas" means. Centralising \emph{desired state} while distributing \emph{execution} is the classic split, and it is exactly what Google's Borg did before Kubernetes existed. Before orchestrators, teams centralised state in a wiki page and distributed execution to on-call engineers.
+
+\glabel{How does it work internally?} Five components matter today.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{30mm} X@{}}
+\wbtablehead{Component} & \wbtablehead{Responsibility, and the detail that matters}\\
+kube-apiserver & The only component that reads or writes \code{etcd}. Every \code{kubectl} command, every controller, every \code{kubelet} goes through it. It authenticates, authorises, runs admission control, validates and persists.\\
+etcd & A distributed key-value store using the Raft consensus algorithm. It holds the whole cluster's declared state. Lose it without a backup and you have lost the cluster's intent, not just its uptime.\\
+kube-scheduler & Watches for Pods with no node assigned; picks one. It does not start anything --- it only writes a node name into the Pod object.\\
+kube-controller-manager & A single binary hosting many independent control loops (Deployment, ReplicaSet, Node, Job, EndpointSlice, and more).\\
+kubelet & The node agent. Watches the API server for Pods assigned to \emph{its} node, tells the container runtime to start them, and reports status back.\\
+\end{tabularx}
+\end{center}
+
+\begin{behind}
+\code{kubectl apply -f deploy.yaml} does not deploy anything. It performs an HTTP request to the API server, which authenticates you, checks RBAC, passes the object through mutating then validating admission plugins, validates it against the schema, and writes it to \code{etcd}. Then it returns \code{200}. At that instant nothing is running. Everything that follows --- ReplicaSet created, Pods created, node chosen, container pulled and started --- happens asynchronously in controllers reacting to that write. This is why \code{kubectl apply} succeeding tells you almost nothing about whether your app works.
+\end{behind}
+
+\begin{wbfigure}{Fig 5.2 — The path of one \code{apply}. Note that the client is done at step 4; everything after is a reaction.}
+\wbscale{\begin{tikzpicture}[node distance=3.9mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7mm, align=left, text width=56mm}]
+  \node[stg] (a) {\textbf{1 · kubectl} \hfill \scriptsize HTTPS POST/PATCH to the API server};
+  \node[stg, wbboxsec, below=of a] (b) {\textbf{2 · AuthN, RBAC, admission} \hfill \scriptsize who, may they, mutate/validate};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · Write to etcd} \hfill \scriptsize Raft commit — the only writer};
+  \node[stg, wbboxgood, below=of c] (d) {\textbf{4 · 200 returned} \hfill \scriptsize nothing is running yet};
+  \node[stg, wbboxk8s, below=of d] (e) {\textbf{5 · Controllers watch} \hfill \scriptsize ReplicaSet creates Pod objects};
+  \node[stg, wbboxk8s, below=of e] (f) {\textbf{6 · Scheduler binds} \hfill \scriptsize filter, score, write nodeName};
+  \node[stg, below=of f] (g) {\textbf{7 · kubelet starts container} \hfill \scriptsize pull image, run, report status};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f,f/g}{\draw[wbarrow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How the scheduler actually chooses.} Scheduling is a two-step operation per Pod. \keyterm{Filtering} eliminates every node on which the Pod \emph{cannot} run: insufficient allocatable CPU or memory for the Pod's \code{requests}, a taint the Pod does not tolerate, a node selector or affinity rule that does not match, a required volume that cannot attach on that node. If filtering leaves an empty set, the Pod stays \code{Pending} and the event log says so. \keyterm{Scoring} then ranks the survivors --- spreading across nodes and zones, preferring nodes that already have the image, balancing resource usage --- and the highest score wins, with ties broken at random. The result is written back as a binding: a node name on the Pod object.
+
+\begin{misconception}
+The scheduler uses \code{requests}, not actual usage, when filtering. A Pod that requests 2 CPUs but uses 0.1 still occupies 2 CPUs of schedulable capacity. This is why a cluster can show 20\% CPU utilisation on the dashboards and still refuse to schedule anything: you have not run out of CPU, you have run out of \emph{promised} CPU. Over-requesting is the single most common cause of an expensive, idle, "full" cluster.
+\end{misconception}
+
+\begin{secwarn}[etcd is the crown jewels]
+Every Secret in the cluster lives in \code{etcd}, and by default the API server stores plain-text representations there with no at-rest encryption. Anyone with a copy of an \code{etcd} snapshot has every credential in the cluster. Production clusters enable an \code{EncryptionConfiguration} on the API server (\code{--encryption-provider-config}) so that at minimum \code{secrets} are encrypted --- ideally with a \code{kms} provider backed by a cloud KMS rather than a key sitting in a file next to the data it protects.
+\end{secwarn}
+
+\wbsub{3.2\quad The Reconciliation Loop --- The Idea Everything Else Is Built On}
+
+\glabel{What is it?} You never tell Kubernetes \emph{how} to do something. You declare the end state you want, and a controller repeatedly compares that declaration with observed reality and takes one small action to narrow the gap. Then it does it again. Forever.
+
+\glabel{Why does it exist?} Because imperative automation is not resilient to the world changing underneath it. A script that says "start three copies" is correct at the instant it runs and wrong forever after --- when a node dies, nobody re-runs it. Declarative reconciliation is level-triggered rather than edge-triggered: it does not care \emph{why} reality diverged, only that it did. A missed event, a network partition, a node reboot, a human running \code{docker kill} --- all converge back to the same state, because the loop reads current reality every pass instead of trusting a memory of past events.
+
+\glabel{How does it work internally?} Controllers do not poll the API server in a loop; that would not scale. They open a \keyterm{watch} --- a long-lived streaming connection --- and receive add/update/delete events, which they use to maintain a local in-memory cache (the informer). Changed objects are pushed into a work queue, and worker goroutines dequeue an object key, read the \emph{current} state of the world from the cache, compute the difference against desired state, and issue at most a small corrective write. Failures go back on the queue with exponential backoff. The result is idempotent by construction: running the same reconcile twice does nothing the second time.
+
+\begin{wbfigure}{Fig 5.3 — One controller, one loop. Every Kubernetes behaviour you will ever debug is an instance of this.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (des) {Desired state\\replicas: 3};
+  \node[wbbox, right=of des] (obs) {Observe actual\\replicas: 2};
+  \node[wbboxk8s, right=of obs] (diff) {Diff\\short by 1};
+  \node[wbboxgood, right=of diff] (act) {Act\\create one Pod};
+  \draw[wbarrow] (des)--(obs); \draw[wbarrow] (obs)--(diff); \draw[wbarrow] (diff)--(act);
+  \draw[wbarrowg] (act.south) -- ++(0,-6mm) -| node[wbcap, pos=0.25, below]{repeat forever --- level-triggered, not edge-triggered} (des.south);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} Whenever you find yourself writing automation that says "when X happens, do Y". Rewrite it as "state Z should hold" and let a loop enforce it. This is the mental shift that carries into Terraform on Day 7 and Ansible on Day 8 --- both are the same idea with different blast radii.
+
+\glabel{When should I \emph{not}?} One-shot, genuinely imperative operations: a database migration, a data backfill, a report. Kubernetes models these as Jobs precisely because they are \emph{not} reconciled to a steady state --- their desired state is "has completed once", not "is running".
+
+\begin{seniornote}
+When something in Kubernetes surprises you, ask three questions in order: what is the desired state (\code{kubectl get -o yaml}), what is the observed state (\code{kubectl describe}, \code{kubectl get events}), and which controller is responsible for closing that gap? Nine incidents in ten resolve at question two, because the controller has already written the reason into an Event and nobody read it. Juniors go straight to \code{logs}; there are no logs when a Pod never started.
+\end{seniornote}
+
+\wbsub{3.3\quad Pods, ReplicaSets and Deployments}
+
+\glabel{What is it?} A \keyterm{Pod} is the smallest schedulable unit: one or more containers that share a network namespace (so they reach each other on \code{localhost}), share storage volumes, and are always placed on one node together. A \keyterm{ReplicaSet} keeps N identical Pods alive. A \keyterm{Deployment} owns ReplicaSets and orchestrates the transition from one to the next, which is what makes a rolling update possible.
+
+\glabel{Why does it exist?} The three-layer split looks like bureaucracy until you need a rollback. Because each image version gets its own ReplicaSet, "roll back" is not a redeploy from source --- it is scaling the previous ReplicaSet up and the current one down, using an image that already exists and Pods whose spec is already known good. Before this, rollback meant re-running the build pipeline on an old commit and hoping the result was byte-identical.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{24mm} X L{34mm}@{}}
+\wbtablehead{Object} & \wbtablehead{What it is} & \wbtablehead{Why it exists}\\
+Pod & One or more containers sharing network and storage, scheduled as a unit & The atom of scheduling; ephemeral by design\\
+ReplicaSet & Keeps exactly N Pods matching a selector alive & Self-healing; you rarely write one by hand\\
+Deployment & Owns ReplicaSets; performs rolling updates and rollbacks & The standard way to run a stateless app\\
+Service & Stable virtual IP and DNS name in front of a label-selected set of Pods & Pod IPs change constantly; clients need one that does not\\
+ConfigMap & Non-secret key/value config, injected as env vars or files & Decouples config from the image\\
+Secret & Same shape, access-controlled separately, base64-encoded & Credentials, tokens, keys\\
+Namespace & A scope for names, quotas and policy & Separating teams and environments on shared infrastructure\\
+\end{tabularx}
+\end{center}
+
+\begin{k8sbox}[k8s/deployment.yaml — CloudBase API]
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudbase-api
+  namespace: cloudbase
+  labels: { app: cloudbase-api }
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: cloudbase-api }
+  template:
+    metadata:
+      labels: { app: cloudbase-api }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: api
+          image: ghcr.io/aymix/cloudbase-api:1.4.2
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef: { name: cloudbase-config }
+            - secretRef:    { name: cloudbase-db }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   {            memory: "512Mi" }
+\end{k8sbox}
+
+\glabel{How does it work internally? (the rolling update)} Editing the Pod template creates a \emph{new} ReplicaSet with a new pod-template-hash label. The Deployment controller then walks both ReplicaSets toward their targets under two constraints: \code{maxUnavailable} (how far below \code{replicas} you may dip) and \code{maxSurge} (how far above you may go). Default is 25\% each, so a 4-replica Deployment runs between 3 and 5 Pods during the transition. New Pods only count toward availability once they pass their \emph{readiness} probe --- which is what actually makes a rolling update safe, and what makes a missing readiness probe silently turn a rolling update into a brief outage.
+
+\begin{tradeoff}
+Pinning an image by mutable tag (\code{:latest}, \code{:main}) makes the manifest look stable while the running software changes underneath you --- and worse, it breaks rollback, because the old ReplicaSet's tag now resolves to the new image too. Pinning by digest (\code{@sha256:...}) is exactly reproducible but makes every release a manifest change, which is only pleasant if a pipeline writes it for you. Production teams generally pin an immutable semantic tag in Git and let CI update it; the digest is recorded in the release notes, not typed by hand.
+\end{tradeoff}
+
+\begin{misconception}
+A bare Pod has no controller watching it. If the node it sits on is drained, cordoned or dies, that Pod is gone permanently --- nothing recreates it. \code{kubectl run} exists for a one-off debugging shell and essentially nothing else. Similarly, editing a live Pod (\code{kubectl edit pod ...}) changes something the Deployment did not write, so the next reconcile or the next replacement erases it. Change the Deployment, always.
+\end{misconception}
+
+\wbsub{3.4\quad How a Service Actually Finds Its Pods}
+
+\glabel{What is it?} A Service is a stable virtual IP and a DNS name that fronts a dynamic set of Pods. Crucially, a Service does not know which Pods exist. It declares a \keyterm{label selector}, and membership is computed continuously by a controller.
+
+\glabel{Why does it exist?} Pod IPs are ephemeral --- a rolling update replaces every IP in the set within a minute. Any client holding a Pod IP holds a value that will be wrong shortly. Before Kubernetes, teams solved this with a service-discovery sidecar plus a load balancer whose backend pool was edited by a deploy script; the failure mode was a load balancer still routing to terminated hosts.
+
+\glabel{How does it work internally?} There is no proxy process in the request path for a normal \code{ClusterIP} Service. The chain is:
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{34mm} X@{}}
+\wbtablehead{Step} & \wbtablehead{What happens}\\
+Label match & The EndpointSlice controller watches Pods, selects those matching the Service's selector, and keeps only the ones that are \emph{Ready}.\\
+EndpointSlice & Those Pod IPs and ports are written into EndpointSlice objects (which replaced the older single Endpoints object so large Services do not ship one huge object on every change).\\
+kube-proxy & On every node, \code{kube-proxy} watches EndpointSlices and programs kernel rules --- iptables or IPVS --- that DNAT the Service's virtual IP to one of the backend Pod IPs.\\
+CoreDNS & Resolves \code{cloudbase-api.cloudbase.svc.cluster.local} to the Service's virtual IP, so clients use a name, never an IP.\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 5.4 — A Service is an indirection through labels, not a list of IPs. Break the label match and the middle of this chain empties out.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxk8s] (svc) {Service\\selector: app=api};
+  \node[wbbox, right=of svc] (eps) {EndpointSlice\\ready Pod IPs};
+  \node[wbboxops, right=of eps] (kp) {kube-proxy\\iptables / IPVS};
+  \draw[wbarrow] (svc)--(eps); \draw[wbarrow] (eps)--(kp);
+  \node[wbboxgood, below=8mm of svc] (p1) {Pod\\app=api};
+  \node[wbboxgood, below=8mm of eps] (p2) {Pod\\app=api};
+  \node[wbboxghost, below=8mm of kp] (p3) {Pod\\app=apy};
+  \draw[wbarrowg] (p1)--(eps); \draw[wbarrowg] (p2)--(eps);
+  \draw[wbarrowg, dashed] (p3)--node[wbcap, right, xshift=1mm]{no match}(kp);
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(svc)(kp)(p1)(p3)] (ns) {};
+    \node[wbzonelabelk8s, anchor=north west] at (ns.north west) {namespace: cloudbase};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{28mm} X@{}}
+\wbtablehead{Service type} & \wbtablehead{What it gives you}\\
+ClusterIP & A virtual IP reachable only inside the cluster. The default, and correct for most internal services.\\
+NodePort & Additionally opens a high port on every node. Mostly a building block, and a blunt one.\\
+LoadBalancer & Asks the cloud provider for an external load balancer pointing at the NodePort. One cloud LB per Service --- which is why Ingress exists (Day 6).\\
+Headless (\code{clusterIP: None}) & No virtual IP; DNS returns the Pod IPs directly. For clients that must address individual replicas, e.g. databases.\\
+\end{tabularx}
+\end{center}
+
+\begin{k8sbox}[k8s/service.yaml — stable front door for the Deployment]
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudbase-api
+  namespace: cloudbase
+spec:
+  type: ClusterIP
+  selector:
+    app: cloudbase-api     # must match the POD labels, not the Deployment's
+  ports:
+    - name: http
+      port: 80             # the stable port clients call
+      targetPort: http     # the named containerPort on the Pod
+\end{k8sbox}
+
+\begin{seniornote}
+Point \code{targetPort} at a \emph{named} port rather than a number. The Service then keeps working when the app moves from 8080 to 9090, because the name travels with the container spec. It also documents intent in a way a bare integer never does. This costs nothing and removes an entire category of "the Service is up but returns connection refused" incidents.
+\end{seniornote}
+
+\begin{misconception}
+The Service's selector matches \emph{Pod} labels, not the Deployment's \code{metadata.labels}. These are different fields, and a manifest can easily have them disagree. When they do, \code{kubectl get svc} looks perfectly healthy --- the Service exists, it has a ClusterIP --- and every request times out, because the EndpointSlice is empty. \code{kubectl get endpointslices} is the two-second check that ends this argument.
+\end{misconception}
+
+\wbsub{3.5\quad ConfigMaps, Secrets and the Twelve-Factor Line}
+
+\glabel{What is it?} A ConfigMap holds non-sensitive key/value configuration; a Secret holds sensitive values. Both can be injected as environment variables or mounted as files.
+
+\glabel{Why does it exist?} Because the same image must run in dev, staging and production. If configuration is baked into the image, "promote to production" means rebuild, which means the artifact you tested is not the artifact you shipped. Day 4's immutability promise only holds if configuration enters at runtime.
+
+\glabel{How does it work internally?} The difference between the two injection styles matters more than most people realise. Environment variables are read once, at process start --- the container's environment block is fixed by the kernel at \code{exec} time, so updating the ConfigMap changes nothing until the Pod is recreated. A \emph{volume-mounted} ConfigMap or Secret, by contrast, is projected by the kubelet into a tmpfs directory and refreshed periodically (on the order of a minute, plus the kubelet's cache sync), so a running process that re-reads the file can pick up changes without a restart.
+
+\begin{k8sbox}[k8s/config.yaml — ConfigMap and Secret]
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudbase-config
+  namespace: cloudbase
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  DB_HOST: "cloudbase-db.cloudbase.svc.cluster.local"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudbase-db
+  namespace: cloudbase
+type: Opaque
+stringData:              # plain text here; the API server base64-encodes it
+  DB_USER: "cloudbase"
+  DB_PASSWORD: "replaced-by-external-secrets-in-production"
+\end{k8sbox}
+
+\begin{secwarn}[base64 is encoding, not encryption]
+\code{echo cGFzc3dvcmQ= | base64 -d} is not an attack; it is a decoding. A Secret is safer than a ConfigMap for three real reasons --- it can be RBAC-scoped separately, it is kept out of most logging and \code{describe} output, and the API server can be configured to encrypt it at rest --- but the value itself is not protected by base64 in any sense. Never commit a real Secret manifest to Git. Production teams inject values from an external store (AWS Secrets Manager, Vault) via the External Secrets Operator or the Secrets Store CSI driver, so the credential exists in the cluster only as a projected file with a short life.
+\end{secwarn}
+
+\begin{autotip}
+Add a checksum of the ConfigMap to the Pod template's annotations in your templating layer. Changing config then changes the Pod template hash, which creates a new ReplicaSet, which performs a normal rolling restart. Without this, a config change to an env-var-consuming app is a no-op until somebody manually restarts the Deployment --- and "I applied it and nothing happened" is one of the most common Kubernetes confusions.
+\end{autotip}
+
+\wbsub{3.6\quad Probes: Readiness Gates Traffic, Liveness Restarts}
+
+\glabel{What is it?} Three probe types, run by the \code{kubelet} against each container. \keyterm{Readiness} answers "may this Pod receive traffic right now?" --- failing it removes the Pod from EndpointSlices, and nothing is restarted. \keyterm{Liveness} answers "is this container unrecoverably stuck?" --- failing it kills and restarts the container. \keyterm{Startup} answers "has it finished booting?" --- while it is failing, the other two are suspended entirely.
+
+\glabel{Why does it exist?} Recall Day 3: a completed TCP handshake proves a socket is bound and the kernel accepted a connection. It proves nothing about the application. A JVM that has bound port 8080 but is still warming caches, loading a schema and opening a connection pool will accept your TCP connection and then sit on the request for forty seconds. Without a readiness probe, Kubernetes would route production traffic there the moment the container started, and every rolling update would drop requests. Before probes, teams solved this with a sleep in the deploy script and a prayer.
+
+\glabel{How does it work internally?} The kubelet --- not the control plane --- executes probes locally against the container. Each probe has \code{initialDelaySeconds}, \code{periodSeconds}, \code{timeoutSeconds}, \code{failureThreshold} and \code{successThreshold}. On readiness failure, the kubelet flips the Pod's \code{Ready} condition to false; the EndpointSlice controller notices and removes the Pod's IP; \code{kube-proxy} rewrites the node's rules. On liveness failure, the kubelet kills the container (SIGTERM then SIGKILL --- exactly Day 1's path) and the restart policy brings it back, with the familiar exponential \code{CrashLoopBackOff} delay.
+
+\begin{k8sbox}[deployment.yaml — the probe block that belongs on every container]
+          startupProbe:            # slow boot? this buys time safely
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+            failureThreshold: 30   # up to 150s to start, then give up
+          readinessProbe:          # gates traffic; checks dependencies
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:           # restarts; checks ONLY the process
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+\end{k8sbox}
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{24mm} X X@{}}
+\wbtablehead{Question} & \wbtablehead{Readiness (\code{/readyz})} & \wbtablehead{Liveness (\code{/healthz})}\\
+On failure & Removed from the Service & Container restarted\\
+Check the database? & Yes --- if you cannot serve, say so & \textbf{Never}\\
+Check the cache, queue, downstream API? & Yes, if requests genuinely need them & No\\
+Should it ever be slow or heavy? & Keep it cheap; it runs constantly & Keep it trivial\\
+What it really means & "send me work" & "I am not deadlocked"\\
+\end{tabularx}
+\end{center}
+
+\begin{reliability}
+The rule that prevents the worst Kubernetes outage there is: \textbf{a liveness probe must never check an external dependency.} Suppose your liveness probe queries the database. The database has a thirty-second blip. Every replica's liveness probe fails simultaneously, so the kubelet restarts every container in the fleet at once. Restarting containers reconnect on cold pools, all at the same instant, and hammer the recovering database --- which fails again. You have converted a brief dependency degradation into a self-sustaining, cluster-wide CrashLoopBackOff that outlives the original fault. The correct design puts the dependency check in \emph{readiness}: traffic drains away, nothing restarts, and when the database returns, every Pod becomes Ready again within one probe period with no cold starts.
+\end{reliability}
+
+\begin{wbfigure}{Fig 5.5 — Same failure, two probe designs. The left column is a recovery; the right is an outage you caused.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm and 12mm, every node/.style={font=\sffamily\scriptsize},
+   s/.style={wbbox, minimum width=42mm, minimum height=7mm, align=left, text width=37mm}]
+  \node[s, wbboxaccent] (t0) {\textbf{DB blips for 30s}};
+  \node[s, wbboxgood, below left=6mm and 4mm of t0] (r1) {readiness fails};
+  \node[s, wbboxwarn, below right=6mm and 4mm of t0] (l1) {liveness fails};
+  \draw[wbarrow] (t0)--(r1); \draw[wbarrow] (t0)--(l1);
+  \node[s, wbboxgood, below=of r1] (r2) {Pods leave EndpointSlice};
+  \node[s, wbboxwarn, below=of l1] (l2) {every container restarts};
+  \draw[wbarrow] (r1)--(r2); \draw[wbarrow] (l1)--(l2);
+  \node[s, wbboxgood, below=of r2] (r3) {no restarts, warm pools};
+  \node[s, wbboxwarn, below=of l2] (l3) {cold pools stampede the DB};
+  \draw[wbarrow] (r2)--(r3); \draw[wbarrow] (l2)--(l3);
+  \node[s, wbboxgood, below=of r3] (r4) {\textbf{Ready again in ~5s}};
+  \node[s, wbboxwarn, below=of l3] (l4) {\textbf{CrashLoopBackOff, fleet-wide}};
+  \draw[wbarrow] (r3)--(r4); \draw[wbarrow] (l3)--(l4);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I \emph{not} use a liveness probe?} More often than you would guess. If your application has no plausible unrecoverable-but-still-running state --- no deadlock-prone thread pool, no known hang --- a liveness probe adds risk without adding recovery. A crashed process is already restarted by the restart policy; liveness only helps for the narrow case of "alive but permanently wedged". A conservative default is: always a readiness probe, a startup probe if boot is slow, and a liveness probe only where you can name the hang it catches.
+
+\begin{perfnote}
+Probe timing is a budget you should compute, not guess. Time to restart on liveness failure is roughly \code{initialDelaySeconds} plus \code{failureThreshold} $\times$ \code{periodSeconds}, plus up to one \code{timeoutSeconds}. With the defaults above that is about 30 seconds --- deliberately longer than a GC pause or a brief lock contention spike, and deliberately shorter than a human noticing. If your probe endpoint takes longer than \code{timeoutSeconds} under load, the probe fails under load, which is precisely when you least want a restart.
+\end{perfnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Deploy through a Deployment, never a bare Pod, outside a debugging session.
+  \item \code{kubectl describe} before \code{kubectl logs} --- scheduling and image failures appear in Events, and there are no logs for a container that never ran.
+  \item Set resource \code{requests} on every container so the scheduler can do its job; set a memory \code{limit} to bound the blast radius.
+  \item Readiness probes check dependencies; liveness probes check only the process.
+  \item Keep config in ConfigMaps and Secrets, never baked into the image, and never a real credential in Git.
+  \item Use namespaces to separate environments, and attach quotas so one team cannot consume the cluster.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Putting a database check in the liveness probe --- the fleet-wide restart storm above.
+  \item Editing a running Pod instead of the Deployment; the change vanishes on the next replacement.
+  \item Assuming a Service holds a fixed list of Pod IPs rather than a live label selector.
+  \item Storing real credentials in a ConfigMap, or assuming base64 in a Secret is encryption.
+  \item Omitting resource requests, so the scheduler packs blindly and one Pod starves its node.
+  \item Believing \code{kubectl apply} succeeding means the application is running.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the second one under pressure, you can debug most Kubernetes networking incidents without opening a browser.
+
+\begin{writespace}[Redraw: the path of one \code{kubectl apply} — auth, admission, etcd, then which components react and in what order]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: Service $\rightarrow$ label selector $\rightarrow$ EndpointSlice $\rightarrow$ kube-proxy $\rightarrow$ Pod, and mark exactly where a readiness failure removes a Pod]
+\reflectionlines[6]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Deploy CloudBase to a Cluster}
+
+\textbf{Goal.} Take yesterday's hardened CloudBase image and give it a real home: a namespace, a Deployment with requests and limits, a Service, externalised configuration, and probes that are correct rather than merely present. Use \code{kind} or \code{minikube} locally --- the manifests are identical against EKS on Day 10.
+
+\resetlab
+\labstep{Create a cluster and a namespace, and set your context}
+Stand up a local cluster, create the \code{cloudbase} namespace, and make it your default context namespace.
+\labwhy{Working in \code{default} is how manifests end up in the wrong place. Namespaces are also where quotas and NetworkPolicies attach later --- getting one from the start costs nothing.}
+
+\labstep{Write the Deployment with requests and limits from the start}
+Three replicas, the pinned image tag from Day 4, \code{runAsNonRoot}, a CPU request and a memory request plus a memory limit.
+\labwhy{Requests are what the scheduler filters on; without them it cannot reason about capacity and will happily overcommit a node into OOM. Set the memory limit but consider leaving CPU unlimited --- a CPU limit throttles, a memory limit kills.}
+
+\labstep{Apply it and watch the reconciliation happen}
+Apply, then immediately watch Pods appear. Note the Pod name structure: Deployment name, ReplicaSet hash, Pod suffix.
+\labwhy{That name is the ownership chain made visible. Reading it tells you which ReplicaSet a Pod belongs to, which is how you tell old from new mid-rollout.}
+
+\labstep{Delete a Pod by hand and time the replacement}
+Delete one Pod and watch what happens within seconds.
+\labwhy{This is the reconciliation loop, observed. Nothing rescheduled a job or fired a webhook --- the ReplicaSet controller simply noticed 2 does not equal 3.}
+
+\labstep{Add the Service and prove the label indirection}
+Create the ClusterIP Service, confirm endpoints exist, then deliberately change the selector to a label no Pod carries and observe the endpoints empty out.
+\labwhy{You are building the reflex to check \code{endpointslices} when a Service "is up" but nothing responds. Break it on purpose now, so the muscle memory exists at 3am.}
+
+\labstep{Externalise configuration into a ConfigMap and Secret}
+Move environment settings to a ConfigMap and credentials to a Secret, injected via \code{envFrom}.
+\labwhy{The same image must be promotable across environments unchanged. This is the boundary that makes the Day 4 immutability promise real rather than aspirational.}
+
+\labstep{Change the ConfigMap and observe that nothing happens}
+Edit a value, apply, and confirm the running Pods still serve the old value. Then restart the Deployment and watch it take effect.
+\labwhy{Environment variables are fixed at process start. Discovering this deliberately, once, is far cheaper than discovering it during an incident where you are certain you already applied the fix.}
+
+\labstep{Add readiness, liveness and startup probes --- then break them}
+Add all three. Then temporarily point the liveness probe at an endpoint that depends on the database, stop the database, and watch the restart storm form.
+\labwhy{Reading about restart storms convinces nobody. Watching every replica enter CrashLoopBackOff because of one probe line is the lesson that sticks for a career.}
+
+\begin{prodtip}
+Get into the habit of \code{kubectl rollout status deployment/cloudbase-api} instead of watching Pods. It exits non-zero if the rollout stalls or times out, which makes it the correct thing for a CI job to run --- and it is a natural gate for Day 9's pipeline. A deploy step that cannot fail is not a deploy step.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+The API server is the only component permitted to read or write \code{etcd}; everything else goes through its HTTP API even though the store is right there. What does this buy that direct \code{etcd} access from each controller would lose --- and what does it cost?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Kubernetes controllers are level-triggered: each pass reads the current state of the world rather than trusting a record of past events. Design the opposite --- an edge-triggered orchestrator that acts only on events. Name three concrete situations in which it silently ends up in the wrong state.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A readiness probe removes a Pod from the Service; a liveness probe restarts it. Now imagine Kubernetes had shipped with only one probe type that did both. Which real failures would that single probe handle acceptably, and which would it turn into an outage?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Every replica in CrashLoopBackOff after a brief database hiccup}
+\textbf{Symptom.} A managed database failed over for about forty seconds. Twenty minutes later the database is healthy but all twelve API Pods are still restarting, and the error rate is 100\%.
+
+\begin{outbox}[kubectl get pods -n cloudbase  and  kubectl describe pod]
+NAME                             READY   STATUS             RESTARTS      AGE
+cloudbase-api-7d9f4c8b6-2xk4m    0/1     CrashLoopBackOff   9 (24s ago)   3h
+cloudbase-api-7d9f4c8b6-9jqvt    0/1     CrashLoopBackOff   9 (11s ago)   3h
+cloudbase-api-7d9f4c8b6-hb2rn    0/1     Running            8 (41s ago)   3h
+
+Events:
+  Warning  Unhealthy  2m (x27 over 19m)  kubelet  Liveness probe failed:
+           HTTP probe failed with statuscode: 503
+  Normal   Killing    2m (x9 over 18m)   kubelet  Container api failed
+           liveness probe, will be restarted
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The kill decision comes from the \emph{liveness} probe returning 503, and it has repeated nine times per Pod. The database recovered long ago.
+  \item \textbf{Hypothesise.} The liveness endpoint checks the database. The original blip failed it everywhere at once; each restart then starts with a cold connection pool, and the restarts themselves keep the dependency saturated.
+  \item \textbf{Investigate.} Read what \code{/healthz} actually does in the application code, and compare it to \code{/readyz}. Check whether both point at the same handler --- they very often do.
+  \item \textbf{Root cause.} An external dependency check inside a liveness probe converts a transient dependency fault into a self-sustaining, fleet-wide restart loop.
+  \item \textbf{Fix.} Point liveness at a trivial in-process handler that touches nothing external; move the database check to readiness. Raise \code{failureThreshold} so a single slow probe cannot kill a container.
+  \item \textbf{Prevent.} Make it a review rule: liveness endpoints may not perform I/O to anything outside the process. Add a startup probe so slow boots never reach the liveness probe at all.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The Service is healthy and every request times out}
+\textbf{Symptom.} \code{kubectl get svc} shows the Service with a ClusterIP. Pods are \code{1/1 Running}. Requests from another Pod hang until they time out.
+
+\begin{outbox}[kubectl get endpointslices  and  the two label blocks]
+NAME                  ADDRESSTYPE   PORTS   ENDPOINTS   AGE
+cloudbase-api-x7f2q   IPv4          <unset> <unset>     14m
+
+# service.yaml
+spec:
+  selector:
+    app: cloudbase-api
+
+# deployment.yaml  (pod template)
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudbase-api
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The EndpointSlice exists but has no endpoints --- the Service is fronting an empty set, so packets are DNAT'd nowhere.
+  \item \textbf{Hypothesise.} Either no Pod carries the selected label, or the Pods carry it but are not \code{Ready}. Here the Pods report \code{1/1}, so readiness is fine.
+  \item \textbf{Investigate.} \code{kubectl get pods -l app=cloudbase-api} returns nothing, while \code{-l app.kubernetes.io/name=cloudbase-api} returns three. The label keys differ.
+  \item \textbf{Root cause.} Someone standardised the Pod template on the recommended \code{app.kubernetes.io/*} label set without updating the Service's selector. The Service is selecting a label nothing has.
+  \item \textbf{Fix.} Align the selector with the Pod template labels. Note that a Deployment's own \code{spec.selector} is immutable --- if that is what drifted, you must recreate the Deployment.
+  \item \textbf{Prevent.} Generate both from one source (Kustomize \code{commonLabels}, or a Helm helper), and add a CI check that every Service selector matches at least one Pod template in the same directory.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Prove the reconciliation loop to yourself in four experiments.\\
+\textbf{Business context.} You are explaining self-healing to a sceptical colleague who thinks it is a cron job.\\
+\textbf{Architecture.} One local cluster, one 3-replica Deployment, no Service yet.\\
+\textbf{Requirements.} Delete a Pod and time the replacement; scale to 5 and back to 2; delete the ReplicaSet and watch it return; \code{kubectl edit} a live Pod's image and watch the change be discarded.\\
+\textbf{Constraints.} Use \code{kubectl get pods -w} throughout --- you are observing, not fixing.\\
+\textbf{Hints.} \code{kubectl get rs} shows old and new ReplicaSets and their desired/current counts.\\
+\textbf{Expected outcome.} A written one-paragraph explanation of who acted, in what order, in each case.\\
+\textbf{Production considerations.} Which of these four would page you, and which are routine?\\
+\textbf{Common pitfalls.} Concluding the Pod "restarted" when it was in fact replaced by a new one with a new name and IP.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~60 min}
+\textbf{Goal.} Build the probe set for a slow-starting application and measure each threshold.\\
+\textbf{Business context.} A JVM service takes 45 seconds to warm up; deploys currently drop requests.\\
+\textbf{Architecture.} One Deployment with an artificial startup delay, one Service, one client loop generating traffic.\\
+\textbf{Requirements.} Add a startup probe that tolerates the boot, a readiness probe that gates traffic, and a liveness probe that touches nothing external. Measure requests lost during a rolling update, before and after.\\
+\textbf{Constraints.} No \code{sleep} in the deploy process --- the cluster must know when the app is ready.\\
+\textbf{Hints.} Drive traffic with a tight \code{curl} loop and count non-200 responses; compare against a run with the readiness probe removed.\\
+\textbf{Expected outcome.} Zero failed requests during a rolling update, with the numbers to prove it.\\
+\textbf{Production considerations.} Compute the worst-case restart delay from your thresholds and state it explicitly.\\
+\textbf{Common pitfalls.} Using the same handler for liveness and readiness; setting \code{initialDelaySeconds} so high that a genuinely wedged container survives for minutes.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2 hours}
+\textbf{Goal.} Produce the complete, reviewable manifest set for CloudBase in one namespace.\\
+\textbf{Business context.} Another engineer must be able to stand up the environment from your repository alone.\\
+\textbf{Architecture.} Namespace $\rightarrow$ ConfigMap $\rightarrow$ Secret $\rightarrow$ Deployment (3 replicas, requests/limits, probes, non-root) $\rightarrow$ ClusterIP Service.\\
+\textbf{Requirements.} Every container has requests, a memory limit, readiness and liveness probes and a named port; no credential is committed in plain text; a \code{README} documents the apply order and the verification commands.\\
+\textbf{Constraints.} Must apply cleanly onto an empty cluster \emph{and} onto a cluster where it already exists --- idempotency, exactly as on Day 1.\\
+\textbf{Hints.} Keep manifests in \code{k8s/} numbered by apply order; verify with \code{rollout status} plus an endpoint check, not by eye.\\
+\textbf{Expected outcome.} \code{kubectl apply -f k8s/} twice in a row, both clean, with a healthy rollout and non-empty endpoints.\\
+\textbf{Production considerations.} Note where the Secret's values will come from in a real environment, and who would be allowed to read them.\\
+\textbf{Common pitfalls.} Selector and Pod labels drifting apart; mutable image tags; forgetting that the namespace must exist before anything in it.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{scalenote}
+The economic case for Kubernetes is bin-packing, not convenience. One service per VM wastes the difference between peak provisioning and average usage on every machine, all the time. A scheduler packing many workloads with honest resource requests onto shared nodes reclaims most of that gap --- Spotify's published case study reports a two-to-threefold CPU utilisation improvement from bin-packing and multi-tenancy. That improvement is entirely contingent on requests being accurate: garbage requests in, garbage packing out.
+\end{scalenote}
+
+\begin{costnote}
+The most expensive line in a Kubernetes manifest is a resource request nobody measured. Requests are what you pay for, because they are what the scheduler reserves; a service requesting 2 CPUs and using 0.15 wastes 92\% of that reservation on every one of its replicas, forever, across every environment. Measure actual usage with the Vertical Pod Autoscaler in recommendation-only mode before committing numbers, and revisit them --- request values set during a launch panic have a way of becoming permanent.
+\end{costnote}
+
+\begin{drtip}
+Back up \code{etcd}, and rehearse the restore. A cluster whose \code{etcd} is gone has not merely lost uptime --- it has lost every declaration of what should be running, every Secret, every RBAC binding. Managed control planes (EKS, GKE, AKS) handle this for you, which is a strong argument for using one. If you run your own, take periodic snapshots, store them off-cluster and encrypted, and prove at least once that you can rebuild from one. An untested backup is a belief, not a control.
+\end{drtip}
+
+\begin{opsnote}
+Kubernetes Events are the cluster telling you exactly what it tried and why it failed --- and they expire, typically after about an hour. If your only record of an incident is \code{kubectl describe} run after the fact, the evidence is already gone. Ship Events to your logging system on day one; on Day 11 you will wire the metrics half of this, but Events answer "why did nothing start?" in a way no metric does.
+\end{opsnote}
+
+\begin{interview}
+Expect: \emph{"How does a Service find its Pods if Pod IPs change constantly?"} The weak answer names the label selector and stops. The strong answer walks the chain --- the selector matches Pod labels, the EndpointSlice controller keeps only \emph{Ready} Pods in the slice, \code{kube-proxy} on each node programs iptables or IPVS rules from those slices, and CoreDNS resolves the Service name to the virtual IP --- and then names the failure mode: a selector that matches nothing produces a perfectly healthy-looking Service with an empty EndpointSlice and total timeouts.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a hardened base host and a strict-mode bootstrap script. Day 2 put it under version control with reviewable history. Day 3 established how traffic actually reaches it across the network. Day 4 turned it into a small, non-root, pinned container image. Today that image stops being an artifact and becomes a running service that survives a node dying.
+
+\begin{buildalong}[Day 05 — CloudBase on Kubernetes]
+\begin{wbitem}
+  \item Create a \code{k8s/} directory in the CloudBase repository, with manifests numbered by apply order so the sequence is documented by the filenames.
+  \item Declare a \code{cloudbase} namespace and use it everywhere --- nothing lands in \code{default}.
+  \item Write the Deployment: 3 replicas, the Day 4 image pinned to an immutable tag, \code{runAsNonRoot}, CPU and memory \code{requests} and a memory \code{limit} on every container.
+  \item Add a \code{ClusterIP} Service selecting the Pod labels by a named \code{targetPort}, and verify with \code{kubectl get endpointslices} that it is non-empty.
+  \item Externalise all configuration into a ConfigMap and all credentials into a Secret, injected with \code{envFrom}; commit the ConfigMap, never the Secret's real values.
+  \item Add a startup probe, a readiness probe that checks the database, and a liveness probe that checks \emph{nothing outside the process} --- then write one sentence in the README explaining that split to the next engineer.
+  \item Prove self-healing: delete a Pod and confirm replacement; break the Service selector and diagnose it from \code{endpointslices} alone; restore it.
+  \item Record the verification commands in \code{docs/k8s-runbook.md}: \code{rollout status}, \code{get endpointslices}, \code{describe pod}, \code{get events --sort-by}.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{kubectl apply -f k8s/} runs cleanly twice in a row, \code{kubectl rollout status deployment/cloudbase-api -n cloudbase} exits 0, the Service has three ready endpoints, deleting any Pod restores three within seconds, and stopping the database drains traffic through readiness \emph{without a single container restart}.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item The control plane decides, the nodes run. The API server is the only writer to \code{etcd}.
+  \item \code{kubectl apply} writes a declaration and returns; controllers do the work asynchronously.
+  \item Reconciliation is level-triggered: observe reality, diff against desired, take one corrective action, repeat.
+  \item The scheduler filters nodes on \code{requests} and constraints, scores the survivors, and writes a node name.
+  \item A Service is a label selector resolved into EndpointSlices and programmed into kernel rules by \code{kube-proxy}.
+  \item Readiness gates traffic; liveness restarts. Only readiness may check external dependencies.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Environment variables from a ConfigMap are fixed at process start --- changing the ConfigMap changes nothing until the Pod is replaced.
+  \item Secrets are base64-encoded, not encrypted; at-rest encryption in \code{etcd} is opt-in on the API server.
+  \item A Deployment's \code{spec.selector} is immutable --- getting it wrong means recreating the object.
+  \item Empty endpoints with a healthy Service is nearly always a label mismatch.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Dependency check in liveness \quad$\bullet$\quad editing a live Pod \quad$\bullet$\quad no resource requests
+  \item Mutable image tags \quad$\bullet$\quad real credentials in a ConfigMap \quad$\bullet$\quad trusting a successful \code{apply}
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Control plane}{API server (only etcd writer) · etcd (Raft, source of truth) · scheduler (filter, score) · controller-manager (loops).}
+\cheatitem{Node}{kubelet (starts containers, runs probes) · kube-proxy (programs Service rules) · container runtime.}
+\cheatitem{Reconciliation}{observe $\rightarrow$ diff $\rightarrow$ act $\rightarrow$ repeat; level-triggered, so it self-corrects after any missed event.}
+\cheatitem{Deployment}{owns ReplicaSets; rolling update bounded by \code{maxSurge} and \code{maxUnavailable}; rollback = scale the old ReplicaSet back up.}
+\cheatitem{Service}{selector $\rightarrow$ EndpointSlice (Ready Pods only) $\rightarrow$ kube-proxy rules $\rightarrow$ CoreDNS name.}
+\cheatitem{Probes}{startup suspends the others · readiness gates traffic · liveness restarts · never do external I/O in liveness.}
+\cheatitem{Resources}{\code{requests} = what the scheduler reserves and you pay for; memory \code{limit} = OOMKill boundary; CPU \code{limit} = throttling.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 5 commands worth memorising]
+# what is the cluster doing right now
+kubectl get pods -n cloudbase -o wide          # includes node and Pod IP
+kubectl get events -n cloudbase --sort-by=.lastTimestamp
+kubectl describe pod <pod> -n cloudbase        # Events: why it will not start
+
+# the declaration itself
+kubectl apply -f k8s/                          # write desired state
+kubectl get deploy cloudbase-api -o yaml       # what the API server stored
+kubectl diff -f k8s/                           # what apply WOULD change
+
+# rollouts
+kubectl rollout status deployment/cloudbase-api -n cloudbase
+kubectl rollout history deployment/cloudbase-api -n cloudbase
+kubectl rollout undo deployment/cloudbase-api -n cloudbase
+kubectl rollout restart deployment/cloudbase-api -n cloudbase
+
+# service wiring -- the two-second timeout diagnosis
+kubectl get endpointslices -n cloudbase
+kubectl get pods -n cloudbase -l app=cloudbase-api
+
+# inspection
+kubectl logs -f <pod> -n cloudbase --previous  # logs from the crashed instance
+kubectl exec -it <pod> -n cloudbase -- /bin/sh
+kubectl top pods -n cloudbase                  # actual usage vs your requests
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the difference between a Pod, a ReplicaSet and a Deployment, and why are there three?}
+\iq{How does a Service find the right Pods if Pod IPs change constantly?}
+\iq{What is \code{etcd}, and what exactly have you lost if you lose it?}
+\iq{Explain the reconciliation loop, and why level-triggered matters more than edge-triggered.}
+\iq{Why is a ConfigMap the wrong place for a database password, given that a Secret is only base64?}
+\iq{What does the scheduler actually use when it decides a node has room?}
+\iq{Why must a liveness probe never check the database?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item \emph{Kubernetes Components} --- kubernetes.io/docs/concepts/overview/components/ --- one page naming every control-plane and node component.
+  \item \emph{Kubernetes Scheduler} --- kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/ --- the filtering and scoring two-step, and scheduling profiles.
+  \item \emph{Liveness, Readiness and Startup Probes} --- kubernetes.io/docs/concepts/workloads/pods/probes/ and the companion task page under /docs/tasks/configure-pod-container/.
+  \item \emph{Encrypting Confidential Data at Rest} --- kubernetes.io/docs/tasks/administer-cluster/encrypt-data/ --- confirms the API server stores plain text in \code{etcd} by default.
+  \item \emph{Service} and \emph{EndpointSlices} --- both under kubernetes.io/docs/concepts/services-networking/.
+  \item Spotify's Kubernetes case study --- kubernetes.io/case-studies/spotify/ --- the Helios migration, provisioning time and utilisation figures quoted in this chapter.
+  \item ``Dynamic Kubernetes Cluster Scaling at Airbnb'' on the Airbnb Tech Blog --- multi-cluster operation and the cluster-type abstraction.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Every workload is a Deployment (or StatefulSet/Job), never a bare Pod.
+  \item Every container has CPU and memory \code{requests} and a memory \code{limit}.
+  \item Every container has a readiness probe; liveness only where a real hang exists, and it performs no external I/O.
+  \item Images are pinned to immutable tags or digests, never \code{latest}.
+  \item Configuration lives in ConfigMaps, credentials in Secrets sourced from an external store.
+  \item At-rest encryption is enabled for Secrets on the API server, and \code{etcd} backups are tested.
+  \item Namespaces separate environments, with resource quotas attached.
+  \item Events are shipped off-cluster before they expire.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 6).} CloudBase now runs and stays running --- but it is only reachable from inside the cluster, it scales only when you type a number, and a bad rollout still reaches every user at once. Tomorrow: Ingress and TLS termination so one entry point serves many services, the Horizontal Pod Autoscaler reacting to real metrics, persistent volumes for state that must outlive a Pod, and rollout strategies that let you fail a deploy in front of 1\% of traffic instead of 100\%.
+\end{keyidea}

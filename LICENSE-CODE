@@ -1,8 +1,9 @@
 MIT License
 
-Applies to the LaTeX design system and build machinery only — preamble.tex,
-main.tex and .gitignore. See LICENSE for the full breakdown; the workbook
-content is licensed separately under CC BY-NC-ND 4.0 (see LICENSE-CONTENT).
+Applies to the LaTeX design system and build machinery only — */preamble.tex,
+*/main.tex and .gitignore, in both volumes (backend/ and devops/). See LICENSE
+for the full breakdown; the workbook content is licensed separately under
+CC BY-NC-ND 4.0 (see LICENSE-CONTENT).
 
 Copyright (c) 2026 Aymix
 

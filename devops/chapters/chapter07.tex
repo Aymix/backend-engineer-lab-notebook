@@ -1,0 +1,708 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 07 ============================
+\daychapter{07}{Infrastructure as Code}{Infrastructure as Code with Terraform}{Providers, state, the plan DAG, modules and remote backends}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain the declarative model: describe the end state, let the tool compute the steps.
+  \item Describe what a provider actually is --- a plugin process with a CRUD schema --- and why versions get pinned.
+  \item Reason about \keyterm{state} as the map from configuration addresses to real-world resource IDs, and treat it as a secret.
+  \item Read a plan as a walk over a dependency graph, and predict create versus update versus replace.
+  \item Design modules with clean inputs and outputs, and detect, explain and correct drift.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} On Day 3 you designed a network on paper: a VPC, public and private subnets across two availability zones, an internet gateway, a NAT gateway, route tables. On Days 5 and 6 you ran a cluster on top of it. Every one of those resources currently exists because a human clicked a console or typed a CLI command. Nobody can say with certainty what the security group rules are, what changed last Tuesday, or how to rebuild the whole thing in a second region by Friday. Infrastructure as Code replaces "what somebody did" with "what the repository says", and makes the gap between the two visible, reviewable and correctable.
+
+\glabel{Why DevOps engineers need it.} Because the console does not scale past one person and one environment. Three environments times forty resources is a hundred and twenty hand-made objects that nobody remembers creating, and the first time production differs from staging in a way that matters, you will spend a day comparing dropdowns. IaC turns infrastructure into something you can diff, review in a pull request, revert with \code{git revert}, and reproduce from scratch. That is not a productivity nicety; it is how a disaster-recovery plan becomes credible.
+
+\glabel{What engineers did before it.} First there was ClickOps --- the console, plus a wiki page that went stale within a month. Then shell scripts wrapping the cloud CLI, which worked exactly once, because scripts are \emph{imperative}: rerunning "create a VPC" on a second run either errors or creates a second VPC. Then vendor-native declarative tools (AWS CloudFormation in 2011), which fixed idempotency but locked you into one cloud and one very verbose template language. Terraform's contribution in 2014 was to put a plugin boundary between the engine and the cloud, so one language and one workflow could drive AWS, an on-prem vSphere, a DNS provider and a SaaS product in a single plan.
+
+\begin{keyidea}
+Terraform is a \emph{reconciliation engine}, exactly like the Kubernetes controllers you met on Day 5. You declare desired state; it observes actual state; it computes and executes the difference. The only structural distinction is when the loop runs. Kubernetes reconciles continuously, forever, on its own. Terraform reconciles once, when a human runs \code{apply}. Everything strange about Terraform --- state files, drift, locking --- follows from that one difference.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Terraform sits at the bottom of the delivery stack, below the cluster and beside the pipeline. It provisions the boxes and the wires; other tools configure and fill them.
+
+\begin{wbfigure}{Fig 7.0 — Where today sits. Terraform creates the substrate; Ansible configures inside it; Kubernetes schedules on top of it.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[lyr, wbboxops] (cicd) {\textbf{CI/CD pipeline runs the plan} \hfill \scriptsize Day 9};
+  \node[lyr, wbboxk8s, below=of cicd] (k8s) {\textbf{Kubernetes workloads} \hfill \scriptsize Day 5--6};
+  \node[lyr, below=of k8s] (cfg) {\textbf{Config management inside hosts} \hfill \scriptsize Day 8};
+  \node[lyr, wbboxaccent, below=of cfg] (tf) {\textbf{Terraform: declared infrastructure} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxcloud, below=of tf] (aws) {\textbf{Cloud API (VPC, EC2, IAM, RDS)} \hfill \scriptsize Day 3, 10};
+  \node[lyr, wbboxghost, below=of aws] (hw) {\textbf{Physical regions and AZs} \hfill \scriptsize provider's problem};
+  \foreach \a/\b in {cicd/k8s,k8s/cfg,cfg/tf,tf/aws,aws/hw}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=5mm of tf, text width=23mm, anchor=west] {the repository is the source of truth};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 ended on \keyterm{idempotency} --- a script that is safe to rerun. Terraform is that idea taken to its conclusion: you do not write the rerun logic at all, you declare the outcome. Day 2's pull-request review now applies to networks and IAM roles, not only application code. Day 3's CIDR plan becomes literal HCL today. Day 5's reconciliation loop is the same algorithm. And Day 8's Ansible is the complement, not the competitor: Terraform decides that a machine exists, Ansible decides what is installed on it.
+
+\glabel{Where companies use it in production.} Slack manages close to 1{,}400 Terraform state files across AWS, GCP, DigitalOcean and NS1, deliberately splitting state per region and per child account so that any single apply touches a small blast radius. They store state in a version-enabled S3 bucket with locking, run every apply from dedicated Jenkins workers holding the privileged IAM roles, and give engineers read-only "Ops" boxes so they can \code{plan} but never \code{apply} by hand. They built an internal "Smart Planner" that works out which of those 1{,}400 state files a pull request touches, plans each one, and posts the results back onto the PR --- turning \code{terraform plan} into a code-review artifact. Shopify's Conversations team went further in a different direction: they wrote their \emph{own} Terraform provider for Twilio TaskRouter so that contact-centre routing rules, previously edited by hand in a vendor GUI, became reviewable HCL with an Atlantis-driven plan on every pull request. Their reported win was not speed; it was \code{git blame} on a routing rule.
+
+\glabel{Common misconceptions.} That Terraform "manages your infrastructure" continuously (it does nothing between applies); that state is a cache you can delete (it is the only record linking your code to real resource IDs); that a plan is a preview of the code (it is a preview of the difference between code, recorded state and live reality); and that Terraform and Ansible compete (they answer different questions).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 7.1 — The Day 7 territory: HCL declares, the provider translates, the graph orders, state remembers.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (hcl) {HCL config\\desired state};
+  \node[wbbox, right=10mm of hcl] (graph) {Dependency\\graph (DAG)};
+  \node[wbbox, above=8mm of graph] (prov) {Provider\\plugin};
+  \node[wbcyl, below=9mm of graph] (state) {State\\file};
+  \draw[wbarrow] (hcl)--(graph);
+  \draw[wbarrow] (graph)--(prov);
+  \draw[wbarrow] (graph)--(state);
+  \node[wbbox, right=9mm of prov] (api) {Cloud API\\real resources};
+  \node[wbboxgood, right=9mm of graph] (plan) {Plan\\the diff};
+  \node[wbboxcloud, right=9mm of state] (backend) {Remote backend\\+ lock};
+  \draw[wbarrow] (prov)--(api);
+  \draw[wbarrow] (graph)--(plan);
+  \draw[wbarrow] (state)--(backend);
+  \node[wbboxops, right=9mm of plan] (apply) {Apply\\execute the diff};
+  \draw[wbarrow] (plan)--(apply);
+  \draw[wbarrowg] (api.east) to[out=-20,in=60] (apply.north);
+  \node[wbboxwarn, below=9mm of backend] (drift) {Drift\\reality $\neq$ state};
+  \draw[wbarrowg] (backend)--(drift);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{declarative} $\rightarrow$ \keyterm{provider} $\rightarrow$ \keyterm{resource} $\rightarrow$ \keyterm{dependency graph} $\rightarrow$ \keyterm{refresh} $\rightarrow$ \keyterm{plan} $\rightarrow$ \keyterm{apply} $\rightarrow$ \keyterm{state} $\rightarrow$ \keyterm{backend} $\rightarrow$ \keyterm{lock} $\rightarrow$ \keyterm{module} $\rightarrow$ \keyterm{drift} $\rightarrow$ \keyterm{import}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Declarative Infrastructure and the Reconciliation Model}
+
+\glabel{What is it?} You write files describing the infrastructure you want to exist. You never write "create", "update" or "delete". The tool compares your description with what it believes exists, and derives the verbs itself.
+
+\glabel{Why does it exist?} Because imperative provisioning has no safe second run. A script that says "create a VPC, then create a subnet in it" is correct on an empty account and wrong everywhere else --- on rerun it either fails, duplicates, or silently skips because someone added an \code{if} that was never tested. The engineering problem is that the \emph{starting state is unknown}. Declarative tools solve it by making the starting state an input to be measured rather than an assumption to be guessed.
+
+\glabel{How does it work internally?} A run has four phases, and confusing them is the source of most beginner surprises.
+
+\begin{wbfigure}{Fig 7.2 — One Terraform run. The diff is computed against \emph{refreshed} state, not against the file you last read.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=60mm, minimum height=7.6mm, align=left, text width=54mm}]
+  \node[stg] (a) {\textbf{1 · Load} \hfill \scriptsize parse HCL, resolve vars, build DAG};
+  \node[stg, wbboxcloud, below=of a] (b) {\textbf{2 · Refresh} \hfill \scriptsize read each managed resource live};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · Plan} \hfill \scriptsize desired vs refreshed $\rightarrow$ actions};
+  \node[stg, wbboxgood, below=of c] (d) {\textbf{4 · Apply} \hfill \scriptsize walk DAG, call provider, write state};
+  \foreach \x/\y in {a/b,b/c,c/d}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=5mm of b, text width=25mm, anchor=west] {this is where drift is discovered};
+  \node[wbcap, right=5mm of d, text width=25mm, anchor=west] {state is written incrementally, not at the end};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} For anything that outlives a single afternoon and that more than one person depends on: networks, IAM, clusters, databases, DNS, queues, buckets.
+
+\glabel{When should I \emph{not}?} For a genuinely throwaway experiment you will destroy in an hour, and --- more importantly --- for things that change many times per day on their own. Autoscaling group \emph{sizes}, Kubernetes Deployment replica counts, and anything a runtime controller adjusts should not be pinned in Terraform, or every plan will fight the controller. Declare the resource; let \code{lifecycle.ignore\_changes} concede the fields something else owns.
+
+\glabel{Production example.} Shopify's Conversations team applied this to a domain most people would never call "infrastructure": Twilio TaskRouter workflows for their contact centre. Previously an operations person edited routing rules in a vendor GUI --- no tests, no rollback, no record of intent. They built a custom Terraform provider, put the rules in HCL, and wired Atlantis so every change arrived as a pull request with a plan attached. The declarative model turned a GUI into a reviewable artifact, and non-engineers began opening infrastructure PRs.
+
+\begin{tradeoff}
+Declarative buys reproducibility and costs expressiveness. There is no clean way to say "do X, then wait for a human, then do Y" in a declaration --- multi-step operational choreography (a database cutover, a blue/green switch with a soak period) is genuinely awkward in HCL. Mature teams accept the split: Terraform owns the shape of the infrastructure, a pipeline or runbook owns the choreography.
+\end{tradeoff}
+
+\wbsub{3.2\quad Providers --- the Plugin Boundary That Made Terraform Multi-Cloud}
+
+\glabel{What is it?} A provider is a separate executable that teaches Terraform about one API. The AWS provider knows what an \code{aws\_vpc} is, which arguments it takes, which of them force replacement when changed, and how to create, read, update and delete one.
+
+\glabel{Why does it exist?} CloudFormation is written by AWS, for AWS, and shipped with AWS. That is fine until your infrastructure includes a DNS vendor, a monitoring SaaS and a second cloud. Terraform's authors moved the vendor-specific knowledge out of the engine entirely, so the engine only knows about \emph{resources with schemas and dependencies}. Everything vendor-shaped lives behind the plugin boundary. That single design choice is why there are thousands of providers today and why you can express "create the VPC, then create the DNS record pointing at its NAT gateway's elastic IP" in one graph.
+
+\glabel{How does it work internally?} When you run \code{terraform init}, Terraform downloads provider binaries into \code{.terraform/providers} and records their exact versions and checksums in \code{.terraform.lock.hcl}. During a plan, Terraform launches each provider as a child process and talks to it over a local gRPC connection. The engine asks structured questions --- "validate this configuration", "read the current state of this object", "given prior state and desired config, what would the resource look like after apply?" --- and the provider answers. The engine never speaks HTTP to AWS; the provider does.
+
+\begin{behind}
+The plan diff you read on screen is largely computed by the \emph{provider}, not the engine. The engine sends prior state plus desired configuration and asks the provider to produce a planned new state. The provider fills in what it knows and marks anything it cannot predict --- a generated ID, an ARN --- as \code{(known after apply)}. That is why unknown values propagate: if a subnet's ID is unknown, everything referencing it is unknown too, and the plan output cascades question marks downstream.
+\end{behind}
+
+\begin{tfbox}[versions.tf — pin the engine and every provider]
+terraform {
+  required_version = "~> 1.9"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.60"   # allow 5.60.x -> 5.x, never 6.0
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Project   = "cloudbase"
+      ManagedBy = "terraform"
+      Env       = var.env
+    }
+  }
+}
+\end{tfbox}
+
+\begin{secwarn}[unpinned providers are a supply-chain and a stability problem]
+Without a version constraint, \code{terraform init} on a fresh CI runner resolves to whatever is newest that morning. A provider major version can change a default, tighten validation, or alter which arguments force replacement --- so a plan that was empty yesterday proposes destroying your NAT gateway today, and the person who typed \code{yes} did nothing wrong. Commit \code{.terraform.lock.hcl}: it records the exact versions \emph{and their checksums}, so CI resolves the same bytes you tested.
+\end{secwarn}
+
+\begin{seniornote}
+Slack supports several AWS provider versions simultaneously rather than forcing a big-bang upgrade. Their Terraform wrapper reads each state directory's \code{versions.tf} and selects the matching binary and plugins, so provider 3.x and 4.x configurations coexist while teams migrate at their own pace, with a purpose-built pre-flight tool checking a bulk upgrade before it runs. The lesson generalises: at scale, "upgrade everything at once" is not an option, so your tooling must make version heterogeneity survivable.
+\end{seniornote}
+
+\wbsub{3.3\quad State --- the Map From Your Code to the Real World}
+
+\glabel{What is it?} A JSON document recording, for every resource you have created, the address in your configuration (\code{aws\_subnet.public["a"]}), the real object's ID (\code{subnet-0f3a...}), every attribute as last observed, and the dependency edges that were in effect. It is Terraform's memory.
+
+\glabel{Why does it exist?} Because there is no reliable way to ask a cloud "which of these objects did I create from this configuration?" Tags are a convention, not a guarantee; two resources can look identical; some resources have no queryable name at all. Without state, Terraform could not tell "this subnet is mine and needs updating" from "this subnet is someone else's, leave it alone" or "the subnet I made is gone, recreate it". State also stores the dependency graph as it was at last apply, which is how Terraform can still destroy resources in the right order after you have deleted their configuration blocks entirely.
+
+\begin{wbfigure}{Fig 7.3 — State is the join table between configuration addresses and cloud resource IDs. Lose it and both sides become orphans.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 12mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent, text width=30mm] (cfg) {\textbf{Configuration}\\aws\_vpc.main\\aws\_subnet.public\_a\\aws\_nat\_gateway.ngw};
+  \node[wbcyl, right=of cfg, text width=22mm] (st) {\textbf{State}\\address $\rightarrow$ id\\+ attributes\\+ dependencies};
+  \node[wbboxcloud, right=of st, text width=30mm] (real) {\textbf{Real AWS}\\vpc-0a91c4\\subnet-0f3ab2\\nat-07dd41};
+  \draw[wbarrow] (cfg)--(st);
+  \draw[wbarrow] (st)--(real);
+  \node[wbcap, below=5mm of st, text width=44mm] {no state = Terraform sees an empty account and proposes creating everything a second time};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it work internally?} The file carries a \code{version}, a \code{lineage} (a UUID identifying this state's ancestry) and a \code{serial} that increments on every write. A backend uses those to refuse a write from a stale reader, and to notice if you point a workspace at a state from a different lineage. Attributes are stored verbatim as the provider returned them --- which is exactly why an RDS password, an IAM access key or a generated TLS private key ends up in the file as plaintext even if you were careful never to write it in HCL. Terraform marks such values \code{sensitive} for \emph{display} purposes; that redaction is a console courtesy, not encryption.
+
+\begin{secwarn}[state is the crown jewel]
+Treat the state file as a credential store, because in practice it is one. Never commit it to Git --- not even to a private repository, because history is forever and clones are everywhere. Put it in a bucket with server-side encryption, versioning, public access fully blocked, and an IAM policy that grants read to almost nobody. If you must inspect it, use \code{terraform show} or \code{terraform state show}, which apply redaction, rather than opening the JSON.
+\end{secwarn}
+
+\glabel{Why remote, and why locked?} With local state, two engineers have two divergent memories of the same account, and whoever applies second silently recreates or destroys what the first one made. A remote backend gives the team one shared memory. Locking then solves the second problem: two applies running concurrently against the same state produce a lost update --- both read serial 41, both write serial 42, one set of changes vanishes from the record while the resources it created remain in the cloud, unmanaged and unbilled to anyone's attention.
+
+\begin{tfbox}[backend.tf — remote state with native S3 locking]
+terraform {
+  backend "s3" {
+    bucket       = "cloudbase-tfstate-prod"
+    key          = "network/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    kms_key_id   = "arn:aws:kms:eu-west-1:111122223333:key/abcd-1234"
+
+    # Native S3 locking via a conditional-write .tflock object.
+    # Replaces the old dynamodb_table argument, which is deprecated.
+    use_lockfile = true
+  }
+}
+\end{tfbox}
+
+\begin{infranote}[what changed recently, and why it matters]
+The S3 backend historically required a separate DynamoDB table for locking, because S3 offered no compare-and-swap primitive. Once S3 gained conditional writes, HashiCorp added \code{use\_lockfile}, which takes the lock by conditionally creating a \code{<key>.tflock} object beside the state --- one service instead of two. The \code{dynamodb\_table} argument is now deprecated and slated for removal in a future minor version. For a migration you may set both at once so that older and newer CLI versions still exclude each other; once every operator is upgraded, drop \code{dynamodb\_table} and delete the table. Note that \code{use\_lockfile} still defaults to \code{false} --- an unlocked backend is the silent default, so you must opt in.
+\end{infranote}
+
+\begin{drtip}
+Enable S3 object versioning on the state bucket before you store anything in it. Versioning turns "somebody ran \code{state rm} on the wrong address" from a reconstruction project into a thirty-second rollback to the previous object version. Slack relies on exactly this property. Also keep the bucket in a separate account or at minimum a separate blast radius from the infrastructure it describes --- state that lives inside the environment it can destroy is not a backup.
+\end{drtip}
+
+\wbsub{3.4\quad The Plan DAG --- How Terraform Decides Order and Verbs}
+
+\glabel{What is it?} Terraform builds a directed acyclic graph whose nodes are resource instances and whose edges are dependencies. The plan is a walk over that graph; the apply is the same walk, executing.
+
+\glabel{Why does it exist?} Because ordering is the hard part of provisioning, and humans get it wrong. A subnet needs its VPC's ID. A NAT gateway needs an elastic IP and a public subnet. A private route table's default route needs the NAT gateway's ID. Encoding that by hand as a numbered runbook is fragile and unparallelisable. Encoding it as a graph means order is \emph{derived}, and independent branches run concurrently for free.
+
+\glabel{How does it work internally?} Edges come from three places. Most are \keyterm{implicit}: writing \code{vpc\_id = aws\_vpc.main.id} inside a subnet tells Terraform that the subnet reads an attribute of the VPC, so the VPC must exist first. Some are \keyterm{explicit}, declared with \code{depends\_on} when a real ordering requirement exists that no attribute reference expresses --- an IAM policy that must be attached before a service can assume the role, for instance. The rest are structural: providers, variables, outputs and module boundaries all become nodes. Terraform then topologically sorts and walks the graph, executing up to ten operations in parallel by default. \textbf{Destroy is the same graph with the edges reversed} --- which is precisely why Terraform deletes the route table before the NAT gateway before the subnet before the VPC without being told to.
+
+\begin{wbfigure}{Fig 7.4 — The CloudBase network graph. Terraform derives this from attribute references; you never write the order.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxcloud] (vpc) {aws\_vpc};
+  \node[wbboxcloud, below left=8mm and 2mm of vpc] (pub) {public subnets\\(2 AZ)};
+  \node[wbboxcloud, below right=8mm and 2mm of vpc] (priv) {private subnets\\(2 AZ)};
+  \node[wbboxcloud, left=of vpc] (igw) {internet\\gateway};
+  \draw[wbarrow] (vpc)--(pub); \draw[wbarrow] (vpc)--(priv); \draw[wbarrow] (vpc)--(igw);
+  \node[wbboxcloud, below=9mm of pub] (eip) {elastic IP};
+  \node[wbboxaccent, below=9mm of eip] (nat) {NAT gateway};
+  \draw[wbarrow] (pub)--(eip); \draw[wbarrow] (eip)--(nat);
+  \node[wbboxops, below=9mm of priv] (prt) {private route\\table + route};
+  \node[wbboxops, right=of pub] (purt) {public route\\table + route};
+  \draw[wbarrow] (nat.east) to[out=0,in=-90] (prt.south);
+  \draw[wbarrow] (priv)--(prt);
+  \draw[wbarrow] (igw.north) to[out=90,in=180] (purt.west);
+  \node[wbcap, below=4mm of nat, text width=34mm] {destroy reverses every arrow};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How does it decide the verb?} For each instance the provider compares prior state with desired configuration attribute by attribute. Four outcomes exist, and the third is the one that ends careers.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{30mm} X@{}}
+\wbtablehead{Symbol in the plan} & \wbtablehead{What it means and when it happens}\\
++ create & No prior state for this address. New resource.\\
+\textasciitilde{} update in-place & Only fields the API can modify were changed --- a tag, a description.\\
+-/+ replace & A changed field is marked \emph{ForceNew} by the provider because the API cannot modify it. \textbf{Destroy then create --- data and IP addresses are lost.}\\
+- destroy & The configuration block was removed, or the resource was targeted for removal.\\
+\end{tabularx}
+\end{center}
+
+\begin{planbox}[terraform plan — read the symbols, not the summary line]
+  # aws_subnet.private["b"] must be replaced
+-/+ resource "aws_subnet" "private" {
+      ~ cidr_block = "10.0.20.0/24" -> "10.0.24.0/24" # forces replacement
+      ~ id         = "subnet-0f3ab2c1" -> (known after apply)
+        vpc_id     = "vpc-0a91c4de"
+    }
+
+  # aws_route_table.private will be updated in-place
+~ resource "aws_route_table" "private" {
+      ~ tags = { "Name" = "cb-private" -> "cloudbase-private" }
+    }
+
+Plan: 1 to add, 1 to change, 1 to destroy.
+\end{planbox}
+
+\begin{misconception}
+"1 to add, 1 to destroy" at the bottom of a plan reads like two independent, harmless operations. It is frequently one resource being \emph{replaced}, and for a stateful resource that is total data loss. Read upward for \code{-/+} and for the comment \code{\# forces replacement}; the provider tells you exactly which attribute triggered it. If a replacement is genuinely required but must not be an outage, add \code{lifecycle \{ create\_before\_destroy = true \}} so the new object exists before the old one goes away --- and verify the API allows both to coexist.
+\end{misconception}
+
+\begin{prodtip}
+Always save the plan and apply \emph{that file}: \code{terraform plan -out=tfplan} then \code{terraform apply tfplan}. An interactive \code{apply} re-plans at the moment you type \code{yes}, so what you approved and what runs can differ if someone else changed reality in between. Applying a saved plan file also makes the pipeline's approval gate meaningful --- the artifact a human approved is the artifact that executes.
+\end{prodtip}
+
+\wbsub{3.5\quad Modules --- Composition Without Copy-Paste}
+
+\glabel{What is it?} A module is a directory of \code{.tf} files with declared inputs (\code{variable}) and declared outputs (\code{output}). Calling it instantiates every resource inside it under a namespaced address. Every configuration is already a module --- the one you run in is the \keyterm{root module}.
+
+\glabel{Why does it exist?} Because the alternative is three near-identical copies of your network code in \code{dev/}, \code{staging/} and \code{prod/}, and by month four they differ in ways nobody intended. The problem is not typing; it is that copies drift independently and there is no single place to fix a security-group mistake.
+
+\glabel{How does it work internally?} At \code{init}, Terraform downloads or copies each module source into \code{.terraform/modules} and records it in a manifest. During graph construction the module boundary is flattened: \code{module.vpc.aws\_subnet.private["a"]} is an ordinary graph node, and dependencies cross module boundaries transparently through inputs and outputs. Modules provide \emph{naming and interface} discipline; they are not runtime isolation, and they do not get their own state.
+
+\begin{tfbox}[modules/network/variables.tf — a module is defined by its interface]
+variable "env"      { type = string }
+variable "cidr"     { type = string }
+variable "az_count" {
+  type    = number
+  default = 2
+  validation {
+    condition     = var.az_count >= 2 && var.az_count <= 3
+    error_message = "Two AZs minimum for availability; three maximum for cost."
+  }
+}
+
+variable "single_nat_gateway" {
+  type        = bool
+  default     = false
+  description = "One NAT for all AZs. Cheaper, but a per-AZ failure domain."
+}
+
+output "private_subnet_ids" { value = [for s in aws_subnet.private : s.id] }
+output "vpc_id"             { value = aws_vpc.this.id }
+\end{tfbox}
+
+\begin{tfbox}[envs/prod/main.tf — the root module composes, it does not implement]
+module "network" {
+  source = "git::ssh://git@github.com/cloudbase/tf-modules.git//network?ref=v1.4.0"
+
+  env                = "prod"
+  cidr               = "10.0.0.0/16"
+  az_count           = 2
+  single_nat_gateway = false   # prod pays for HA; dev does not
+}
+\end{tfbox}
+
+\begin{seniornote}
+The hardest part of module design is not the code, it is the interface. A module with thirty input variables is a leaky abstraction that has re-exposed the provider it was meant to hide; a module with two is usually too rigid to reuse. Aim for inputs that express \emph{intent} (\code{single\_nat\_gateway}, \code{env}) rather than plumbing (\code{route\_table\_id}), and let the module derive the plumbing. If a caller needs a raw resource ID from inside, that is a signal your boundary is drawn in the wrong place.
+\end{seniornote}
+
+\begin{scalenote}
+Slack's module story is a good map of the road ahead. They began with relative-path modules --- fastest to change, but a single edit could silently break dozens of state files. They moved to an internal catalog where a pipeline versions each module into a tarball in S3 with a \code{versions.json} history, plus a browser tool so teams can find modules. The cost is honest: publishing before consuming slows iteration, and there is still no way to force every consumer to test an upgrade. Version pinning does not eliminate breakage; it converts unplanned breakage into scheduled work.
+\end{scalenote}
+
+\begin{costnote}
+A NAT gateway is billed per hour \emph{and} per gigabyte processed, in every AZ you put one in. Making \code{single\_nat\_gateway} a module input rather than a hardcoded choice lets development and staging run one gateway while production runs one per AZ --- a decision the module makes cheap to express and cheap to revisit. The general principle: parameterise the knobs that trade cost against availability, and set the default to the safe option so a careless caller overspends rather than under-protects.
+\end{costnote}
+
+\wbsub{3.6\quad Drift, Import, and Moving Things Without Destroying Them}
+
+\glabel{What is it?} \keyterm{Drift} is the divergence between what state records and what the cloud actually contains, caused by anything that changes a managed resource outside Terraform: a console click, an incident fix at 3am, another automation, or the cloud provider itself changing a default.
+
+\glabel{Why does it matter?} Because Terraform's next plan does not know the change was deliberate. It sees a discrepancy and proposes to close it --- by reverting your emergency fix. The scariest version is silent: someone widens a security group during an incident, nobody records it, and the next unrelated apply quietly narrows it again three weeks later, causing a second incident whose cause looks unrelated to its trigger.
+
+\glabel{How does it work internally?} The refresh phase reads every managed resource from the API and updates the in-memory state before diffing. So drift always surfaces as an unexplained \code{\textasciitilde{}} line in a plan you expected to be empty. \code{terraform plan -refresh-only} performs the refresh and shows you what changed in the world without proposing to fix it --- the correct first move when you suspect drift. From there you have exactly two honest choices: revert the manual change (apply the plan), or update the code to match reality (the change was right, the method was wrong).
+
+\begin{outbox}[terraform plan -refresh-only — drift, discovered]
+Note: Objects have changed outside of Terraform
+
+  # aws_security_group.api has changed
+  ~ resource "aws_security_group" "api" {
+      ~ ingress = [
+          + { from_port = 22, to_port = 22, cidr_blocks = ["0.0.0.0/0"] },
+        ]
+    }
+
+This is a refresh-only plan, so Terraform will not take any actions.
+\end{outbox}
+
+\glabel{Bringing existing resources under management.} Days 5 and 6 built the CloudBase cluster by hand. You do not have to destroy and rebuild it to codify it --- \code{import} adopts an existing object into state. Since Terraform 1.5 this is a \emph{declarative} \code{import} block rather than a state-mutating CLI command, which means importing is now a plannable operation you can review in a pull request. Running plan with \code{-generate-config-out} even writes a first draft of the resource block from the live object.
+
+\begin{tfbox}[import.tf — adopt, do not recreate]
+import {
+  to = aws_vpc.main
+  id = "vpc-0a91c4de"
+}
+
+# terraform plan -generate-config-out=generated.tf
+#   -> writes a draft resource block matching the live object
+# then review, fold into your real files, and apply.
+\end{tfbox}
+
+\begin{opsnote}
+Two blocks prevent the most avoidable destructive plans. \code{moved} tells Terraform that a resource was \emph{renamed or moved into a module}, so it updates the state address instead of destroying the old address and creating a new one. \code{removed} tells Terraform to forget a resource without deleting the real object --- the reviewable replacement for \code{terraform state rm}. Refactoring a working configuration should never show a destroy line; if it does, you are missing a \code{moved} block.
+\end{opsnote}
+
+\glabel{Workspaces versus directories.} Workspaces let one configuration hold several states, selected by name. They are convenient for short-lived, structurally identical copies. For long-lived environments most serious teams use separate directories with separate backend keys instead, for two reasons: environments always eventually differ structurally (prod has a replica, dev does not), and workspace selection is invisible ambient state --- an operator who forgets \code{terraform workspace select} applies a dev change to production with no visual cue. Separate directories make the target explicit in the path.
+
+\begin{reliability}
+Make the blast radius of a single apply small on purpose. Slack splits state per region and per child account, and isolates large services into their own state files, precisely so no single \code{apply} can touch everything. Splitting has a real cost --- you need \code{terraform\_remote\_state} data sources or explicit inputs to pass values across boundaries --- but the cost is paid once, and the alternative is a monolithic state where one bad plan is an outage.
+\end{reliability}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Remote state, encrypted, versioned, locked. Commit \code{.terraform.lock.hcl}; never commit \code{.tfstate}.
+  \item Pin \code{required\_version} and every provider; upgrade deliberately, not by accident of timing.
+  \item \code{plan -out=tfplan} then \code{apply tfplan} --- approve and execute the same artifact.
+  \item Read plans upward for \code{-/+} and \code{forces replacement} before trusting the summary line.
+  \item Split state by environment and by blast radius; make the target explicit in the directory path.
+  \item Use \code{import} to adopt existing resources and \code{moved} to refactor without destroying.
+  \item Tag everything with \code{default\_tags} so cost reports and orphan hunts are possible later.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Committing a state file --- it contains passwords and keys in plaintext, and Git history is forever.
+  \item Applying without reading the plan, then discovering \code{-/+} meant the database was replaced.
+  \item Fixing production in the console and not telling anyone, leaving drift for a future stranger.
+  \item Running with no lock, so two concurrent applies produce a lost update and orphaned resources.
+  \item Hand-editing state JSON instead of using \code{import}, \code{moved} or \code{state mv}.
+  \item Renaming a resource in code and shipping the resulting destroy-and-create as if it were a rename.
+  \item One giant state file for the whole company, where every plan is slow and every apply is risky.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the graph, you can predict the plan --- and predicting the plan is the whole skill.
+
+\begin{writespace}[Redraw: the CloudBase network DAG --- VPC, IGW, public and private subnets, EIP, NAT gateway, both route tables --- with every arrow pointing from dependency to dependent. Then mark what destroy order would be.]
+\reflectionlines[7]
+\end{writespace}
+
+\begin{writespace}[Redraw: the four phases of a run, and mark exactly where drift is discovered, where the lock is taken and released, and where state is written]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Codify the CloudBase Network}
+
+\textbf{Goal.} Turn the Day 3 network design into Terraform with shared, locked, encrypted remote state --- then prove it is reproducible by destroying and recreating a non-production copy. This is the foundation Day 10 builds compute and data on top of.
+
+\resetlab
+\labstep{Create the state backend before you create anything else}
+By hand (or with a tiny separate configuration), create the S3 bucket: versioning on, default encryption on, public access fully blocked, a restrictive bucket policy.
+\labwhy{The backend is the one bootstrap paradox in Terraform --- state has to live somewhere before there is state. Creating it deliberately, once, and never touching it again is cleaner than the recursive trickery people attempt.}
+
+\labstep{Declare the backend and pin your versions}
+Write \code{backend.tf} with \code{use\_lockfile = true} and \code{encrypt = true}; write \code{versions.tf} with \code{required\_version} and a provider constraint. Run \code{init} and commit \code{.terraform.lock.hcl}.
+\labwhy{You are deciding two things that are painful to change later: where the team's shared memory lives, and which provider version the team's plans are computed against.}
+
+\labstep{Express the CIDR plan as data, not as literals}
+Derive subnet CIDRs from the VPC CIDR with \code{cidrsubnet()}, and take the AZ list from a data source rather than hardcoding \code{eu-west-1a}.
+\labwhy{Hardcoded AZ names are the single most common reason a configuration cannot be reused in another region. Deriving the plan keeps the Day 3 arithmetic in one place, where it can be reviewed.}
+
+\labstep{Build the public path first, and plan without applying}
+VPC, internet gateway, public subnets with \code{map\_public\_ip\_on\_launch}, a public route table with a default route to the IGW, and associations. Run \code{plan -out} and read every line.
+\labwhy{Reading a plan of resources you fully understand is how you learn to read a plan of resources you do not. Note which values are \code{(known after apply)} and ask yourself why.}
+
+\labstep{Add the private path and watch the graph deepen}
+Private subnets, an elastic IP, a NAT gateway in a public subnet, a private route table whose default route targets the NAT gateway.
+\labwhy{This is where the dependency chain becomes non-obvious: the NAT gateway lives in a \emph{public} subnet but serves \emph{private} ones. Terraform derives that ordering from your attribute references --- you never state it.}
+
+\labstep{Apply, then run plan again and demand an empty diff}
+A second plan must report no changes.
+\labwhy{An idempotent, empty second plan is the proof that your configuration fully describes reality. A perpetual diff --- a field the API normalises, a tag the cloud adds --- is a real bug that will hide genuine changes forever if you tolerate it.}
+
+\labstep{Cause drift on purpose, then diagnose it properly}
+In the console, add an inbound rule or retag a subnet. Run \code{plan -refresh-only} first, then a normal plan.
+\labwhy{You are practising the incident response, not the vandalism. \code{-refresh-only} tells you what the world did; the normal plan tells you what Terraform intends to do about it. Deciding which of the two is right is a judgement call, and you should make it consciously.}
+
+\labstep{Extract it into a module and instantiate it twice}
+Move the resources into \code{modules/network}, expose \code{env}, \code{cidr}, \code{az\_count}, \code{single\_nat\_gateway}. Add \code{moved} blocks for every address that changed. Then instantiate a second, non-overlapping copy for \code{dev}.
+\labwhy{Refactoring must not be destructive. If your plan after extraction shows destroys, your \code{moved} blocks are incomplete --- fix them until the plan is empty, and you will have learned the single most valuable Terraform refactoring skill.}
+
+\begin{prodtip}
+Never grant apply permissions to a human laptop in production. Slack's engineers plan from read-only "Ops" boxes and apply only through Jenkins workers that hold the privileged IAM roles. The pattern to copy: humans propose and review; a machine identity with a narrow role executes; every apply leaves a log with a commit SHA attached. Day 9 wires exactly this into your pipeline.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Kubernetes reconciles continuously and needs no state file --- it queries the API server, which \emph{is} the record. Terraform reconciles once and needs state. Explain why the difference in \emph{when} the loop runs forces the difference in \emph{whether} a state file is required. What would Terraform have to become to stop needing one?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your team is deciding between one state file for the whole platform and thirty state files split by service. Enumerate what gets harder in each direction --- not just risk, but cross-boundary references, plan duration, onboarding, and who has to be in the room to ship a change. Where would you draw the first boundary, and what evidence would tell you it was wrong?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+An engineer widened a security group in the console at 3am to stop an outage, and it worked. Twelve days later an unrelated apply reverts it. Whose failure is this, and which of the following would actually have prevented it: alerting on drift, denying console write access, requiring a follow-up PR within 24 hours, or refresh-only checks in CI? Rank them by cost and by effectiveness --- they are not the same ordering.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{"Error acquiring the state lock" --- and nobody else is running Terraform}
+\textbf{Symptom.} Every plan fails immediately. The engineer who ran the last apply says their laptop lost Wi-Fi during it.
+
+\begin{outbox}[terraform plan]
+Error: Error acquiring the state lock
+
+Error message: operation error S3: PutObject, https response error
+StatusCode: 412, PreconditionFailed: At least one of the pre-conditions
+you specified did not hold
+Lock Info:
+  ID:        9f4c2a1e-77b3-4a90-b0c1-2d5e6f7a8b90
+  Path:      cloudbase-tfstate-prod/network/terraform.tfstate.tflock
+  Operation: OperationTypeApply
+  Who:       amine@ops-box-3
+  Created:   2026-07-19 02:14:51.229 +0000 UTC
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} A \code{.tflock} object exists in the bucket and the conditional write is being refused with 412 --- the lock is held, not the state corrupted.
+  \item \textbf{Hypothesise.} The apply process died before releasing the lock, so the lock object was never deleted. This is a \emph{stale} lock, not a concurrent one.
+  \item \textbf{Investigate.} Confirm the holder in \code{Who} and \code{Created}; ask that person directly. Then check whether resources were partially created --- the state object's \code{serial} and its S3 version history tell you whether any writes landed.
+  \item \textbf{Root cause.} A crashed or network-interrupted apply. Locks are released by the process that took them; if it is killed, nothing cleans up.
+  \item \textbf{Fix.} Once you have \emph{verified with a human} that no apply is running, \code{terraform force-unlock 9f4c2a1e-...} using the exact ID. Then run \code{plan -refresh-only} to see what actually got created before the crash before doing anything else.
+  \item \textbf{Prevent.} Run applies from CI, not laptops, so a dropped connection cannot orphan a lock. Alert on \code{.tflock} objects older than the longest plausible apply. Never \code{force-unlock} on a hunch --- unlocking a genuinely running apply is how you get two writers and a lost update.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{A tag change that proposes to destroy the NAT gateway}
+\textbf{Symptom.} A junior engineer opened a PR that only renames resources for consistency. CI attaches a plan showing 6 to destroy.
+
+\begin{planbox}[plan attached to the pull request]
+  # aws_nat_gateway.ngw will be destroyed
+  # (because aws_nat_gateway.ngw is not in configuration)
+- resource "aws_nat_gateway" "ngw" {
+    - id            = "nat-07dd4193ce8f2b01a"
+    - allocation_id = "eipalloc-0b3c9e12"
+  }
+
+  # aws_nat_gateway.this will be created
++ resource "aws_nat_gateway" "this" {
+    + id            = (known after apply)
+  }
+
+Plan: 6 to add, 0 to change, 6 to destroy.
+\end{planbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Add and destroy counts are equal and the destroy reason is "not in configuration" --- the classic signature of a rename, not a deletion.
+  \item \textbf{Hypothesise.} The resources still exist; only their \emph{configuration addresses} changed. State still maps the old addresses, so Terraform sees six orphans and six new declarations.
+  \item \textbf{Investigate.} Diff the PR: are the resource bodies identical and only the labels different? Cross-check \code{terraform state list} against the new addresses.
+  \item \textbf{Root cause.} A refactor without \code{moved} blocks. Terraform has no way to know \code{ngw} and \code{this} are the same object --- an address is an identity.
+  \item \textbf{Fix.} Add a \code{moved} block per renamed address (\code{from = aws\_nat\_gateway.ngw}, \code{to = aws\_nat\_gateway.this}) and re-plan. The correct outcome is \emph{no changes at all}.
+  \item \textbf{Prevent.} Make "a refactor-only PR must plan to zero changes" a review rule, and fail CI on any destroy in a PR that carries a \code{refactor} label. Had this applied, the NAT gateway's elastic IP would have changed --- breaking every downstream allowlist that trusted it.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Build a VPC with two public subnets and observe every plan symbol at least once.\\
+\textbf{Business context.} You are proving to your team that the console can be replaced.\\
+\textbf{Architecture.} One root module, local state, one region, no NAT.\\
+\textbf{Requirements.} Create the VPC and subnets; then change a tag (expect \code{\textasciitilde{}}); then change a subnet CIDR (expect \code{-/+}); then delete a subnet block (expect \code{-}).\\
+\textbf{Constraints.} Predict the symbol in writing \emph{before} running plan each time.\\
+\textbf{Hints.} \code{cidrsubnet("10.0.0.0/16", 8, 1)} yields \code{10.0.1.0/24}.\\
+\textbf{Expected outcome.} A four-row table: change made, symbol predicted, symbol observed, why.\\
+\textbf{Production considerations.} Note which attributes were ForceNew and how the provider signalled it.\\
+\textbf{Common pitfalls.} Reading only the summary line; assuming a CIDR change is an in-place edit.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~70 min}
+\textbf{Goal.} Migrate local state to a locked, encrypted S3 backend without losing anything.\\
+\textbf{Business context.} A second engineer is joining the project on Monday.\\
+\textbf{Architecture.} Existing local state $\rightarrow$ versioned, encrypted bucket with \code{use\_lockfile}.\\
+\textbf{Requirements.} Create the bucket with versioning, encryption and public access blocked; add the backend block; run \code{init -migrate-state}; verify with \code{state list}; then hold a lock in one terminal and prove a second run is refused.\\
+\textbf{Constraints.} Back up the local state first. Do not skip the concurrency test --- it is the point.\\
+\textbf{Hints.} \code{terraform state list} before and after must be identical.\\
+\textbf{Expected outcome.} Identical state lists, a state object in S3, and a captured lock error.\\
+\textbf{Production considerations.} Write the IAM policy the CI role needs, including \code{s3:DeleteObject} on the \code{.tflock} key, and no more.\\
+\textbf{Common pitfalls.} Forgetting versioning before the first write; leaving \code{use\_lockfile} at its default of false and believing you are locked.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2 hours}
+\textbf{Goal.} Extract a reusable network module and stand up dev and prod from it, non-destructively.\\
+\textbf{Business context.} Dev and prod must be structurally identical but differently sized and priced.\\
+\textbf{Architecture.} \code{modules/network} consumed by \code{envs/dev} and \code{envs/prod}, separate backend keys.\\
+\textbf{Requirements.} Inputs \code{env}, \code{cidr}, \code{az\_count}, \code{single\_nat\_gateway} with validation; outputs \code{vpc\_id}, \code{public\_subnet\_ids}, \code{private\_subnet\_ids}; \code{moved} blocks so the prod refactor plans to zero changes; dev on a non-overlapping CIDR with one NAT gateway.\\
+\textbf{Constraints.} The prod plan after extraction must show \emph{no changes}. No resource may be destroyed.\\
+\textbf{Hints.} \code{terraform state list} gives you the exact old addresses to write \code{moved} blocks from.\\
+\textbf{Expected outcome.} Two environments from one module, and a prod plan that is empty.\\
+\textbf{Production considerations.} Estimate the monthly NAT cost difference between the two settings and record it in the module README.\\
+\textbf{Common pitfalls.} Overlapping CIDRs that block future peering; a module with twenty pass-through variables; forgetting that a module rename changes every address beneath it.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{infranote}
+Infrastructure as Code is not really about automation --- provisioning was already scriptable. It is about \emph{auditability}. The value is that \code{git log} answers "why does this security group allow that", that a reviewer saw the change before it happened, and that the difference between two environments is a diff rather than an archaeology project. Teams that adopt Terraform but apply from laptops without review keep the syntax and throw away the benefit.
+\end{infranote}
+
+\begin{secwarn}[the identity that runs Terraform is the most powerful thing you own]
+A CI role with permission to apply your network configuration can also delete it. Scope it: separate roles per environment, no wildcard \code{*} on delete actions for stateful resources, and \code{prevent\_destroy} on the resources whose loss would be unrecoverable (the state bucket, production databases). Day 12's least-privilege IAM work applies to your automation before it applies to your applications --- the pipeline is the highest-value target in the estate.
+\end{secwarn}
+
+\begin{autotip}
+Put three cheap gates in CI, in this order: \code{terraform fmt -check} (style, no argument), \code{terraform validate} (syntax and type errors, no cloud credentials needed), then \code{plan} with the output posted to the PR. Slack's Smart Planner shows where this leads at scale --- it determines which state files a change affects, plans each, and attaches the results for reviewers. The generalisable idea: the plan is a review artifact, so a reviewer should never have to run Terraform to know what a PR does.
+\end{autotip}
+
+\begin{costnote}
+Terraform makes waste visible and therefore fixable. Because every managed resource has an address and a tag set, you can answer "what does this environment cost" and "which resources have no owner". The corollary is that unmanaged resources are invisible to that accounting --- so a partially-adopted estate has a permanent blind spot. Importing the last 10\% is usually worth more in cost clarity than in reproducibility.
+\end{costnote}
+
+\begin{interview}
+Expect: \emph{"Walk me through what happens if someone changes a Terraform-managed resource in the console."} The weak answer is "it causes drift". The answer that lands walks the mechanism: the next run's refresh phase reads the live object and updates in-memory state, the plan diffs desired configuration against that refreshed state, and Terraform proposes to revert the manual change --- silently, if nobody reads the plan. Then give the remedy: \code{plan -refresh-only} to see the drift on its own, then a conscious decision to either revert it or codify it, and \code{import} if the object was created outside Terraform entirely.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a hand-built host. Day 2 put it under version control. Day 3 designed the network on paper. Days 4 to 6 containerised the API and ran it on a cluster you created \emph{by hand} --- which means today the entire platform exists only because somebody remembered the right clicks. Today that stops: the network becomes code, and the code becomes the source of truth.
+
+\begin{buildalong}[Day 07 — the network, declared and reproducible]
+\begin{wbitem}
+  \item Create the state backend by hand, once: an S3 bucket with versioning, default encryption and all public access blocked, in a blast radius separate from the workloads it will describe.
+  \item Add \code{versions.tf} pinning \code{required\_version} and the AWS provider, and \code{backend.tf} using \code{use\_lockfile = true} and \code{encrypt = true}. Commit \code{.terraform.lock.hcl}; add \code{*.tfstate*} to \code{.gitignore}.
+  \item Codify the Day 3 design: VPC, internet gateway, two public and two private subnets across two AZs, an elastic IP, a NAT gateway, and both route tables with their associations --- CIDRs derived with \code{cidrsubnet()}, AZs from a data source.
+  \item Apply, then run \code{plan} again and do not stop until the second plan is empty.
+  \item Extract everything into \code{modules/network} with inputs \code{env}, \code{cidr}, \code{az\_count}, \code{single\_nat\_gateway} and outputs \code{vpc\_id}, \code{public\_subnet\_ids}, \code{private\_subnet\_ids}; use \code{moved} blocks so the refactor plans to zero changes.
+  \item Instantiate a \code{dev} environment from the same module on a non-overlapping CIDR with a single NAT gateway, under its own backend key.
+  \item Adopt one hand-made resource from Days 5--6 with an \code{import} block, generating a draft with \code{-generate-config-out} and folding it into the real files.
+  \item Cause drift deliberately in the console, capture the \code{-refresh-only} output, and write \code{docs/drift-runbook.md} describing how to decide between reverting and codifying.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{terraform apply} from a clean clone reproduces the entire CloudBase network in an empty account with no console clicks; a second \code{plan} reports no changes in both \code{dev} and \code{prod}; state is remote, encrypted, versioned and locked; no \code{.tfstate} file exists anywhere in Git history; and the drift runbook is committed.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Declarative means you describe the end state; the tool derives create, update, replace and destroy.
+  \item A provider is a plugin process with a CRUD schema --- it, not the engine, computes most of the diff.
+  \item State is the map from configuration addresses to real resource IDs, and it holds secrets in plaintext.
+  \item Remote state gives the team one memory; locking prevents two concurrent applies losing an update.
+  \item Plan walks a DAG built from attribute references; destroy is the same graph with edges reversed.
+  \item \code{-/+} is a replacement --- destroy then create --- and for stateful resources that is data loss.
+  \item Drift surfaces in the refresh phase; \code{-refresh-only} shows it without proposing to fix it.
+  \item \code{import} adopts existing resources; \code{moved} refactors without destroying.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item An address is an identity. Renaming a resource without a \code{moved} block means destroy-and-create.
+  \item \code{use\_lockfile} defaults to \code{false}. Unlocked is the silent default; you must opt in.
+  \item DynamoDB-based locking for the S3 backend is deprecated in favour of native S3 lock files.
+  \item A second plan that is not empty is a bug, not a quirk --- it will hide real changes forever.
+  \item Terraform provisions; Ansible (Day 8) configures. Neither replaces the other.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Committed state \quad$\bullet$\quad unread plans \quad$\bullet$\quad unpinned providers \quad$\bullet$\quad no lock
+  \item Console fixes that nobody codifies \quad$\bullet$\quad one monolithic state \quad$\bullet$\quad hand-edited state JSON
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Declarative}{describe the end state; the engine derives the verbs and the order.}
+\cheatitem{Provider}{a plugin process with a CRUD schema; pin it, and commit \code{.terraform.lock.hcl}.}
+\cheatitem{State}{address $\rightarrow$ real ID, plus attributes and dependencies. Secret. Remote. Versioned. Locked.}
+\cheatitem{Plan}{refresh, then diff desired against refreshed state, then order by the DAG.}
+\cheatitem{Symbols}{\code{+} create · \code{\textasciitilde{}} in-place · \code{-/+} replace (destructive) · \code{-} destroy.}
+\cheatitem{Module}{a directory with inputs and outputs; expose intent, not plumbing; version it.}
+\cheatitem{Drift}{reality diverged from state. \code{plan -refresh-only} to see it; then revert or codify.}
+\cheatitem{Refactor}{\code{import} to adopt · \code{moved} to rename · \code{removed} to forget without deleting.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 7 commands worth memorising]
+# lifecycle
+terraform init                          # download providers + configure backend
+terraform init -migrate-state           # move local state into a remote backend
+terraform fmt -check -recursive         # style gate for CI
+terraform validate                      # syntax and types, no credentials needed
+terraform plan -out=tfplan              # save the exact diff you will approve
+terraform apply tfplan                  # execute THAT plan, not a fresh one
+
+# state inspection (never open the JSON by hand)
+terraform state list                    # every managed address
+terraform state show aws_vpc.main       # attributes, with sensitive values redacted
+terraform show -json tfplan             # machine-readable plan, for policy checks
+
+# drift and adoption
+terraform plan -refresh-only            # what changed in the world, no proposed fix
+terraform plan -generate-config-out=generated.tf   # draft HCL for import blocks
+
+# locks and graph
+terraform force-unlock <LOCK_ID>        # ONLY after a human confirms nothing is running
+terraform graph                         # emit the dependency DAG in DOT format
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is Terraform state, and why can't Terraform work correctly without it?}
+\iq{Why should state live in a remote backend with locking instead of locally?}
+\iq{Walk me through what happens if someone manually changes a Terraform-managed resource in the console.}
+\iq{What's the difference between a resource and a module?}
+\iq{How would you safely bring an existing, manually-created resource under Terraform management?}
+\iq{Why pin provider versions --- and what does \code{.terraform.lock.hcl} add on top of a version constraint?}
+\iq{In a plan, what is the difference between \code{\textasciitilde{}} and \code{-/+}, and why does it matter?}
+\iq{How does Terraform know what order to create and destroy resources in?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item HashiCorp, "State" --- developer.hashicorp.com/terraform/language/state --- purpose of state, and the explicit warning about secrets in it.
+  \item HashiCorp, "Backend Type: s3" --- developer.hashicorp.com/terraform/language/backend/s3 --- \code{use\_lockfile}, the \code{dynamodb\_table} deprecation, encryption and required IAM permissions.
+  \item HashiCorp, "Import resources overview" and the \code{import} block reference --- developer.hashicorp.com/terraform/language/import --- config-driven import and \code{-generate-config-out}.
+  \item HashiCorp blog, "Terraform 1.5 brings config-driven import and checks" --- why import became a plannable operation.
+  \item Slack Engineering, "How We Use Terraform At Slack" --- slack.engineering/how-we-use-terraform-at-slack --- 1{,}400 state files, the module catalog, and the Smart Planner.
+  \item Shopify Engineering, "Using Terraform to Manage Infrastructure" --- shopify.engineering/manage-infrastructure-with-terraform --- writing a custom provider and reviewing infrastructure via Atlantis.
+  \item AWS Prescriptive Guidance, "Terraform AWS provider best practices --- Backend" --- state bucket hardening.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item State is remote, encrypted at rest, versioned, and locking is explicitly enabled.
+  \item No \code{.tfstate} file exists in any branch or any commit of any repository.
+  \item \code{required\_version} and every provider are pinned; \code{.terraform.lock.hcl} is committed.
+  \item CI runs \code{fmt -check}, \code{validate} and \code{plan}, and posts the plan onto the pull request.
+  \item Applies run from a machine identity with a scoped role --- never from a human laptop in production.
+  \item A saved plan file is what gets approved and what gets applied.
+  \item State is split by environment and by blast radius, with the target explicit in the path.
+  \item Irreplaceable resources carry \code{prevent\_destroy}; every resource carries ownership tags.
+  \item A drift runbook exists, and drift is checked on a schedule --- not discovered by accident.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 8).} Terraform now guarantees that the \emph{machine exists} and that the network around it is exactly what the repository says. It has nothing to say about what is installed on that machine, which packages are patched, or which config files are correct --- the moment you SSH in and edit something, you are back to Day 1's invisible drift. Tomorrow, Ansible closes that gap: agentless configuration management, idempotent modules, inventories and roles, and the reason the industry keeps both tools instead of picking one.
+\end{keyidea}

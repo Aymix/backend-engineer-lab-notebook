@@ -1,0 +1,763 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 13 ============================
+\daychapter{13}{Operations}{GitOps \& Deployment Strategies}{Argo CD, blue-green, canary, rollback and progressive delivery}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain GitOps as a continuous reconciliation loop, and why pulling beats pushing for production clusters.
+  \item Describe what Argo CD actually does internally --- render, diff, sync, self-heal --- rather than which buttons it has.
+  \item Compare rolling update, blue-green and canary honestly on blast radius, cost and rollback speed.
+  \item Gate a canary promotion on real SLO metrics with an automated abort, not on a timer and a human's nerve.
+  \item Rehearse a rollback so that the path exists before the incident that needs it.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} By Day 12 you can build an image, test it, scan it, sign it and hand it to a cluster. What you cannot yet answer, in one sentence and without logging into anything, is: \emph{what exactly is running in production right now, who put it there, and how do I put the previous thing back?} In a push-based pipeline that answer lives in the union of a CI job's history, whatever someone typed into a terminal at 02:40, and the cluster's own memory. GitOps collapses all three into one queryable artefact --- the git history of a repository --- and then makes a machine continuously enforce it.
+
+\glabel{Why DevOps engineers need it.} Deployment is where every previous day's work is finally exposed to users. A perfect Terraform module and a beautiful dashboard do not help if a bad release reaches 100\% of traffic in eleven seconds and the only rollback plan is "rebuild and redeploy, roughly nine minutes if the registry is fast." Senior engineers are distinguished less by how they ship and far more by how quickly and calmly they \emph{un}-ship.
+
+\begin{keyidea}
+Kubernetes is a reconciliation loop: you declare desired state, a controller works continuously to make reality match. GitOps is that same idea moved up one level --- the desired state of the \emph{whole cluster} is a git repository, and an in-cluster agent reconciles the cluster against it forever. Day 5 taught you the pattern. Today you apply it to delivery itself.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Today's layer sits between the pipeline you built on Day 9 and the cluster you built on Days 5--6, and it consumes the metrics you built on Day 11 to decide whether a release lives.
+
+\begin{wbfigure}{Fig 13.0 — Where today sits. CI stops at the registry and the repo; a controller inside the cluster does the deploying.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[lyr] (ci) {\textbf{CI: build · test · scan · sign} \hfill \scriptsize Day 9, 12};
+  \node[lyr, wbboxghost, below=of ci] (art) {\textbf{Registry + config repo} \hfill \scriptsize immutable artefacts};
+  \node[lyr, wbboxaccent, below=of art] (gitops) {\textbf{GitOps agent: render · diff · sync} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxk8s, below=of gitops] (k8s) {\textbf{Kubernetes workloads} \hfill \scriptsize Day 5--6};
+  \node[lyr, wbboxops, below=of k8s] (obs) {\textbf{Metrics \& SLOs} \hfill \scriptsize Day 11 --- the promotion gate};
+  \foreach \a/\b in {ci/art,art/gitops,gitops/k8s}{\draw[wbarrow] (\a)--(\b);}
+  \draw[wbarrowg] (k8s)--(obs);
+  \draw[wbflow] (obs.east) -- ++(6mm,0) |- (gitops.east);
+  \node[wbcap, right=9mm of obs, text width=20mm, anchor=west] {metrics feed the rollout decision};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 5's controller pattern is the mechanism. Day 7's declarative infrastructure is the mindset. Day 9's pipeline is the producer that now stops at the repository boundary instead of reaching into the cluster. Day 11's error-rate and latency queries stop being dashboards and become \emph{control inputs}. Day 12's least-privilege thinking is why the deploy credential disappears from CI entirely.
+
+\glabel{Where companies use it in production.} Adobe replaced its legacy internal container platform (Moonbeam) with \keyterm{Flex}, a GitOps delivery platform built on the Argo ecosystem: Argo CD for continuous reconciliation and git-based delivery, Argo Workflows for pipeline orchestration, Argo Events for event-driven automation, and Argo Rollouts for progressive delivery. Published CNCF case-study figures put Flex at over 6{,}000 services across roughly 50{,}000 environments, of which approximately 19{,}000 are production, serving more than 3{,}000 developers, with over 10{,}400 legacy pipelines migrated or decommissioned. The architectural point is not the size. It is that at that size, "who changed production?" must be answerable by a query, not by asking people --- and reconciliation is what makes the answer trustworthy. Argo CD itself was created at Intuit to manage large numbers of services across many clusters, and is now a CNCF Graduated project.
+
+\glabel{Common misconceptions.} That GitOps means "we store YAML in git" (storing is trivial; \emph{continuous reconciliation} is the idea). That a canary is a percentage (it is an experiment with a hypothesis and an abort criterion). That blue-green is strictly safer than canary (it exposes 100\% of users at once, just reversibly). That rollback is a button (it is a rehearsed procedure, and the database is usually the part that cannot roll back).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 13.1 — The Day 13 territory: git holds desired state, an agent reconciles it, and a rollout controller decides how the change reaches users.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (git) {Git repo\\desired state};
+  \node[wbbox, right=of git] (agent) {GitOps agent\\Argo CD · Flux};
+  \node[wbboxk8s, right=of agent] (cluster) {Cluster\\live state};
+  \draw[wbarrow] (git)--node[wbcap,above]{pull}(agent);
+  \draw[wbarrow] (agent)--node[wbcap,above]{apply}(cluster);
+  \draw[wbarrowg] (cluster.south) -- ++(0,-6mm) -| node[wbcap,pos=0.25,below]{observed state (drift)} (agent.south);
+
+  \node[wbboxops, below=17mm of git] (strat) {Strategy\\rolling · B/G · canary};
+  \node[wbboxops, right=of strat] (analysis) {Analysis\\SLO queries};
+  \node[wbboxgood, right=of analysis] (promote) {Promote\\or abort};
+  \draw[wbarrow] (strat)--(analysis); \draw[wbarrow] (analysis)--(promote);
+  \draw[wbarrowg] (cluster)--(promote);
+  \node[wbboxwarn, below=7mm of analysis] (rb) {Rollback\\git revert};
+  \draw[wbarrow] (promote.south) -- ++(0,-4mm) -| (rb.east);
+  \draw[wbarrow] (rb.west) -| (git.south);
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(agent)(cluster)(promote)] (cl) {};
+    \node[wbzonelabelk8s, anchor=north west] at (cl.north west) {inside the cluster};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{desired state} $\rightarrow$ \keyterm{reconciliation} $\rightarrow$ \keyterm{drift} $\rightarrow$ \keyterm{self-heal} $\rightarrow$ \keyterm{progressive delivery} $\rightarrow$ \keyterm{analysis run} $\rightarrow$ \keyterm{promotion gate} $\rightarrow$ \keyterm{abort} $\rightarrow$ \keyterm{feature flag}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad GitOps --- Reconciliation Applied to Delivery}
+
+\glabel{What is it?} GitOps is an operating model with four properties, formalised by the OpenGitOps project: the system's desired state is \textbf{declarative}; that state is stored \textbf{versioned and immutably} with full history; software agents \textbf{pull} it automatically; and agents \textbf{continuously reconcile} actual state toward it. Notice what is absent from that list: git. The name is historical --- the principles describe reconciliation from a versioned source of truth, and git is simply the store nearly everyone already has.
+
+\glabel{Why does it exist?} Before GitOps, deployment was imperative and push-based. A CI job held cluster credentials and ran \code{kubectl apply} (or \code{helm upgrade}) at the end of a pipeline. Three problems compounded:
+
+\begin{wbitem}
+  \item \textbf{Credential sprawl.} Every pipeline that could deploy held a credential that could write to production. CI systems execute arbitrary code from branches, which makes them an attractive and well-trodden path to that credential.
+  \item \textbf{No convergence.} \code{kubectl apply} is a one-shot event. If someone later ran \code{kubectl edit} or \code{scale}, nothing ever noticed. The cluster drifted, silently, and the drift was only discovered when the next deploy produced an unexplainable diff.
+  \item \textbf{Unknowable state.} "What is deployed in staging?" required inspecting the cluster, because the pipeline's last successful run was not proof --- someone might have changed it since.
+\end{wbitem}
+
+\glabel{How does it work internally?} A controller inside the cluster holds three representations at all times: the \keyterm{desired state} (manifests rendered from a specific git commit), the \keyterm{live state} (objects read from the Kubernetes API, kept warm by watches rather than repeated list calls), and the \keyterm{diff} between them. The loop is: fetch the repo revision, render manifests, compare against live, report \code{Synced} or \code{OutOfSync}, and --- if automated sync is enabled --- apply the difference. Argo CD polls the repository roughly every three minutes by default (\code{timeout.reconciliation} of 120s plus up to 60s of jitter, so that a thousand applications do not all poll on the same second); a repository webhook makes that near-instant, and setting the interval to zero makes the system webhook-only.
+
+\begin{wbfigure}{Fig 13.2 — Push versus pull. The arrow that matters is the credential's direction, not the manifest's.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  % push
+  \node[wbbox] (ci1) {CI runner};
+  \node[wbboxk8s, right=of ci1] (c1) {Cluster API};
+  \draw[wbarrow] (ci1)--node[wbcap,above]{kubectl apply}node[wbcap,below]{holds write creds}(c1);
+  \node[wbcap, left=3mm of ci1, text width=17mm, anchor=east] {\textbf{push}};
+  \node[wbboxwarn, above=6mm of ci1, minimum height=6mm] (t1) {credential lives outside the cluster};
+
+  % pull
+  \node[wbbox, below=20mm of ci1] (git2) {Git repo};
+  \node[wbboxaccent, right=of git2] (ag2) {Agent\\(in cluster)};
+  \node[wbboxk8s, right=of ag2] (c2) {Cluster API};
+  \draw[wbarrow] (ag2)--node[wbcap,above]{read only}(git2);
+  \draw[wbarrow] (ag2)--node[wbcap,above]{apply}(c2);
+  \node[wbcap, left=3mm of git2, text width=17mm, anchor=east] {\textbf{pull}};
+  \node[wbboxgood, below=6mm of ag2, minimum height=6mm] (t2) {nothing outside needs cluster write access};
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(ag2)(c2)(t2)] (z) {};
+    \node[wbzonelabelk8s, anchor=north west] at (z.north west) {trust boundary};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{secwarn}[the credential argument, stated precisely]
+Pull-based GitOps does not make deployment "secure". It moves one specific credential. In push mode, a token with cluster write permission is stored in a system that runs untrusted code on every pull request. In pull mode, the agent lives inside the cluster, already has a ServiceAccount, and needs only \emph{read} access to git and the registry. The blast radius of a compromised CI runner drops from "can deploy anything to production" to "can propose a commit" --- which then meets code review and branch protection from Day 2. Combine it with signed commits and the deploy path is auditable end to end.
+\end{secwarn}
+
+\glabel{When should I use it?} Any Kubernetes environment with more than one cluster, more than one environment, or more than one person who can deploy. The value grows superlinearly with the number of clusters, because reconciliation is the only approach whose operational cost per cluster stays flat.
+
+\glabel{When should I \emph{not}?} When you do not have a declarative target. GitOps agents reconcile Kubernetes objects; a pipeline that uploads a JAR to a VM or runs a database migration is not something Argo CD should own. Also resist it for a single hobby cluster where the agent itself becomes the most complicated component you operate --- and note that the agent is a stateful production dependency: if Argo CD is down and your rollback plan is "revert the commit", you have no rollback plan.
+
+\begin{misconception}
+"We are doing GitOps --- our pipeline commits the new image tag to a repo and then runs \code{kubectl apply}." That is still push-based delivery with a git-shaped audit log. The defining property is that \emph{no external system applies anything}; an in-cluster agent observes divergence forever and corrects it. If disabling your CI system would stop drift from being corrected, you are not reconciling.
+\end{misconception}
+
+\wbsub{3.2\quad Inside Argo CD --- Render, Diff, Sync, Self-Heal}
+
+\glabel{What is it?} Argo CD is a Kubernetes controller plus a set of CRDs. The unit of management is an \code{Application}: a custom resource naming a source (repo URL, revision, path, and any Helm or Kustomize settings) and a destination (cluster and namespace).
+
+\glabel{How does it work internally?} Three components split the work, and knowing which one is struggling is most of Argo CD operations:
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{27mm} X@{}}
+\wbtablehead{Component} & \wbtablehead{Responsibility, and what its failure looks like}\\
+API server & gRPC/REST gateway for the UI, CLI and webhooks; authentication, RBAC, credential storage. If it is down, \emph{you} cannot see or drive anything --- but reconciliation continues.\\
+Repo server & Clones and caches repositories, then \emph{renders} manifests (Helm template, Kustomize build, plain YAML). CPU- and memory-hungry. Slow syncs and rendering timeouts are almost always here.\\
+Application controller & Watches live cluster objects, computes the diff against rendered desired state, sets \code{Synced}/\code{OutOfSync}, executes syncs, runs hooks, and self-heals. Sharded across replicas when you manage many clusters.\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 13.3 — The Argo CD loop. Rendering and diffing are separate concerns; most performance problems live in the render step.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.2mm, align=left, text width=56mm}]
+  \node[stg] (a) {\textbf{1 · Fetch revision} \hfill \scriptsize poll approx. 3 min, or webhook};
+  \node[stg, below=of a] (b) {\textbf{2 · Render manifests} \hfill \scriptsize helm template / kustomize build};
+  \node[stg, wbboxk8s, below=of b] (c) {\textbf{3 · Read live state} \hfill \scriptsize from watch-backed cache};
+  \node[stg, wbboxaccent, below=of c] (d) {\textbf{4 · Diff} \hfill \scriptsize normalise, ignore known noise};
+  \node[stg, wbboxgood, below=of d] (e) {\textbf{5 · Sync} \hfill \scriptsize waves, hooks, prune};
+  \node[stg, wbboxops, below=of e] (f) {\textbf{6 · Report health} \hfill \scriptsize Synced / OutOfSync / Degraded};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f}{\draw[wbarrow] (\x)--(\y);}
+  \draw[wbarrowg] (f.east) -- ++(5mm,0) |- (a.east);
+  \node[wbcap, right=6mm of d, text width=17mm, anchor=west] {self-heal fires here};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{The diff is harder than it looks.} A naive comparison of your YAML against the live object always reports a difference, because the API server, admission webhooks and other controllers legitimately add fields: \code{status}, defaulted values, injected sidecars, autoscaler-managed replica counts, mutating-webhook annotations. Argo CD therefore diffs against the last-applied configuration and applies normalisation rules, and offers explicit \code{ignoreDifferences} for fields another controller owns. The classic symptom of getting this wrong is an application that flaps \code{OutOfSync} forever, or --- worse --- an app with self-heal enabled that fights the HorizontalPodAutoscaler, resetting \code{replicas} to the committed value every few minutes.
+
+\begin{behind}
+\code{syncPolicy.automated.selfHeal} is what makes drift disappear rather than merely become visible. With it off, a manual \code{kubectl edit} shows up as \code{OutOfSync} and waits for a human. With it on, the controller re-applies the git state on the next reconciliation --- so the manual edit survives for at most one interval. That is the desired behaviour in production and a genuinely infuriating one during a live incident, which is why teams keep a documented break-glass procedure: disable auto-sync on that one Application, act, then commit the fix and re-enable.
+\end{behind}
+
+\glabel{Ordering.} Manifests are not applied in file order. Argo CD groups resources into \keyterm{sync waves} (an annotation carrying an integer; lower waves complete and become healthy first) and runs \keyterm{hooks} at the \code{PreSync}, \code{Sync} and \code{PostSync} phases. This is how a schema migration Job runs before the Deployment that needs the new column, and how a smoke test runs after.
+
+\begin{k8sbox}[argocd/application-cloudbase-api.yaml]
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cloudbase-api-prod
+  namespace: argocd
+spec:
+  project: cloudbase
+  source:
+    repoURL: https://github.com/acme/cloudbase-config.git
+    targetRevision: main            # never a mutable branch for prod? see note
+    path: envs/prod/api
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cloudbase-prod
+  syncPolicy:
+    automated:
+      prune: true                   # delete objects removed from git
+      selfHeal: true                # revert manual cluster edits
+    syncOptions:
+      - CreateNamespace=true
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas             # owned by the HPA, not by git
+\end{k8sbox}
+
+\begin{tradeoff}[tracking a branch versus a digest]
+Tracking \code{main} means "production is whatever the tip of main renders to," which is convenient and slightly terrifying: a merge deploys. Tracking an immutable tag or commit SHA means promotion is an explicit act, and \code{git log} of the config repo is literally the deploy log. Most mature setups track a branch for dev, and a promoted SHA or release tag for production. The same reasoning applies to image references: a \code{:latest} tag defeats reconciliation entirely, because the desired state is no longer deterministic. Pin image digests.
+\end{tradeoff}
+
+\glabel{Scaling the pattern.} Two idioms dominate. \keyterm{App-of-apps}: one Application whose manifests are other Applications, so a single root object bootstraps a whole cluster. \keyterm{ApplicationSet}: a generator (over a list, a git directory, a cluster label selector, or a pull request) that templates many Applications from one definition --- the standard answer to "one app per environment per region per cluster" without copy-pasted YAML.
+
+\glabel{The alternative.} Flux takes the same principles and decomposes them into small controllers on the GitOps Toolkit: \code{source-controller} fetches artefacts (git, OCI, Helm) and serves them internally as tarballs; \code{kustomize-controller} and \code{helm-controller} apply them; \code{notification-controller} routes events in and out. There is no bundled UI. Flux tends to appeal to platform teams who want composable controllers and Kubernetes-API-only interfaces; Argo CD appeals where a multi-tenant UI, RBAC and a visual diff for many teams are worth running a heavier component. Both are CNCF Graduated. The choice rarely matters as much as arguments about it suggest.
+
+\begin{scalenote}
+At a few hundred Applications the bottleneck is the repo server's rendering CPU and the controller's cache memory --- one live-object cache per managed cluster. The scaling levers are: shard the application controller, split enormous mono-repos so a single commit does not invalidate every render, prefer webhooks to shorter polling intervals, and keep manifests cheap to render (deeply nested Helm charts with heavy templating are the usual culprit). Reconciling faster is rarely the answer; reconciling less redundantly is.
+\end{scalenote}
+
+\wbsub{3.3\quad Deployment Strategies --- Trading Cost for Blast Radius}
+
+\glabel{What is it?} A deployment strategy is a decision about \emph{who sees the new version, when, and how fast you can undo it}. Three shapes cover almost everything.
+
+\glabel{How does it work internally? (rolling update)} Kubernetes' default. The Deployment controller creates a new ReplicaSet and shifts replicas between the two, bounded by \code{maxSurge} (how many extra Pods may exist above the desired count) and \code{maxUnavailable} (how many may be missing). Pods only receive traffic once their readiness probe passes, which is the entire safety mechanism --- a Deployment with no readiness probe rolls broken Pods straight into the Service's endpoint list. During the roll, both versions serve simultaneously, so your API contract must be backward compatible with itself. There is no traffic-percentage control: the split is whatever the replica ratio happens to be.
+
+\glabel{How does it work internally? (blue-green)} Two complete environments exist. Blue serves; green is deployed and warmed with no production traffic. Cutover is a single atomic-ish change --- flipping a Service's label selector, or an Ingress/listener rule --- so all users move at once. Rollback is flipping it back, which is why blue-green's rollback time is measured in seconds and is by far its main selling point. The cost is running double capacity for the overlap, and the risk is that a defect only observable under real production load reaches 100\% of users instantly.
+
+\glabel{How does it work internally? (canary)} A small, controlled fraction of traffic goes to the new version while the rest stays on the old. The split is enforced either crudely by replica ratio (nine old Pods, one new Pod, behind one Service --- approximately 10\%, subject to connection reuse and keep-alive skew) or properly by a weighted router: an Ingress controller that supports weights, or a service mesh such as Istio or Linkerd manipulating routing rules. The mesh approach is the accurate one, because it splits \emph{requests}, not endpoints.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} X L{25mm} L{20mm}@{}}
+\wbtablehead{Strategy} & \wbtablehead{Blast radius of a bad release} & \wbtablehead{Extra cost} & \wbtablehead{Rollback}\\
+Rolling & Grows steadily to 100\% as the roll proceeds & None (bounded by maxSurge) & Minutes --- roll back through the same gradual process\\
+Blue-green & 100\% instantly, but only from cutover & 2$\times$ capacity during overlap & Seconds --- flip the selector back\\
+Canary & Bounded by the current weight (often 5--10\%) & Small (a few extra Pods) plus a router & Seconds --- set weight to zero\\
+\end{tabularx}
+\end{center}
+
+\begin{tradeoff}[the honest comparison]
+Blue-green optimises \emph{recovery time}; canary optimises \emph{exposure}. If your failure mode is "the new version is catastrophically broken and we know within thirty seconds", blue-green is excellent and simpler. If your failure mode is "the new version raises p99 latency by 40\% under real traffic patterns we cannot reproduce in staging", canary is the only one of the three that finds it before everyone is affected. Canary is also the only strategy that requires you to have working SLO metrics --- which is precisely why it is the one that fails when adopted by teams who skipped Day 11.
+\end{tradeoff}
+
+\begin{costnote}
+Blue-green's double capacity is often mispriced. The real bill is not "2$\times$ for five minutes"; it is 2$\times$ for however long you keep green warm as a rollback safety net --- frequently hours, sometimes across a weekend. And if your cluster autoscaler must add nodes to fit the green environment, you also pay node startup latency inside your deploy window, plus whatever your cloud's minimum billing increment is. Canary's few extra Pods are almost free by comparison; its cost is the routing infrastructure and the engineering time to make the analysis trustworthy.
+\end{costnote}
+
+\begin{misconception}
+"Blue-green means zero downtime." It means zero downtime for \emph{stateless request serving}. Shared state does not fork: both colours talk to the same database, the same queues, the same caches. If green writes a row shape blue cannot read, flipping back does not undo the row. This is why schema changes follow \keyterm{expand--contract} --- add the new column, deploy code writing both, backfill, deploy code reading new, and only then drop the old --- so that every intermediate state is compatible with both colours.
+\end{misconception}
+
+\wbsub{3.4\quad Progressive Delivery --- Promotion Gated on Metrics}
+
+\glabel{What is it?} \keyterm{Progressive delivery} is canary plus automation: the traffic weight advances through defined steps, and at each step a machine evaluates real metrics against explicit success and failure conditions, then promotes or aborts without waiting for a human.
+
+\glabel{Why does it exist?} The manual canary is theatre. An engineer sets 10\%, stares at Grafana for ten minutes, sees nothing obviously red, and promotes. This fails in three ways: the human is not sampling anything statistically meaningful; the human is doing this at 23:00 and wants to go home; and there is no record of the criterion that was applied, so nobody can review or improve the decision. Encoding the criterion as a query with thresholds fixes all three at once.
+
+\glabel{How does it work internally?} With Argo Rollouts, a \code{Rollout} CRD replaces the Deployment. Its canary strategy is a list of steps --- set weight, pause, set weight, pause --- and \code{AnalysisTemplate} objects define measurements. Each metric has an \code{interval} (sampling frequency), a \code{count} (how many measurements; zero means run continuously), a \code{successCondition} and a \code{failureCondition} evaluated against the query result, and a \code{failureLimit} (how many failed measurements are tolerated before the analysis fails). A result matching neither condition is \emph{inconclusive} --- deliberately distinct from failure. Analysis runs in one of two modes: \textbf{inline}, as a step that blocks progression until it completes, and \textbf{background}, running in parallel with the steps and aborting the rollout retroactively if it fails. When analysis fails, the controller sets the canary weight back to zero and scales the canary ReplicaSet down --- traffic returns to stable in seconds, without any git change.
+
+\begin{wbfigure}{Fig 13.4 — A gated canary. Every arrow forward is a metric decision; every failure exits to the same place.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=54mm, minimum height=7mm, align=left, text width=48mm}]
+  \node[stg, wbboxghost] (a) {\textbf{weight 0} \hfill \scriptsize stable only};
+  \node[stg, below=of a] (b) {\textbf{weight 5\%} \hfill \scriptsize analysis: 5 min};
+  \node[stg, below=of b] (c) {\textbf{weight 25\%} \hfill \scriptsize analysis: 10 min};
+  \node[stg, below=of c] (d) {\textbf{weight 50\%} \hfill \scriptsize analysis: 10 min};
+  \node[stg, wbboxgood, below=of d] (e) {\textbf{weight 100\%} \hfill \scriptsize promoted, stable};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e}{\draw[wbarrow] (\x)--(\y);}
+  \node[stg, wbboxwarn, right=15mm of c, text width=26mm, minimum width=30mm] (ab) {\textbf{abort} \\ \scriptsize weight $\rightarrow$ 0, scale canary down};
+  \foreach \x in {b,c,d}{\draw[wbflow] (\x.east)--(ab.west);}
+  \node[wbcap, left=3mm of c, text width=19mm, anchor=east] {error rate + p95 latency vs stable};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{k8sbox}[rollouts/analysis-error-rate.yaml]
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: cloudbase-slo
+spec:
+  args:
+    - name: service
+  metrics:
+    - name: error-rate
+      interval: 1m
+      count: 5                 # five samples, not one lucky reading
+      successCondition: result[0] <= 0.01
+      failureLimit: 1          # one bad sample is enough to abort
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            sum(rate(http_requests_total{
+              service="{{args.service}}",version="canary",
+              status=~"5.."}[2m]))
+            /
+            sum(rate(http_requests_total{
+              service="{{args.service}}",version="canary"}[2m]))
+    - name: latency-p95
+      interval: 1m
+      count: 5
+      successCondition: result[0] < 0.400
+      failureLimit: 2
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.95, sum(rate(
+              http_request_duration_seconds_bucket{
+                service="{{args.service}}",version="canary"}[2m]
+            )) by (le))
+\end{k8sbox}
+
+\begin{k8sbox}[rollouts/rollout-cloudbase-api.yaml]
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: cloudbase-api
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      canaryService: cloudbase-api-canary
+      stableService: cloudbase-api-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: cloudbase-api
+            routes: [primary]
+      analysis:                        # background analysis
+        templates:
+          - templateName: cloudbase-slo
+        args:
+          - name: service
+            value: cloudbase-api
+      steps:
+        - setWeight: 5
+        - pause: {duration: 5m}
+        - setWeight: 25
+        - pause: {duration: 10m}
+        - setWeight: 50
+        - pause: {duration: 10m}
+\end{k8sbox}
+
+\begin{perfnote}
+The most common analytical error is a sample-size problem. At 5\% of 200 requests per second you get 10 requests per second on the canary --- roughly 600 in a one-minute window. If your baseline error rate is 0.1\%, the expected number of errors in that window is \emph{less than one}, so a single unlucky request pushes the measured rate to 0.17\% and your threshold decides the release is broken. Two fixes, both used in practice: widen the query window so the denominator is large enough to be meaningful, and compare canary against the concurrently measured \emph{stable} version rather than an absolute constant, so that a site-wide incident does not get blamed on your release.
+\end{perfnote}
+
+\begin{reliability}
+Choose your failure conditions from the user's perspective, and make them cheap to evaluate. Error rate and latency are the reliable pair because they are the two symptoms every user notices. Avoid gating on CPU, memory or replica count --- those are causes, not symptoms, and a new version that legitimately uses 15\% more CPU will abort a perfectly good release. Gate on the SLIs from Day 11, and if a metric is not good enough to alert on at 03:00, it is not good enough to abort a deploy either.
+\end{reliability}
+
+\begin{seniornote}
+Progressive delivery only pays for itself when the analysis window is long enough to catch your actual failure modes and short enough that people do not route around it. A ninety-minute canary on a service that deploys eight times a day means the team will ship with the gate disabled by Friday. Start with the fastest-detecting signals, keep the total rollout under about twenty minutes for high-frequency services, and reserve long bake times for the one or two components where a subtle regression is genuinely expensive. Guardrails that get bypassed are worse than no guardrails, because they create false confidence.
+\end{seniornote}
+
+\wbsub{3.5\quad Rollback as a First-Class, Rehearsed Operation}
+
+\glabel{What is it?} A rollback is a return to a known-good state. Under GitOps that means one thing: \emph{make git describe the previous state}, and let reconciliation do the rest.
+
+\glabel{Why does it exist as a discipline?} Because under pressure people do the fast thing, and in a self-healing system the fast thing is often undone thirty seconds later by the controller. This is the single most important operational consequence of GitOps and it surprises nearly everyone the first time.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{34mm} X L{24mm}@{}}
+\wbtablehead{Mechanism} & \wbtablehead{What it does} & \wbtablehead{Survives self-heal?}\\
+\code{git revert} + push & Changes desired state; agent reconciles the cluster back & Yes --- this is the real rollback\\
+\code{argocd app rollback} & Syncs the Application to an earlier deployed revision & Only with auto-sync disabled; it is an emergency lever\\
+\code{kubectl rollout undo} & Switches the Deployment back to a previous ReplicaSet & No --- git still says otherwise; drift is re-applied\\
+Abort a canary & Sets weight to 0 and scales the canary down & Yes, and it is the fastest of all\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 13.5 — Two rollback paths. Only the left one changes what the controller believes.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 10mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxwarn] (inc) {Bad release detected};
+  \node[wbboxgood, below left=8mm and 4mm of inc] (rev) {git revert\\push};
+  \node[wbboxwarn, below right=8mm and 4mm of inc] (kub) {kubectl\\rollout undo};
+  \draw[wbarrow] (inc)--(rev); \draw[wbarrow] (inc)--(kub);
+  \node[wbbox, below=8mm of rev] (rec) {Agent reconciles\\to old commit};
+  \node[wbboxghost, below=8mm of kub] (drift) {Cluster now drifts\\from git};
+  \draw[wbarrow] (rev)--(rec); \draw[wbarrow] (kub)--(drift);
+  \node[wbboxgood, below=7mm of rec] (ok) {Durable};
+  \node[wbboxwarn, below=7mm of drift] (bad) {Self-heal re-applies\\the bad version};
+  \draw[wbarrow] (rec)--(ok); \draw[wbarrow] (drift)--(bad);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{drtip}
+Rehearse the rollback in a scheduled exercise, with a stopwatch, on the production-shaped environment --- not on a laptop. Measure three numbers and write them in the runbook: time to \emph{detect} (alert fires), time to \emph{decide} (who is allowed to call it, and can they do so without waking an architect), and time to \emph{recover} (traffic actually back on the old version). Teams routinely discover in this exercise that the revert commit is blocked by a required-reviewers rule and there is no reviewer online at 03:00. That discovery is the entire point of the rehearsal.
+\end{drtip}
+
+\begin{bashbox}[rollback drill]
+# 1 - fastest: abort an in-flight canary (no git change needed)
+kubectl argo rollouts abort cloudbase-api -n cloudbase-prod
+
+# 2 - durable: make git describe the good state again
+git revert --no-edit <bad-sha>
+git push origin main
+argocd app wait cloudbase-api-prod --sync --health --timeout 300
+
+# 3 - emergency lever, only if git is unavailable
+argocd app rollback cloudbase-api-prod 42   # 42 = a prior deployed revision
+# then: re-enable auto-sync only AFTER git matches reality
+\end{bashbox}
+
+\begin{secwarn}[what cannot be rolled back]
+Code rolls back. State does not. A migration that dropped a column, a message consumed off a queue with an incompatible schema, a cache populated with a new serialisation format, an outbound webhook already delivered to a customer --- none of these are undone by reverting a commit. This is why forward-compatible, additive migrations are not a database nicety but a \emph{deployment safety requirement}. Before every release, ask one question: if we revert this in ten minutes, what will be left behind?
+\end{secwarn}
+
+\wbsub{3.6\quad Feature Flags --- Decoupling Deploy from Release}
+
+\glabel{What is it?} A feature flag is a runtime condition around new behaviour, evaluated per request against a user, tenant or percentage. The code ships to production \emph{dark} --- deployed but inactive --- and is enabled later, separately, without a new deploy.
+
+\glabel{Why does it exist?} Deployment strategies control \emph{which version of the binary} handles a request. They cannot control \emph{which behaviour} that binary exhibits for a particular user. Bundling those two decisions makes every deploy a user-facing event, which pressures teams into large, infrequent, high-risk releases --- exactly the dynamic continuous delivery is meant to eliminate. Flags separate two questions that fail for entirely different reasons: "did this code deploy safely?" and "does this feature behave correctly for users?"
+
+\glabel{How does it work internally?} A flag SDK inside the process holds an in-memory rule set and evaluates locally, so the hot path costs a map lookup and not a network call. The rules are refreshed by streaming (server-sent events or a websocket) or polling from a control plane; percentage targeting is done by hashing a stable key --- user ID plus flag key --- into a bucket, so the same user gets a consistent answer across requests and services. Two properties follow directly from that design and both matter operationally: evaluation continues from cache if the control plane is unreachable, and the default value chosen for that case is a real availability decision.
+
+\begin{tradeoff}[flags are not free]
+Every flag is a permanent branch in your code and a doubling of the state space to test. Ten live flags is a thousand combinations, most never exercised. Mature teams treat flags as inventory with an expiry date: every release flag has an owner and a removal ticket created when it is added, kill switches are labelled distinctly from experiments and are allowed to persist, and stale flags are audited monthly. Untended flag debt turns into behaviour nobody can explain --- a service that responds differently for one legacy tenant because a flag was flipped in 2024 and never removed.
+\end{tradeoff}
+
+\begin{opsnote}
+The pairing that works in production: deploy with a canary gated on technical SLIs (error rate, latency --- is the binary healthy?), then release with a flag ramped on business metrics (conversion, engagement --- is the feature good?). They answer different questions on different timescales. A canary that takes twenty minutes cannot tell you a checkout redesign reduces conversion; a flag ramp over a week can, and can be switched off in one second without any deploy at all.
+\end{opsnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Keep application code and deployment config in separate repositories --- so a config commit does not trigger a rebuild, and the config repo's history is a clean deploy log.
+  \item Pin image digests, never \code{:latest}; a non-deterministic desired state cannot be reconciled.
+  \item Enable \code{selfHeal} in production and document the break-glass procedure for disabling it.
+  \item Gate canary promotion on the same SLIs you alert on, compared against stable, not against a constant.
+  \item Make every production change a reviewed commit --- then branch protection and signing from Days 2 and 12 apply automatically to deploys.
+  \item Rehearse rollback on a schedule and record detect/decide/recover times in the runbook.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Leaving a long-lived, cluster-admin credential in CI after adopting an in-cluster agent --- keeping the risk and adding a component.
+  \item Promoting a canary on a fixed timer regardless of what the metrics show.
+  \item Analysing a canary with too little traffic for the numbers to mean anything.
+  \item Fixing an incident with \code{kubectl edit} in a self-healing cluster, and being confused when it reverts.
+  \item Testing the rollback path for the first time during the incident that needs it.
+  \item Treating "deployed" and "released" as the same event, so every deploy becomes an all-or-nothing user-facing change.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the credential direction and the abort path without notes, you can explain this chapter in an interview.
+
+\begin{writespace}[Redraw: push versus pull delivery, marking which side holds the cluster write credential and where the trust boundary sits]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the canary ladder with its analysis gate at each step, and the single abort path all failures take]
+\reflectionlines[6]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — GitOps and a Gated Canary}
+
+\textbf{Goal.} Move a running service from pipeline-pushed deploys to reconciliation, then put a metric-gated canary in front of it and prove that a bad release aborts itself. You are building the delivery path CloudBase uses for the rest of the book.
+
+\resetlab
+\labstep{Split the config repository from the application repository}
+Create a second repository (or a clearly separated directory tree) holding only rendered Kubernetes manifests, structured per environment: \code{envs/dev}, \code{envs/staging}, \code{envs/prod}.
+\labwhy{A commit to the config repo means "change what is running"; a commit to the app repo means "change the code". Merging them makes the deploy history unreadable and causes rebuild loops when the pipeline commits an image tag back into the repo it watches.}
+
+\labstep{Install the agent and register the first Application}
+Install Argo CD into its own namespace, then declare one \code{Application} pointing at \code{envs/dev}. Sync it manually the first time and read the diff view before you approve it.
+\labwhy{Reading the diff before the first sync is the habit that separates operators from button-pressers --- it is also the only moment you will clearly see how much the API server defaults into your objects.}
+
+\labstep{Cause drift deliberately, and watch it heal}
+With auto-sync and \code{selfHeal} on, run \code{kubectl scale} or \code{kubectl edit} against the live Deployment. Watch the application go \code{OutOfSync}, then watch it return.
+\labwhy{This is the moment GitOps stops being an abstract idea. You must feel the loop, and you must know how long it takes, because that duration is how long a manual emergency change would survive.}
+
+\labstep{Make the pipeline stop touching the cluster}
+Delete the cluster credential from CI. The pipeline's last step becomes: push the image, then open (or commit) a change to the config repo's image digest.
+\labwhy{If the credential still exists "just in case", you have added a component without removing a risk. Deleting it is the change; everything else is plumbing.}
+
+\labstep{Convert the Deployment to a Rollout with canary steps}
+Install Argo Rollouts, replace the Deployment with a \code{Rollout}, and configure weighted routing through your ingress controller or mesh with a stable and a canary Service.
+\labwhy{Understand where the split is enforced. Replica-ratio canaries are approximations distorted by keep-alive connections; a weighted router splits actual requests, which is what your analysis assumes.}
+
+\labstep{Write the AnalysisTemplate against your Day 11 metrics}
+Express error rate and p95 latency as Prometheus queries scoped to the canary version. Run each query by hand in the Prometheus UI first and confirm it returns a sensible number.
+\labwhy{An analysis template whose query returns no data does not fail --- it is inconclusive, and inconclusive behaves differently from failure. Verifying the query manually is the only way to know which one you have written.}
+
+\labstep{Ship a deliberately broken version and watch the abort}
+Add an endpoint that returns HTTP 500 for a fraction of requests, deploy it, and watch the rollout abort and traffic return to stable. Record how long detection took.
+\labwhy{A guardrail you have never seen fire is a guardrail you do not know the behaviour of. You need the measured detection time for your incident runbook, not an estimate.}
+
+\labstep{Rehearse the full rollback, with a stopwatch}
+Promote the broken version to 100\% on purpose in a non-production environment, then recover it via \code{git revert}. Time detect, decide and recover separately.
+\labwhy{The three numbers are separately actionable: slow detection is a monitoring problem, slow decision is an org problem, slow recovery is a tooling problem. Averaging them hides which one you actually have.}
+
+\begin{prodtip}
+Give Argo CD its own repository and bootstrap itself with an app-of-apps: one root Application that manages Argo CD's own configuration, projects, RBAC and every other Application. It feels circular and it is --- but it means the platform's configuration is reviewed and reconciled exactly like everything else, and rebuilding a lost cluster becomes "install the agent, point it at the root app, wait." Keep the bootstrap manifest in a second location, though: an agent cannot install itself.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Self-heal reverts manual cluster changes within one reconciliation interval. During a live incident, that is exactly the behaviour you do not want. Design the break-glass procedure: who may invoke it, what it disables, how the system reminds you it is disabled, and what forces it back on. What does your answer imply about how much you trust processes versus mechanisms?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A service handles 40 requests per second. You want a canary at 5\% weight to detect an error-rate regression from 0.1\% to 1\%. Roughly how many requests must the canary serve for that difference to be distinguishable from noise, and how long does that take? Now decide what you would change: the weight, the window, the metric --- or the strategy entirely.
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Blue-green gives you seconds-fast rollback but exposes 100\% of users at cutover; canary bounds exposure but rolls back a partially-migrated population. For a payment API and for a recommendation widget, which do you choose, and what property of each system drove the choice rather than a general preference?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The application that will not stay Synced}
+\textbf{Symptom.} \code{cloudbase-api-prod} flips between \code{Synced} and \code{OutOfSync} every few minutes. Nobody is deploying. Pods restart more often than expected during peak hours.
+
+\begin{outbox}[argocd app diff cloudbase-api-prod]
+===== apps/Deployment cloudbase-prod/cloudbase-api ======
+  spec:
+    minReadySeconds: 0
+-   replicas: 12
++   replicas: 4
+    revisionHistoryLimit: 10
+
+# argocd app get cloudbase-api-prod
+Health Status:  Progressing
+Sync Policy:    Automated (Prune, SelfHeal)
+CONDITION       MESSAGE
+SyncError       one or more objects failed to apply (retried 3 times)
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The only differing field is \code{replicas}: git says 4, the cluster says 12. The flapping is periodic and correlates with load.
+  \item \textbf{Hypothesise.} Two controllers own the same field. The HorizontalPodAutoscaler scales up under load; Argo CD's self-heal scales back down to the committed value; the HPA reacts again.
+  \item \textbf{Investigate.} \code{kubectl get hpa -n cloudbase-prod} confirms an HPA targets this Deployment with min 4, max 20. Correlate the Argo CD sync timestamps with HPA scale events --- they interleave.
+  \item \textbf{Root cause.} Desired state was declared for a field that another controller legitimately owns at runtime. Reconciliation is working perfectly; the ownership model is wrong.
+  \item \textbf{Fix.} Add \code{ignoreDifferences} for \code{/spec/replicas} on this Deployment (or remove \code{replicas} from the manifest entirely so the HPA is the sole owner).
+  \item \textbf{Prevent.} Adopt a rule: any field a controller mutates at runtime --- replica counts, injected sidecars, autoscaler and mesh annotations --- is either excluded from git or explicitly ignored. Treat a permanently \code{OutOfSync} app as a design bug, never as background noise, or your team will learn to ignore the one that matters.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The canary that promoted a broken release}
+\textbf{Symptom.} A release with a clearly broken endpoint passed a five-minute canary at 5\% weight and reached 100\%. Error-rate alerts fired eight minutes after full promotion. The analysis run reported success.
+
+\begin{outbox}[kubectl argo rollouts get rollout cloudbase-api]
+Name:            cloudbase-api
+Status:          Healthy
+Strategy:        Canary
+  Step:          6/6
+  SetWeight:     100
+  ActualWeight:  100
+
+NAME                          KIND         STATUS      AGE  INFO
+> analysisrun/cloudbase-api-5f8c-2  AnalysisRun  Successful  14m
+    measurement error-rate    value: 0     phase: Successful  # 5/5 samples
+    measurement latency-p95   value: NaN   phase: Inconclusive
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The error-rate metric measured exactly \code{0} for all five samples, and the latency metric returned \code{NaN} and was recorded as inconclusive rather than failed.
+  \item \textbf{Hypothesise.} The queries are not matching the canary's series. A metric that selects nothing returns an empty vector, which is not an error --- so "no data" was read as "no errors".
+  \item \textbf{Investigate.} Run the query in Prometheus with the canary label. The canary Pods carry \code{version=canary-abc123}, not the literal \code{version="canary"} the template hardcodes. No series match, so the numerator and denominator are both empty.
+  \item \textbf{Root cause.} A label-selector mismatch between what the Rollout stamps onto canary Pods and what the AnalysisTemplate queries. The gate was measuring nothing and reporting success.
+  \item \textbf{Fix.} Pass the canary pod-hash into the template as an argument from the Rollout's value-from reference, so the selector always matches the current canary ReplicaSet. Re-run against a known-bad build to confirm it now fails.
+  \item \textbf{Prevent.} Add a \emph{liveness assertion} to every analysis: a metric requiring the canary's total request count to exceed a floor, with a \code{failureCondition} when it does not. Absence of data must fail the gate, never pass it. Then verify the whole path periodically by deliberately shipping a broken build to staging --- a fire drill for the guardrail itself.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Experience reconciliation and drift correction first-hand.\\
+\textbf{Business context.} Your team keeps finding hand-edits in staging nobody remembers making.\\
+\textbf{Architecture.} One local cluster (kind or minikube), Argo CD, one git repo with a Deployment and a Service.\\
+\textbf{Requirements.} Register the app with auto-sync and self-heal; then scale, edit an env var, and delete a Pod, observing each.\\
+\textbf{Constraints.} Do not use the UI to fix anything --- only git and observation.\\
+\textbf{Hints.} Watch \code{argocd app get} in one terminal and \code{kubectl get deploy -w} in another; note the time between drift and correction.\\
+\textbf{Expected outcome.} A written note stating your reconciliation interval and which of the three changes healed, which did not, and why.\\
+\textbf{Production considerations.} Deleting a Pod is not drift --- the Deployment controller owns that. Know which controller owns what.\\
+\textbf{Common pitfalls.} Assuming self-heal is instant; forgetting that \code{prune} is what deletes objects removed from git.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~70 min}
+\textbf{Goal.} Build a canary that aborts itself on a real metric.\\
+\textbf{Business context.} A bad release last quarter reached all users before anyone noticed.\\
+\textbf{Architecture.} Argo Rollouts plus a weighted ingress or mesh, Prometheus from Day 11, a load generator.\\
+\textbf{Requirements.} Steps at 10\%/50\%/100\%; an AnalysisTemplate on error rate; a deliberately broken build that must abort at the first step.\\
+\textbf{Constraints.} Generate enough synthetic traffic that the canary sees a statistically meaningful request count.\\
+\textbf{Hints.} Validate every PromQL query by hand first; add a request-count floor so empty results fail rather than pass.\\
+\textbf{Expected outcome.} A recorded abort with the elapsed time from deploy to traffic fully back on stable.\\
+\textbf{Production considerations.} Compare the canary against concurrently measured stable, so a site-wide incident does not abort an innocent release.\\
+\textbf{Common pitfalls.} Label selectors that match nothing; thresholds tighter than your normal error-rate variance.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2.5 hours}
+\textbf{Goal.} Run a rollback game day and produce a runbook with measured numbers.\\
+\textbf{Business context.} Leadership asked "how fast can we undo a bad deploy?" and nobody has a defensible answer.\\
+\textbf{Architecture.} GitOps-managed staging with a canary, alerting from Day 11, a colleague acting as incident commander.\\
+\textbf{Requirements.} Have someone else deploy a defect without telling you what it is; detect, decide and recover; record all three times; repeat with a second, subtler defect.\\
+\textbf{Constraints.} You may only use documented procedures. If a step is not written down, you may not do it --- write it down first, then do it.\\
+\textbf{Hints.} Include the awkward cases: branch protection blocking the revert, the agent itself unhealthy, a migration already applied.\\
+\textbf{Expected outcome.} A one-page runbook: detection sources, decision authority, exact commands, and what to do when git is unavailable.\\
+\textbf{Production considerations.} Decide in advance who may declare a rollback without escalation --- ambiguity here costs more minutes than any tooling gap.\\
+\textbf{Common pitfalls.} Rehearsing only the easy defect; assuming the person who deployed will be available.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{opsnote}
+The DORA metrics land here. Deployment frequency and lead time are improved by making deploys boring; change failure rate is improved by canary gates; and time to restore service is improved almost entirely by rehearsed rollback. Notice that three of the four are properties of your \emph{delivery mechanism}, not of your code --- which is why this is the highest-leverage day in the operations track.
+\end{opsnote}
+
+\begin{infranote}
+Reconciliation makes cluster rebuild tractable. If every workload, namespace, quota and policy is declared in a repository and applied by an agent, recreating a lost cluster is: provision infrastructure (Day 7), install the agent, point it at the root Application, wait. Teams that can do this stop treating clusters as pets --- and cluster upgrades stop being annual anxiety events, because you can stand up a new cluster beside the old one and shift traffic.
+\end{infranote}
+
+\begin{secwarn}
+Secrets are the one thing that does not go into the config repo in plaintext. The three workable patterns: encrypt at rest in git with SOPS or Sealed Secrets so the agent decrypts in-cluster; use an External Secrets operator that pulls from Vault or a cloud secret manager at reconcile time; or use workload identity so no static secret exists. Whichever you choose, remember that git history is forever --- a secret committed once and "removed" in the next commit is still in the repository, and the Day 12 rotation procedure applies.
+\end{secwarn}
+
+\begin{interview}
+Expect: \emph{"Why is pull-based GitOps more secure than push-based CI deploys?"} The weak answer recites "no credentials in CI". The strong answer is precise about what moves: in push mode a token that can write to the production cluster sits in a system that executes untrusted code from branches, so compromising a runner compromises production. In pull mode the agent's identity never leaves the cluster and needs only read access to git and the registry, so the equivalent compromise yields the ability to \emph{propose} a change --- which then faces review, branch protection and signing. Then add the honest caveat: the agent itself becomes a highly privileged in-cluster component and must be treated as such.
+\end{interview}
+
+\begin{reliability}
+Every automated gate needs a manual override, and every manual override needs an audit trail. Argo Rollouts' \code{promote --full} skips remaining analysis; that is a legitimate incident tool for shipping a hotfix quickly. It is also how a team quietly disables its own safety net. Make the override loud: log it, alert on it, review it in the weekly ops meeting. A guardrail used ten times a month is either miscalibrated or ignored --- both are worth knowing.
+\end{reliability}
+
+\begin{costnote}
+Progressive delivery has an underappreciated cost saving: aborted releases never reach the users who would have generated support tickets, refunds and incident hours. It also has a real running cost --- a mesh or weighted ingress, a Prometheus that can answer analysis queries under load, and extra Pods during rollouts. Size it deliberately: a canary on your revenue-critical path is obviously worth it; a canary on an internal admin tool used by nine people is ceremony, and rolling update plus a fast revert is the correct engineering answer.
+\end{costnote}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+CloudBase is containerised (Day 4), orchestrated (Days 5--6), provisioned by Terraform (Day 7), built by a pipeline (Day 9), secured (Day 12) and observable (Day 11). Until today, that pipeline still ended by reaching into the cluster with a credential. Today you cut that arrow and replace it with a loop.
+
+\begin{buildalong}[Day 13 — GitOps delivery with a gated canary]
+\begin{wbitem}
+  \item Create \code{cloudbase-config}: a manifest-only repository with \code{envs/dev}, \code{envs/staging}, \code{envs/prod}, each pinning image \emph{digests} rather than tags.
+  \item Install Argo CD and bootstrap an app-of-apps root Application that owns every CloudBase Application, so the platform's own configuration is reconciled too.
+  \item Enable \code{automated} sync with \code{prune} and \code{selfHeal} on staging and production; add \code{ignoreDifferences} for HPA-owned \code{replicas}.
+  \item Rewrite the Day 9 pipeline's final stage: build, scan and sign the image, then commit the new digest to \code{cloudbase-config} --- and \textbf{delete the cluster credential from CI}.
+  \item Replace the API's Deployment with an Argo Rollouts \code{Rollout}: weights 5\% $\rightarrow$ 25\% $\rightarrow$ 50\% $\rightarrow$ 100\%, with stable and canary Services behind weighted routing.
+  \item Write an \code{AnalysisTemplate} using the Day 11 SLIs --- 5xx rate and p95 latency, canary compared against stable --- plus a request-count floor so an empty result fails instead of passing.
+  \item Prove the gate: deploy a build that returns 500s for 3\% of requests and confirm it aborts at the first weight step. Record the elapsed detection time.
+  \item Rehearse the rollback end to end: promote a bad build deliberately in staging, recover with \code{git revert}, and time detect / decide / recover separately.
+  \item Add one kill-switch feature flag around a risky code path, and document who may flip it and how it is audited.
+  \item Write \code{docs/deployment-runbook.md}: strategy per service and why, the exact rollback commands, the break-glass procedure for disabling self-heal, and your three measured recovery times.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} no credential outside the cluster can write to production; a manual \code{kubectl edit} in staging is reverted automatically within one reconciliation interval; a deliberately broken release aborts at the first canary step without human intervention; and a rehearsed \code{git revert} restores the previous version with measured detect, decide and recover times recorded in the runbook.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item GitOps is continuous reconciliation from a versioned, declarative source --- not "YAML in git".
+  \item Pull-based delivery moves the cluster write credential inside the cluster, shrinking the CI blast radius to "can propose a commit".
+  \item Argo CD splits work across API server, repo server (rendering) and application controller (diff, sync, self-heal); most performance problems are rendering.
+  \item Self-heal makes manual cluster edits temporary --- plan a break-glass procedure before you need one.
+  \item Blue-green optimises recovery time at double cost; canary optimises exposure but requires trustworthy metrics.
+  \item Progressive delivery replaces a human staring at a dashboard with explicit success and failure conditions, and an automatic abort.
+  \item Under GitOps the real rollback is \code{git revert}; \code{kubectl rollout undo} is drift that self-heal will overwrite.
+  \item Code rolls back; state does not. Migrations must be additive and forward-compatible.
+  \item Feature flags separate "deployed safely" from "released correctly" --- two failures with different timescales.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Argo CD's default reconciliation is approx. 3 minutes (120s plus up to 60s jitter); webhooks make it near-instant.
+  \item An analysis metric that matches no series is \emph{inconclusive}, not failed --- always add a request-count floor.
+  \item A canary at 5\% of low traffic cannot measure a small error-rate change; widen the window or raise the weight.
+  \item Never point a production Application at a mutable \code{:latest} image tag --- desired state must be deterministic.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Keeping the CI cluster credential "just in case" \quad$\bullet$\quad timer-based promotion \quad$\bullet$\quad gating on CPU instead of SLIs
+  \item Fighting the HPA over \code{replicas} \quad$\bullet$\quad an unrehearsed rollback \quad$\bullet$\quad unbounded feature-flag debt
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{GitOps}{declarative · versioned · pulled automatically · continuously reconciled (OpenGitOps v1).}
+\cheatitem{Argo CD}{API server (UI/CLI) · repo server (render) · application controller (diff, sync, self-heal).}
+\cheatitem{Sync policy}{\code{automated} + \code{prune} (delete removed objects) + \code{selfHeal} (revert drift).}
+\cheatitem{Rolling}{maxSurge/maxUnavailable; readiness probes are the only safety net; no traffic weights.}
+\cheatitem{Blue-green}{two full environments, selector flip; seconds to roll back, 2$\times$ cost during overlap.}
+\cheatitem{Canary}{weighted routing (mesh/ingress); exposure bounded by weight; requires real metrics.}
+\cheatitem{Analysis}{\code{interval} · \code{count} · \code{successCondition} · \code{failureCondition} · \code{failureLimit}; no match = inconclusive.}
+\cheatitem{Rollback}{\code{git revert} is durable; \code{kubectl rollout undo} is drift; aborting a canary is fastest.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 13 commands worth memorising]
+# Argo CD - inspect before you act
+argocd app list
+argocd app get cloudbase-api-prod          # sync + health + conditions
+argocd app diff cloudbase-api-prod         # git vs live, field by field
+argocd app sync cloudbase-api-prod --prune
+argocd app history cloudbase-api-prod      # the deploy log
+argocd app rollback cloudbase-api-prod 42  # emergency lever only
+
+# drift + break glass
+kubectl -n argocd patch app cloudbase-api-prod --type merge \
+  -p '{"spec":{"syncPolicy":{"automated":null}}}'   # disable auto-sync
+
+# Argo Rollouts - drive and observe a canary
+kubectl argo rollouts get rollout cloudbase-api --watch
+kubectl argo rollouts promote cloudbase-api        # next step
+kubectl argo rollouts promote cloudbase-api --full # skip remaining analysis
+kubectl argo rollouts abort cloudbase-api          # weight -> 0, back to stable
+kubectl argo rollouts undo cloudbase-api --to-revision=3
+
+# native fallbacks
+kubectl rollout status deployment/cloudbase-api
+kubectl rollout undo deployment/cloudbase-api      # drift under GitOps!
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the practical security benefit of pull-based GitOps over push-based CI deploys --- and what new risk does it introduce?}
+\iq{Blue-green versus canary: what does each actually protect you from, and at what cost?}
+\iq{How should a canary rollout decide automatically whether to proceed or roll back?}
+\iq{Why does GitOps make rollback simpler than an imperative deploy pipeline --- and what does it make harder?}
+\iq{What problem do feature flags solve that a deployment strategy alone cannot?}
+\iq{What does "git as the source of truth for the cluster" actually mean in practice?}
+\iq{Your Argo CD application is permanently OutOfSync on one field. How do you diagnose it?}
+\iq{Which parts of a release cannot be rolled back, and how do you design around that?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item OpenGitOps --- \code{opengitops.dev}: the four GitOps principles (v1.0.0), the vendor-neutral definition.
+  \item Argo CD documentation --- \code{argo-cd.readthedocs.io}, especially "Operator Manual $\rightarrow$ Architectural Overview" and the FAQ entry on reconciliation timeouts.
+  \item Argo Rollouts documentation --- \code{argo-rollouts.readthedocs.io}, "Features $\rightarrow$ Analysis" for AnalysisTemplate semantics and background versus inline runs.
+  \item Flux documentation --- \code{fluxcd.io/flux/components/}: the GitOps Toolkit controllers (source, kustomize, helm, notification).
+  \item Kubernetes documentation --- "Performing a Rolling Update" and the Deployment strategy reference for \code{maxSurge} and \code{maxUnavailable}.
+  \item CNCF case study: Adobe --- the Flex platform built on Argo CD, Workflows, Events and Rollouts, and the scale it operates at.
+  \item Google SRE Workbook, "Canarying Releases" --- the statistical reasoning behind canary sizing and duration.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item No system outside the cluster holds a credential that can write to production.
+  \item Application code and deployment config live in separate repositories.
+  \item Every production image is referenced by digest, never by a mutable tag.
+  \item Auto-sync with self-heal is enabled, and the break-glass procedure is written down and tested.
+  \item Fields owned by other controllers are excluded or explicitly ignored; no app is permanently OutOfSync.
+  \item Canary analysis uses the same SLIs you alert on, compares against stable, and fails on absent data.
+  \item Rollback has been rehearsed within the last quarter, with detect/decide/recover times recorded.
+  \item Schema changes are additive and forward-compatible for at least one release.
+  \item Every feature flag has an owner and a removal date; kill switches are labelled separately.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 14).} You can now build, secure, observe, deploy and safely undo a system. Tomorrow you assemble the whole fourteen days into one coherent platform story --- the capstone review: what CloudBase looks like end to end, where its remaining weaknesses are, how to talk about these decisions in an interview, and how to keep learning once the roadmap ends.
+\end{keyidea}

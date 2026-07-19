@@ -1,0 +1,799 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 06 ============================
+\daychapter{06}{Orchestration}{Kubernetes in Production}{Helm, Ingress, TLS, RBAC, autoscaling and StatefulSets}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Package a directory of raw manifests as a versioned, rollback-able Helm chart with per-environment values.
+  \item Explain what an Ingress controller \emph{is} --- a reverse proxy that watches the API server and rewrites its own configuration --- and route traffic through one.
+  \item Terminate TLS at the edge of the cluster and automate certificate issuance and renewal with ACME.
+  \item Derive the Horizontal Pod Autoscaler's replica count from its metric-ratio formula, and configure probes and resource requests that make that number meaningful.
+  \item Apply least-privilege RBAC with per-application ServiceAccounts, and say precisely when a StatefulSet is required instead of a Deployment.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} On Day 5 you got a workload \emph{running} on Kubernetes: a Deployment, a Service, a ConfigMap, applied with \code{kubectl apply -f}. That is a demo. A production system additionally has to answer six questions that raw manifests do not: how do I ship the same application to three environments without maintaining three copies of the YAML? How does traffic from the public internet reach a Pod that has an ephemeral, cluster-internal IP? Who issues and renews the TLS certificate, at 3\,am on a Sunday, without a human? How many replicas should be running \emph{right now}? What is this application allowed to ask the API server for? And where does the data live when the Pod that owns it is deleted? Today answers all six.
+
+\glabel{Why DevOps engineers need it.} The gap between "it runs on my cluster" and "it survives a Black Friday, an expired certificate and a compromised container" is exactly this chapter. Every item here is a control loop or a packaging boundary, and each one has a failure mode that beginners walk into: a chart whose values do not merge the way they expect, an Ingress annotation silently ignored because it targets a different controller, an HPA that never scales because no metrics API is installed, a ServiceAccount bound to \code{cluster-admin} "to make an error go away."
+
+\glabel{Where it fits in a modern cloud architecture.} Day 6 is the layer between the cloud load balancer you will provision on Day 10 and the Pods you scheduled on Day 5. Read the diagram top-down as a request travelling inward.
+
+\begin{wbfigure}{Fig 6.0 — The production request path. Everything between the cloud load balancer and the Pod is what you build today.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.2mm, align=left, text width=58mm}]
+  \node[lyr, wbboxghost] (net) {\textbf{Client · DNS · TCP · TLS} \hfill \scriptsize Day 3};
+  \node[lyr, wbboxcloud, below=of net] (lb) {\textbf{Cloud load balancer (NLB/ALB)} \hfill \scriptsize Day 10};
+  \node[lyr, wbboxaccent, below=of lb] (ic) {\textbf{Ingress controller · TLS termination} \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxaccent, below=of ic] (svc) {\textbf{Service $\rightarrow$ EndpointSlice} \hfill \scriptsize Day 5, revisited};
+  \node[lyr, wbboxk8s, below=of svc] (pod) {\textbf{Pods: probes · requests · limits} \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxops, below=of pod] (ctl) {\textbf{Control loops: HPA · cert-manager} \hfill \scriptsize \textbf{today}};
+  \node[lyr, wbboxsec, below=of ctl] (rbac) {\textbf{RBAC on the API server} \hfill \scriptsize \textbf{today}};
+  \foreach \a/\b in {net/lb,lb/ic,ic/svc,svc/pod,pod/ctl,ctl/rbac}{\draw[wbarrowg] (\a)--(\b);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{keyidea}
+Kubernetes is not a deployment tool. It is a set of \keyterm{control loops}: independent processes that continuously compare an observed state to a declared state and act to close the gap. The Ingress controller, cert-manager, the HPA and the StatefulSet controller in this chapter are four instances of exactly the same pattern. Once you see them that way, "how does X work?" always has the same shape of answer --- what does it watch, what does it compute, and what does it write?
+\end{keyidea}
+
+\glabel{How it connects to previous chapters.} Day 1's SIGTERM/grace-period path is what \code{terminationGracePeriodSeconds} governs, and exit code 137 is what an exceeded memory limit produces. Day 4's image layers and non-root user are what the Pod runs. Day 5 gave you Deployments, Services and the reconciliation model; today every new object is another controller reconciling against it. Day 7's Terraform will provision the cluster and the DNS records that point at your Ingress, and Day 12's least-privilege IAM work is the same principle as RBAC with the enforcement point moved from the cluster API to the cloud API.
+
+\glabel{Where companies use it in production.} Shopify runs \code{ingress-nginx} such that, in their own description, nearly every request they serve passes through it at some point; they hit a real bottleneck where NGINX reloaded its configuration on every deploy, adding latency, and contributed a Lua-based dynamic endpoint-update path so that Pod churn updates an in-memory shared dictionary instead of forcing a reload. Zalando runs well over a hundred Kubernetes clusters on AWS and did not use the common controllers at all: they built \code{kube-ingress-aws-controller}, which watches Ingress objects and orchestrates real AWS load balancers, in front of Skipper, their own HTTP router; and \code{kube-metrics-adapter}, which feeds the HPA with request-rate, SQS-queue-depth and arbitrary Prometheus queries rather than CPU. Both architectures are worth understanding because they show the same interfaces --- Ingress, the external metrics API --- with completely different implementations behind them.
+
+\glabel{Common misconceptions.} That Helm is a deployment tool (it is a template renderer plus a release ledger; the cluster still reconciles). That an \code{Ingress} object routes traffic (it does not; it is a piece of data that a controller reads). That the HPA reads Prometheus (it reads the metrics APIs, and something must implement them). That RBAC can deny something (it cannot --- it is purely additive). That a StatefulSet gives you a highly available database (it gives you stable identity and storage; the replication is your database's problem).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 6.1 — Day 6 in one picture: a packaging layer on the left, three control loops in the middle, and the enforcement and state layers underneath.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (helm) {Helm chart\\templates + values};
+  \node[wbbox, right=of helm] (api) {API server\\declared state};
+  \draw[wbarrow] (helm)--node[wbcap,above]{renders}(api);
+  \node[wbboxk8s, above right=6mm and 9mm of api] (ing) {Ingress controller\\reverse proxy};
+  \node[wbboxops, right=of api] (hpa) {HPA loop\\metric ratio};
+  \node[wbboxk8s, below right=6mm and 9mm of api] (sts) {StatefulSet\\stable identity};
+  \draw[wbarrow] (api)--(ing); \draw[wbarrow] (api)--(hpa); \draw[wbarrow] (api)--(sts);
+  \node[wbboxsec, below=8mm of api] (rbac) {RBAC\\ServiceAccount};
+  \draw[wbarrowg] (rbac)--(api);
+  \node[wbboxsec, right=of ing] (tls) {cert-manager\\ACME + Secret};
+  \draw[wbarrow] (tls)--(ing);
+  \node[wbcyl, right=of sts] (pvc) {PVC\\PersistentVolume};
+  \draw[wbarrow] (sts)--(pvc);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{chart} $\rightarrow$ \keyterm{values} $\rightarrow$ \keyterm{release revision} $\rightarrow$ \keyterm{Ingress} $\rightarrow$ \keyterm{IngressClass} $\rightarrow$ \keyterm{TLS termination} $\rightarrow$ \keyterm{readiness} $\rightarrow$ \keyterm{request/limit} $\rightarrow$ \keyterm{metric ratio} $\rightarrow$ \keyterm{ServiceAccount} $\rightarrow$ \keyterm{Role} $\rightarrow$ \keyterm{volumeClaimTemplate}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Helm --- Packaging, Values and the Release Ledger}
+
+\glabel{What is it?} A \keyterm{chart} is a directory of Go-templated Kubernetes manifests plus a \code{values.yaml} of defaults and a \code{Chart.yaml} of metadata. Helm renders the templates against merged values, sends the resulting plain manifests to the API server, and records what it sent as a numbered \keyterm{release revision}.
+
+\glabel{Why does it exist?} A real service is a dozen YAML files, and between dev, staging and production the only differences are usually the image tag, the replica count, the resource sizes, the hostname and a handful of environment variables. Before Helm, teams solved this three ways, all bad: copy the directory per environment and let it drift; run \code{sed} over the YAML in CI and discover typos at apply time; or hand-roll a Python script that emits manifests, which nobody else on the team can read. Helm's contribution is not the templating --- it is the \emph{release}: a versioned, named, upgradeable and rollback-able unit, so that "what is deployed in production" is a question with a machine-readable answer.
+
+\glabel{How does it work internally?} Rendering is entirely client-side. Helm walks \code{templates/}, executes each file as a Go template with a context containing \code{.Values} (defaults deep-merged with every \code{-f} file and \code{--set} flag, later overriding earlier), \code{.Release} (name, namespace, revision, and whether this is an install or an upgrade), \code{.Chart} and \code{.Capabilities} (the cluster's Kubernetes version and available API groups). The output is ordinary YAML --- there is nothing Helm-specific left in what the cluster receives, which is why \code{helm template} is such a useful debugging command.
+
+The interesting part is state. Helm 3 removed the Tiller server component and stores each release revision as a Secret in the release's own namespace, named \code{sh.helm.release.v1.<release>.v<N>}. Its \code{release} key is a base64-encoded, gzip-compressed JSON blob containing the chart, the merged values, the rendered manifests and the release metadata. That is what makes \code{helm rollback 3} instantaneous: revision 3's rendered manifests are already stored, so a rollback is a re-apply, not a re-render from source you may no longer have.
+
+On upgrade, Helm computes a \keyterm{three-way strategic merge patch}: it compares the old rendered manifest, the object's \emph{live} state in the cluster, and the new rendered manifest. This matters enormously in practice. If another controller (or a human) added a field to the live object, a two-way patch --- what Helm 2 did --- would silently wipe it. The three-way patch preserves changes that Helm did not make and did not intend to remove.
+
+\begin{wbfigure}{Fig 6.2 — What Helm actually does. Everything left of the API server is client-side text processing; the cluster only ever sees plain manifests.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=60mm, minimum height=7.2mm, align=left, text width=54mm}]
+  \node[stg] (a) {\textbf{1 · Merge values} \hfill \scriptsize defaults + -f + --set};
+  \node[stg, below=of a] (b) {\textbf{2 · Render Go templates} \hfill \scriptsize client-side, no cluster};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · Three-way merge patch} \hfill \scriptsize old · live · new};
+  \node[stg, wbboxk8s, below=of c] (d) {\textbf{4 · Apply to API server} \hfill \scriptsize plain YAML};
+  \node[stg, wbboxops, below=of d] (e) {\textbf{5 · Store revision Secret} \hfill \scriptsize sh.helm.release.v1};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=4mm of e, text width=25mm, anchor=west] {this is what rollback reads};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{yamlbox}[chart/values.yaml -- defaults, deliberately safe]
+replicaCount: 2
+image:
+  repository: ghcr.io/cloudbase/api
+  tag: ""            # empty -> template falls back to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+resources:
+  requests: { cpu: "250m", memory: "256Mi" }
+  limits:   { memory: "512Mi" }
+ingress:
+  enabled: false     # off by default; each environment opts in
+  host: ""
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+\end{yamlbox}
+
+\begin{yamlbox}[chart/values-prod.yaml -- only the deltas]
+replicaCount: 5
+image:
+  tag: "1.4.2"
+resources:
+  requests: { cpu: "500m", memory: "512Mi" }
+  limits:   { memory: "1Gi" }
+ingress:
+  enabled: true
+  host: api.cloudbase.example
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+\end{yamlbox}
+
+\begin{k8sbox}[chart/templates/deployment.yaml -- the templated fragment]
+spec:
+  # replicas is omitted entirely when the HPA owns it, so that a
+  # helm upgrade cannot fight the autoscaler back down to the default
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  template:
+    spec:
+      serviceAccountName: {{ include "cloudbase.serviceAccountName" . }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag
+                   | default .Chart.AppVersion }}"
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+\end{k8sbox}
+
+\begin{misconception}
+"Helm deploys my application." Helm renders text and posts it to the API server; the Deployment controller, the ReplicaSet controller and the scheduler do the deploying. This distinction is not pedantry --- it explains why \code{helm upgrade} returning success means "the API server accepted the manifests", not "the new Pods are healthy". You need \code{--wait} (and honestly, a real readiness gate in CI) before treating a Helm exit code as a deployment result.
+\end{misconception}
+
+\begin{seniornote}
+The \code{replicas} template guard above is one of the most valuable eight lines in a production chart. If the chart hardcodes \code{replicas: 5} while an HPA has scaled the Deployment to 14, the next unrelated \code{helm upgrade} sets the field back to 5, the API server kills nine Pods, and the HPA spends the next few minutes scaling back up --- during which you are under-provisioned. Omit fields another controller owns.
+\end{seniornote}
+
+\glabel{When should I use it?} As soon as you have more than one environment, or more than one team consuming the same deployment shape, or a third-party component you would otherwise install by pasting a vendor's YAML.
+
+\glabel{When should I \emph{not}?} For a single application in a single environment, a \code{kustomize} overlay is simpler and involves no templating language --- Kustomize patches structured YAML rather than generating text, so it cannot produce syntactically invalid output. And once a chart's templates are more \code{if} than manifest, the chart has become a program; that is the signal to split it, not to add another conditional.
+
+\begin{tradeoff}
+Helm templates \emph{text}, not YAML. That is why indentation helpers like \code{nindent} exist and why a stray space produces a parse error hundreds of lines from its cause. Kustomize manipulates parsed YAML structures, so it is structurally safe but far less expressive --- there are no loops and no conditionals. Teams commonly land on: Helm for anything published or shared across teams, Kustomize overlays for internal per-environment tweaks. Both are first-class; \code{kubectl} ships Kustomize built in.
+\end{tradeoff}
+
+\wbsub{3.2\quad Ingress, Ingress Controllers and TLS Termination}
+
+\glabel{What is it?} An \code{Ingress} is an API object describing HTTP routing rules: for host \code{api.example.com}, path \code{/orders}, send traffic to Service \code{order-api} on port 8080; and here is the Secret holding the TLS certificate for that host. An \keyterm{Ingress controller} is a separate program running in the cluster that reads those objects and makes them true.
+
+\glabel{Why does it exist?} On Day 5 you exposed a Service with \code{type: LoadBalancer}, and the cloud provider provisioned a load balancer. That is fine for one service. For forty services it means forty load balancers, forty public IPs, forty DNS records, forty certificates and forty monthly line items --- and no shared place to put authentication, rate limiting or request logging. Before Ingress, teams solved this by running their own NGINX or HAProxy in the cluster and regenerating its config file from a script that polled the API server. Ingress standardised that pattern: the routing intent became an API object, and the config-regenerating proxy became a supported component.
+
+\glabel{How does it work internally?} An Ingress controller is a reverse proxy plus a control loop, in the same process or Pod. The loop opens a \emph{watch} on the API server for Ingress, Service, EndpointSlice and Secret objects. A watch is a long-lived streamed connection --- the controller does not poll; the API server pushes ADDED/MODIFIED/DELETED events as they happen. On each event the controller recomputes its own desired configuration, and if it differs from what the proxy is currently running, it applies the difference and updates the Ingress object's \code{status.loadBalancer} field so \code{kubectl get ingress} shows an address.
+
+The subtle part is \emph{how} the difference is applied, and it is exactly where Shopify's engineering effort went. A naive controller writes a new \code{nginx.conf} and reloads. NGINX reloads gracefully --- old workers drain, new workers start --- but during a deploy, Pod churn produces a reload every few seconds, each one spawning worker processes and dropping keepalive connections; Shopify measured this as real added end-user latency. Their fix, contributed upstream, was to split configuration into two classes: \emph{structural} changes (a new host, a new path, a changed annotation) still require a reload, while \emph{endpoint} changes (a Pod came or went) are pushed over an internal HTTP endpoint into a Lua shared dictionary that the request path reads on every request. Pod churn therefore stopped causing reloads at all. That two-tier design --- slow path for structure, fast path for membership --- is the standard architecture for every serious data-plane component you will meet.
+
+\begin{wbfigure}{Fig 6.3 — The Ingress controller as a control loop: it watches the API server and rewrites its own data plane. One load balancer serves every host and path.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 10mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxghost] (net) {Internet};
+  \node[wbboxcloud, right=of net] (lb) {Cloud LB\\one, not forty};
+  \node[wbboxaccent, right=24mm of lb] (ic) {Ingress controller\\proxy + watch loop};
+  \node[wbboxk8s, above right=5mm and 12mm of ic] (s1) {Service api\\$\rightarrow$ Pods};
+  \node[wbboxk8s, below right=5mm and 12mm of ic] (s2) {Service web\\$\rightarrow$ Pods};
+  \draw[wbflow] (net)--(lb); \draw[wbflow] (lb)--node[wbcap,above]{TLS ends here}(ic);
+  \draw[wbflow] (ic)--node[wbcap,above,sloped]{/api}(s1);
+  \draw[wbflow] (ic)--node[wbcap,below,sloped]{/}(s2);
+  \node[wbbox, below=12mm of ic] (api) {API server};
+  \draw[wbarrowg] (api)--node[wbcap,left,align=right]{watch:\\Ingress · EndpointSlice\\· Secret}(ic);
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(ic)(s1)(s2)(api)] (cl) {};
+    \node[wbzonelabelk8s, anchor=north west] at (cl.north west) {cluster};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{k8sbox}[ingress.yaml -- host and path routing with TLS]
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cloudbase
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx        # WHICH controller owns this object
+  tls:
+    - hosts: [api.cloudbase.example]
+      secretName: cloudbase-tls  # cert-manager creates and renews this
+  rules:
+    - host: api.cloudbase.example
+      http:
+        paths:
+          - path: /orders
+            pathType: Prefix
+            backend:
+              service:
+                name: order-api
+                port: { number: 8080 }
+\end{k8sbox}
+
+\begin{behind}
+\code{ingressClassName} exists because a cluster can run several controllers at once --- an internal one for private traffic and an external one for public. Each controller only acts on Ingress objects whose class matches its own. Omit the field on a cluster with no default IngressClass and \emph{nothing happens}: the object is created, \code{kubectl get ingress} shows an empty ADDRESS column forever, and there is no error anywhere, because no controller ever considered the object its business. This is the single most common "my Ingress does not work" cause.
+\end{behind}
+
+\glabel{TLS termination.} Terminating TLS means the controller completes the handshake, decrypts, and forwards plaintext HTTP to the Pod over the cluster network. The certificate and private key live in a \code{kubernetes.io/tls} Secret; the controller loads them and selects one per hostname using SNI, the TLS extension that carries the requested hostname in the ClientHello \emph{before} the certificate is chosen. That is what allows one IP and one port to serve dozens of certificates.
+
+Automating issuance is cert-manager's job, and it is another control loop. You declare an \code{Issuer} or \code{ClusterIssuer} pointing at an ACME directory (RFC 8555 --- Let's Encrypt is one implementation). cert-manager watches Ingress objects for its annotation, creates a \code{Certificate}, then an \code{Order}, then a \code{Challenge}. For an HTTP-01 challenge it spins up a temporary solver Pod, a Service and a temporary Ingress so that the ACME server's request to \code{/.well-known/acme-challenge/<token>} on your public hostname is routed to the solver, which returns the expected key authorisation. On success cert-manager writes the certificate into the Secret, deletes the temporary objects, and schedules renewal well before expiry --- typically at around two-thirds of the certificate's lifetime, so a failure has weeks of runway rather than hours.
+
+\begin{secwarn}[terminating TLS is not the same as having encryption]
+After termination, traffic from the controller to your Pods is plaintext on the cluster network. For most workloads that is an accepted trade-off, because the pod network is considered a trusted zone. It stops being acceptable the moment you handle regulated data, run untrusted tenants in the same cluster, or cross an availability zone on a shared network. The answers are re-encryption to the backend, or a service mesh doing mutual TLS between every Pod --- and the honest cost is another control plane to operate. Decide deliberately; do not let "we have HTTPS" end the conversation at the load balancer.
+\end{secwarn}
+
+\begin{opsnote}[what changed recently, and why it matters to you]
+The Kubernetes project announced in November 2025 that \code{ingress-nginx} --- for years the default choice, and by Datadog's measurement present in roughly half of cloud-native environments --- would be retired in March 2026, with no further releases including security fixes. The stated migration path is the \keyterm{Gateway API}, the successor to Ingress, which splits the single overloaded object into role-oriented resources: \code{GatewayClass} and \code{Gateway} for the platform team, \code{HTTPRoute} for the application team. Existing installs keep working; they simply stop receiving patches. Learn Ingress --- it is what the overwhelming majority of running clusters use and what you will be handed --- but write new platform work against Gateway API, and know that "which controller, and is it maintained?" is now a live production question rather than a detail.
+\end{opsnote}
+
+\wbsub{3.3\quad Probes, Requests and Limits --- The Contract With the Node}
+
+\glabel{What is it?} Probes are periodic checks the kubelet performs against a container. Requests and limits are the numbers the scheduler and the kernel use to decide where a Pod runs and how much it may consume.
+
+\glabel{Why does it exist?} "The process is running" is a uselessly weak definition of healthy. A JVM that has deadlocked every request thread is running. A service whose connection pool is exhausted is running. Kubernetes needs two different and independent answers: \emph{should I restart this?} and \emph{should I send it traffic?} Before orchestrators, both questions were answered by an external monitoring system and a human paged at 3\,am.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} X L{40mm}@{}}
+\wbtablehead{Probe} & \wbtablehead{Question it answers} & \wbtablehead{Action on failure}\\
+Liveness & Is this process wedged beyond recovery? & kubelet kills the container; restart policy applies\\
+Readiness & Can it serve a request \emph{right now}? & Pod is removed from the Service's EndpointSlice --- no restart\\
+Startup & Has a slow boot finished? & Liveness and readiness are suppressed until it passes; failure kills the container\\
+\end{tabularx}
+\end{center}
+
+\glabel{How does it work internally?} The kubelet on the node --- not the control plane --- runs every probe. On failure it increments a counter and only acts after \code{failureThreshold} consecutive failures, which is why a probe's \emph{effective} timeout is \code{periodSeconds} $\times$ \code{failureThreshold}, not \code{timeoutSeconds}. A readiness failure causes the kubelet to update the Pod's status condition; the endpoints controller observes that and removes the Pod's address from the EndpointSlice; kube-proxy (or the Ingress controller reading EndpointSlices directly) stops sending it traffic. Notice this is several hops of eventual consistency --- there is a real window, typically a second or two, during which a not-ready Pod still receives requests. That window is why a graceful shutdown that keeps serving during its termination grace period matters, and it is Day 1's SIGTERM discussion resurfacing.
+
+\begin{k8sbox}[deployment.yaml -- probes and resources, deliberately separated]
+readinessProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+  periodSeconds: 5
+  failureThreshold: 2      # out of rotation fast
+livenessProbe:
+  httpGet: { path: /actuator/health/liveness, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 6      # restart slow: 60s of sustained failure
+startupProbe:
+  httpGet: { path: /actuator/health/readiness, port: 8080 }
+  periodSeconds: 5
+  failureThreshold: 30     # allows a 150s cold start, once
+resources:
+  requests: { cpu: "250m", memory: "256Mi" }
+  limits:   { memory: "512Mi" }
+\end{k8sbox}
+
+\begin{reliability}
+Never let a downstream dependency influence the liveness probe. If the liveness endpoint checks the database and the database has a slow ten minutes, every replica fails liveness simultaneously, every replica is killed simultaneously, every replica cold-starts and reopens connections into an already-struggling database, and you have converted a degradation into an outage. Liveness answers "is \emph{this process} wedged?" and nothing else. Readiness may check dependencies, because its consequence --- being removed from rotation --- is reversible and does not amplify load.
+\end{reliability}
+
+\glabel{Requests and limits, honestly.} A \keyterm{request} is a scheduling reservation: the scheduler will only place the Pod on a node whose unreserved capacity covers it, and the sum of requests on a node can never exceed its allocatable capacity. A \keyterm{limit} is a runtime ceiling enforced by kernel cgroups --- exactly the cgroups from Day 4.
+
+The two resources behave completely differently at the ceiling, and this is a favourite interview question with a mechanical answer. CPU is \emph{compressible}: the kernel's CFS bandwidth controller gives the cgroup a quota of microseconds per 100\,ms period, and when it is exhausted the tasks are simply descheduled until the next period. The process does not fail; it goes slow, and \code{container\_cpu\_cfs\_throttled\_seconds\_total} goes up. Memory is \emph{incompressible}: there is no way to give a process less memory than it has already allocated, so when the cgroup exceeds its limit the kernel OOM killer terminates a process in it. The container exits 137 --- Day 1's $128 + 9$ --- and Kubernetes reports \code{OOMKilled}.
+
+\begin{perfnote}
+CPU \emph{limits} are the most contested setting in Kubernetes. Setting a low limit on a latency-sensitive service causes throttling in exactly the bursty moments that matter, and the resulting p99 latency spikes look like an application bug for weeks. Many mature teams set CPU requests carefully and omit CPU limits entirely, relying on requests for fair share under contention, while always setting memory requests \emph{and} limits at the same value for critical services --- which additionally earns the Pod the Guaranteed QoS class, making it the last thing evicted when a node runs short. Whatever you choose, choose it from a load test, not from a template someone copied in 2021.
+\end{perfnote}
+
+\wbsub{3.4\quad The Horizontal Pod Autoscaler Control Loop}
+
+\glabel{What is it?} A controller that periodically adjusts a Deployment's replica count so that an observed metric stays near a target you declare.
+
+\glabel{Why does it exist?} Capacity planning by hand means provisioning for peak and paying for it at 4\,am. Before autoscaling, teams either over-provisioned permanently or ran a cron job that scaled up at 08:00 and down at 20:00 --- which handles the daily curve and nothing else, and fails precisely on the unusual day when it matters.
+
+\glabel{How does it work internally?} This is the part to memorise, because it explains nearly every surprising HPA behaviour. Every 15 seconds by default, the controller reads the current metric for each Pod belonging to the target, computes the mean across ready Pods, and evaluates:
+
+\begin{center}\small\ttfamily
+desiredReplicas = ceil[ currentReplicas $\times$ ( currentMetricValue / desiredMetricValue ) ]
+\end{center}
+
+Three consequences follow immediately. First, it is a \emph{ratio}, so at 90\% observed against a 70\% target with 4 replicas you get \code{ceil(4 * 90/70) = ceil(5.14) = 6}. Second, because of \code{ceil}, small clusters over-shoot: with 1 replica any excess at all produces at least 2. Third, the controller applies a \keyterm{tolerance} --- historically a fixed 10\%, and configurable per-direction since Kubernetes v1.33 --- and does nothing at all when the ratio is within it. That hysteresis is deliberate: without it the loop would oscillate around the target forever. Scale-down is further damped by a stabilisation window (five minutes by default) during which the controller uses the \emph{highest} recommendation it has seen, so a brief dip does not tear down capacity you are about to need.
+
+\begin{wbfigure}{Fig 6.4 — The HPA loop. Note the two dampers: the tolerance band and the scale-down stabilisation window.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.2mm, align=left, text width=56mm}]
+  \node[stg] (a) {\textbf{1 · Read metrics API} \hfill \scriptsize metrics.k8s.io / custom / external};
+  \node[stg, below=of a] (b) {\textbf{2 · Mean over ready Pods} \hfill \scriptsize unready Pods excluded};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{3 · ceil(replicas x ratio)} \hfill \scriptsize current / target};
+  \node[stg, wbboxwarn, below=of c] (d) {\textbf{4 · Inside tolerance? do nothing} \hfill \scriptsize hysteresis};
+  \node[stg, wbboxops, below=of d] (e) {\textbf{5 · Clamp to min/max, stabilise} \hfill \scriptsize 5 min scale-down window};
+  \node[stg, wbboxgood, below=of e] (f) {\textbf{6 · Patch the scale subresource} \hfill \scriptsize Deployment reconciles};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f}{\draw[wbarrow] (\x)--(\y);}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{k8sbox}[hpa.yaml -- autoscaling/v2, with explicit behaviour]
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: order-api }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: order-api }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0     # react immediately to load
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      stabilizationWindowSeconds: 600   # shed capacity slowly
+      policies: [{ type: Percent, value: 25, periodSeconds: 60 }]
+\end{k8sbox}
+
+\begin{misconception}
+\code{averageUtilization: 70} does not mean "70\% of a CPU core" or "70\% of the node". It is 70\% of the container's CPU \emph{request}. A Pod requesting \code{250m} and using \code{200m} is at 80\% utilisation and will trigger scale-up, even though it is using a fifth of a core on a machine that is 90\% idle. Changing a request therefore silently changes every HPA target derived from it --- which is why request tuning and autoscaler tuning have to happen in the same conversation.
+\end{misconception}
+
+\begin{behind}
+The HPA does not read Prometheus, and it does not read the kubelet. It reads three aggregated APIs: \code{metrics.k8s.io} for CPU and memory (implemented by metrics-server, which is not installed by default in a vanilla cluster), \code{custom.metrics.k8s.io} for metrics attached to Kubernetes objects, and \code{external.metrics.k8s.io} for metrics with no Kubernetes object at all --- an SQS queue depth, a Kafka consumer lag. Something must implement each. Zalando's \code{kube-metrics-adapter} implements the latter two, letting them autoscale on Skipper's request rate, SQS backlog or an arbitrary Prometheus query. "The HPA shows \code{<unknown>} for the metric" almost always means the API exists but nothing is serving it.
+\end{behind}
+
+\begin{scalenote}
+CPU is a lagging indicator for request-driven services: by the time CPU is at 70\%, latency has usually already degraded. Scaling on requests-per-second or on queue depth is leading, and it is why Zalando built the adapter rather than living with the default. Note also that the HPA only adds Pods --- if the cluster has no room for them the new Pods sit \code{Pending} until a \emph{cluster} autoscaler adds a node, which takes minutes. Pod autoscaling without node autoscaling has a hard ceiling you will find during an incident.
+\end{scalenote}
+
+\wbsub{3.5\quad RBAC --- Least Privilege on the API Server}
+
+\glabel{What is it?} Role-Based Access Control decides whether a given identity may perform a given verb on a given resource. Four object types: \code{Role} and \code{ClusterRole} carry the permissions; \code{RoleBinding} and \code{ClusterRoleBinding} attach them to subjects (users, groups, ServiceAccounts).
+
+\glabel{Why does it exist?} Every Pod can reach the API server. Without authorisation, a compromised container --- or a buggy one --- could list every Secret in the cluster, including database passwords and the TLS private keys from the previous section. RBAC is the enforcement point that makes container compromise a contained incident rather than a cluster compromise.
+
+\glabel{How does it work internally?} A request arrives at the API server and passes through three phases: authentication (who are you?), authorisation (may you?), then admission controllers (should this specific object be allowed, and should it be mutated?). RBAC is an authoriser. It gathers every Role and ClusterRole bound to the subject and asks whether any rule matches the request's apiGroup, resource, verb and --- for a namespaced request --- namespace. \textbf{RBAC is purely additive: there are no deny rules.} If no rule matches, the request is denied by default; if any rule matches, it is allowed. You cannot "subtract" a permission by adding an object --- you have to remove the binding that granted it.
+
+The scoping rules trip everyone up once, so learn them as a two-by-two: a Role is namespaced and grants inside its namespace; a ClusterRole is cluster-scoped; a RoleBinding grants only within its own namespace; a ClusterRoleBinding grants everywhere. The useful diagonal is a RoleBinding referencing a ClusterRole --- that grants the ClusterRole's permissions but only inside the binding's namespace, which is how you define a reusable "developer" permission set once and bind it to twelve team namespaces.
+
+\begin{k8sbox}[rbac.yaml -- the ServiceAccount CloudBase's API actually needs]
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: cloudbase-api, namespace: cloudbase }
+automountServiceAccountToken: false   # this app never calls the API
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: config-reader, namespace: cloudbase }
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cloudbase-feature-flags"]   # ONE object, not all
+    verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: config-reader, namespace: cloudbase }
+subjects:
+  - kind: ServiceAccount
+    name: cloudbase-api
+roleRef:
+  kind: Role
+  name: config-reader
+  apiGroup: rbac.authorization.k8s.io
+\end{k8sbox}
+
+\begin{secwarn}[the default ServiceAccount is a real attack path]
+Every namespace has a \code{default} ServiceAccount, and any Pod that does not name one gets it. By default its token is mounted into the container at \code{/var/run/secrets/kubernetes.io/serviceaccount/token}, so anyone with code execution in that container has a cluster credential in a known path. Two disciplines fix this: give every workload its own ServiceAccount with an explicitly scoped Role, and set \code{automountServiceAccountToken: false} on every Pod that never talks to the API server --- which is most of them. Never bind \code{cluster-admin} to a workload identity to clear a \code{Forbidden} error; read the error, which names the exact apiGroup, resource and verb that was refused, and grant that.
+\end{secwarn}
+
+\begin{behind}
+Since Kubernetes 1.24, ServiceAccounts no longer get a permanent Secret containing a never-expiring JWT. Pods receive a \emph{projected} token: short-lived, automatically rotated by the kubelet, and bound both to an audience and to the Pod object itself --- so it is invalidated when the Pod is deleted and is rejected by any service that checks the audience. If you find a long-lived ServiceAccount token in a CI system or a \code{.kube/config}, that is a legacy credential and it is a finding, not a configuration.
+\end{behind}
+
+\begin{prodtip}
+\code{kubectl auth can-i --list --as=system:serviceaccount:cloudbase:cloudbase-api} prints everything an identity may do, without needing that identity's credentials. Run it against your own workloads before an audit runs it against you, and put it in CI as an assertion: if the list grows, the pull request that grew it has to say why.
+\end{prodtip}
+
+\wbsub{3.6\quad StatefulSets and PersistentVolumes}
+
+\glabel{What is it?} A StatefulSet manages Pods that need a \emph{stable identity} and \emph{stable storage}: ordinal names (\code{db-0}, \code{db-1}), a stable DNS name per Pod via a headless Service, and a PersistentVolumeClaim per Pod that follows that ordinal across rescheduling.
+
+\glabel{Why does it exist?} A Deployment's Pods are deliberately interchangeable --- random name suffixes, any Pod can replace any other, and a shared volume would be shared by all of them. That model is wrong for anything that keeps data or forms a cluster. A PostgreSQL replica must know it is replica 2 and must find the same 200\,GB it had before the node was drained. A Kafka broker's identity determines which partitions it leads. Before StatefulSets, teams ran databases on pet VMs outside the cluster precisely because the orchestrator had no vocabulary for identity.
+
+\glabel{How does it work internally?} Three mechanisms. First, ordinals: Pods are created \code{0, 1, 2, \ldots} in order, and by default the controller waits for each to become Ready before creating the next; deletion runs in reverse. Second, network identity: paired with a headless Service (\code{clusterIP: None}), each Pod gets a resolvable DNS record \code{db-0.db.cloudbase.svc.cluster.local} that survives rescheduling. Third, storage: \code{volumeClaimTemplates} makes the controller create one PVC \emph{per ordinal} rather than one shared claim. That PVC binds to a PersistentVolume through a StorageClass, whose CSI driver provisions the real disk --- an EBS volume, a Ceph RBD image. When \code{db-1} is rescheduled onto another node, the CSI driver detaches the volume from the old node and attaches it to the new one, and the same data comes back.
+
+\begin{wbfigure}{Fig 6.5 — StatefulSet identity: each ordinal owns a DNS name and its own volume, both of which survive rescheduling.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxk8s] (h) {Headless Service\\clusterIP: None};
+  \node[wbboxk8s, below left=7mm and 6mm of h] (p0) {db-0};
+  \node[wbboxk8s, below=7mm of h] (p1) {db-1};
+  \node[wbboxk8s, below right=7mm and 6mm of h] (p2) {db-2};
+  \draw[wbarrowg] (h)--(p0); \draw[wbarrowg] (h)--(p1); \draw[wbarrowg] (h)--(p2);
+  \node[wbcyl, below=6mm of p0] (v0) {pvc-db-0};
+  \node[wbcyl, below=6mm of p1] (v1) {pvc-db-1};
+  \node[wbcyl, below=6mm of p2] (v2) {pvc-db-2};
+  \draw[wbarrow] (p0)--(v0); \draw[wbarrow] (p1)--(v1); \draw[wbarrow] (p2)--(v2);
+  \begin{scope}[on background layer]
+    \node[wbzonek8s, fit=(h)(p0)(p2)(v0)(v2)] (ns) {};
+    \node[wbzonelabelk8s, anchor=north west] at (ns.north west) {namespace cloudbase};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{k8sbox}[statefulset.yaml -- identity and per-Pod storage]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: db }
+spec:
+  serviceName: db          # MUST match the headless Service name
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60   # let the DB checkpoint
+      containers:
+        - name: postgres
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3
+        resources: { requests: { storage: 200Gi } }
+\end{k8sbox}
+
+\begin{misconception}
+A StatefulSet does not replicate your data, elect a leader, or handle failover. It gives three Pods stable names and three separate disks; making \code{db-1} a replica of \code{db-0} is entirely your database's configuration and your responsibility. This is why production teams either run a purpose-built \keyterm{operator} --- a controller encoding an expert's runbook for backup, failover and version upgrade --- or use a managed database and keep the cluster stateless. "We put Postgres in a StatefulSet" is the beginning of the work, not the end of it.
+\end{misconception}
+
+\begin{drtip}
+Deleting a StatefulSet does not delete its PVCs, and that default has saved a lot of data. It also means orphaned volumes accumulate and keep billing --- a genuine and commonly overlooked cloud cost. More importantly: a replicated database is not a backup. Replication faithfully copies a \code{DROP TABLE} to every replica within milliseconds. You need snapshots with a tested restore path, and the restore has to be tested on a schedule, because an untested backup is a hypothesis.
+\end{drtip}
+
+\glabel{When should I \emph{not} use a StatefulSet?} When a managed service will do. Running your own database on Kubernetes means owning backups, failover, version upgrades, storage expansion and the CSI driver's failure modes. Choose it when you have a genuine reason --- cost at scale, a database with no managed equivalent, a strict data-residency constraint --- and staff it accordingly. For most teams below a certain size, RDS plus a stateless cluster is the correct engineering decision, and saying so out loud is a senior move.
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item One chart, many values files. Environments differ by data, never by a forked copy of the templates.
+  \item Omit \code{replicas} from the chart whenever an HPA owns the Deployment.
+  \item Always set \code{ingressClassName}; never rely on a cluster default you did not configure.
+  \item Separate liveness from readiness, and never put a dependency check in liveness.
+  \item Set memory requests and limits on every container; derive them from a load test, not a template.
+  \item Give every workload its own ServiceAccount, and disable token automount where it is not needed.
+  \item Automate certificate renewal, then alert on days-to-expiry anyway --- automation fails silently.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Exposing every Service with \code{type: LoadBalancer} instead of one Ingress.
+  \item Leaving resource limits unset, letting one runaway Pod starve every neighbour on its node.
+  \item Wiring a database check into the liveness probe, producing cluster-wide restart storms.
+  \item Binding the default ServiceAccount to \code{cluster-admin} to make a \code{Forbidden} error go away.
+  \item Expecting an HPA to work without metrics-server installed, then debugging the HPA.
+  \item Assuming a StatefulSet gives you replication, failover or backups. It gives you none of them.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the loop, you can debug the loop.
+
+\begin{writespace}[Redraw: a request from the internet to a Pod --- LB, Ingress controller, TLS termination, Service, EndpointSlice --- and mark where the controller's watch connection to the API server sits]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Write out the HPA formula, then work it: 6 replicas, target 70\%, observed 40\%. Does it scale down? Now observed 76\% --- does it scale up? Say why in one line each]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Production-Shaping CloudBase}
+
+\textbf{Goal.} Take Day 5's raw manifests and turn them into something you would defend in a design review: a chart, an Ingress with real TLS, honest probes, a working HPA and a scoped ServiceAccount. Work in a local cluster (kind or minikube) with an ingress controller and metrics-server installed.
+
+\resetlab
+\labstep{Convert the manifests into a chart, mechanically first}
+Create the chart skeleton, move Day 5's YAML into \code{templates/} unchanged, and confirm \code{helm template} reproduces byte-identical output before you parameterise anything.
+\labwhy{Separating "restructure" from "parameterise" means that when the diff is wrong you know which of the two steps broke it. This is the same discipline as never mixing a refactor with a behaviour change in one commit.}
+
+\labstep{Parameterise only what actually differs between environments}
+Extract image tag, replica count, resources, hostname and the autoscaling and ingress toggles. Leave everything else hardcoded.
+\labwhy{Every value you expose is a value someone can set wrong. A chart with forty knobs has forty untested configurations; a chart with six has six.}
+
+\labstep{Install with two values files and inspect the release ledger}
+Install to a \code{dev} namespace and a \code{staging} namespace from the same chart, then read the release Secret to see what Helm stored.
+\labwhy{Seeing the gzipped manifests inside \code{sh.helm.release.v1} makes rollback stop being magic --- you can point at where the previous revision physically lives.}
+
+\labstep{Add the Ingress and prove the class matters}
+Enable the Ingress, then deliberately remove \code{ingressClassName} and observe that the object is created, no controller claims it, and \code{ADDRESS} stays empty with no error anywhere.
+\labwhy{Creating this failure once, on purpose, immunises you against the most common Ingress support ticket in existence.}
+
+\labstep{Terminate TLS and watch the ACME objects appear and vanish}
+Add a ClusterIssuer and the cert-manager annotation, then watch Certificate, Order and Challenge objects, plus the temporary solver Pod, while the certificate is issued.
+\labwhy{Watching the temporary objects appear and be cleaned up teaches the challenge flow far better than reading it, and it is exactly what you will inspect when issuance is stuck.}
+
+\labstep{Separate the probes and break each one independently}
+Give readiness a fast threshold and liveness a slow one. Make readiness fail (a toggle endpoint) and confirm the Pod leaves the EndpointSlice without restarting. Then make liveness fail and watch the restart count climb.
+\labwhy{The distinction only becomes real once you have seen the two different consequences with your own \code{kubectl get pods -w}.}
+
+\labstep{Load-test, then set requests and limits from the measurement}
+Generate load, record actual CPU and memory, and set requests near the observed steady state. Then set a deliberately low CPU limit and watch throttling metrics rise while the Pod stays alive.
+\labwhy{This is the difference between throttled and OOMKilled, felt rather than read --- and it is where your requests stop being a guess.}
+
+\labstep{Enable the HPA and predict its arithmetic before it acts}
+With the HPA active, apply load and, before looking, compute the replica count the formula demands. Then remove the load and time how long scale-down takes.
+\labwhy{Predicting the number turns the HPA from a black box into arithmetic. The scale-down delay you measure is the stabilisation window, and it will explain a future "why is it still at 12 replicas" question in seconds.}
+
+\begin{prodtip}
+Run \code{helm upgrade} while the HPA has scaled the Deployment above \code{replicaCount}. If the chart still hardcodes \code{replicas}, you will watch the API server delete Pods you need. Fix it with the template guard from Section 3.1 and run the same test again --- this is a five-minute experiment that prevents a real, embarrassing incident.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+The HPA rounds up with \code{ceil} and refuses to act inside a tolerance band. Both choices cost efficiency: you run more Pods than the ratio strictly demands, and you tolerate being off-target. What failure would each choice's absence produce, and what does that tell you about designing any feedback controller that acts on a noisy signal?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+RBAC is purely additive and has no deny rules. Cloud IAM (Day 12) does have explicit denies. What class of mistake does each design make easy, and which would you rather debug at 2\,am with an incident channel watching?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Shopify's fix was to split the Ingress controller's configuration into a slow path (reload for structural change) and a fast path (in-memory update for endpoint change). Name two other systems you have met that use the same split, and say what property makes a change eligible for the fast path.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{The HPA that will not scale during a traffic spike}
+\textbf{Symptom.} CPU on the order-api Pods is pinned, latency is climbing, and the HPA has been sitting at \code{minReplicas} for twenty minutes.
+
+\begin{outbox}[kubectl get hpa and describe]
+NAME        REFERENCE              TARGETS         MINPODS  MAXPODS  REPLICAS
+order-api   Deployment/order-api   <unknown>/70%   3        20       3
+
+Conditions:
+  Type           Status  Reason                  Message
+  AbleToScale    True    SucceededGetScale       the HPA controller was able to get
+  ScalingActive  False   FailedGetResourceMetric unable to get metrics for resource
+                                                 cpu: no metrics returned from
+                                                 resource metrics API
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The target reads \code{<unknown>}, not a number. The HPA is not making a wrong decision --- it has no input at all.
+  \item \textbf{Hypothesise.} Either nothing is serving \code{metrics.k8s.io}, or it is serving but has no data for these Pods.
+  \item \textbf{Investigate.} \code{kubectl get apiservices | grep metrics} to see whether the aggregated API is registered and Available; then \code{kubectl top pods}, which uses the same API and fails the same way.
+  \item \textbf{Root cause.} metrics-server is not installed --- it is not part of a vanilla cluster. (The near neighbour: it is installed but its Pod is CrashLooping on kubelet TLS verification.)
+  \item \textbf{Fix.} Install metrics-server; confirm \code{kubectl top pods} returns values; the HPA target populates within one loop period.
+  \item \textbf{Prevent.} Treat metrics-server as a cluster prerequisite provisioned with the cluster, and alert on the HPA's \code{ScalingActive=False} condition --- a silently inert autoscaler is worse than none, because you believe you are protected.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Certificate served is the wrong one, and browsers refuse the site}
+\textbf{Symptom.} After adding a new hostname, clients get \code{NET::ERR\_CERT\_COMMON\_NAME\_INVALID}. The controller is serving its own default self-signed certificate instead of the Let's Encrypt one.
+
+\begin{outbox}[kubectl describe challenge and get secret]
+Name:    cloudbase-tls-1-2937482
+Status:  pending
+Reason:  Waiting for HTTP-01 challenge propagation: failed to perform self check
+         GET request: Get "http://api.cloudbase.example/.well-known/acme-
+         challenge/6Xk...": dial tcp 203.0.113.9:80: connect: connection refused
+
+NAME             TYPE                DATA   AGE
+cloudbase-tls    kubernetes.io/tls   0      14m
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The Secret exists but holds zero keys --- issuance never completed --- and the Challenge is stuck on its own self-check over plain HTTP on port 80.
+  \item \textbf{Hypothesise.} Either DNS does not point at this controller's load balancer, or port 80 is closed, or an HTTPS redirect is rewriting the challenge path before the solver sees it.
+  \item \textbf{Investigate.} Resolve the hostname and compare with the Ingress \code{ADDRESS}; check the load balancer's port 80 listener and security group; \code{curl} the challenge path from outside the cluster and see what answers.
+  \item \textbf{Root cause.} The load balancer was configured for 443 only, so the ACME server's HTTP-01 request could never arrive. Port 80 must stay reachable for the challenge even on an HTTPS-only site.
+  \item \textbf{Fix.} Open port 80 to the controller and exempt \code{/.well-known/acme-challenge/} from the force-HTTPS redirect; the Challenge clears and the Secret fills within a minute.
+  \item \textbf{Prevent.} Alert on \code{Certificate} objects whose Ready condition is False and on days-to-expiry below thirty --- so a broken renewal surfaces weeks early rather than as an outage. Consider DNS-01 challenges instead, which need no inbound HTTP at all and are the only option for wildcard certificates.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~45 min}
+\textbf{Goal.} Convert a two-file manifest set into a chart and perform a real rollback.\\
+\textbf{Business context.} A bad image tag reached staging and the team took eleven minutes to revert by hand.\\
+\textbf{Architecture.} One chart, one Deployment, one Service, two values files.\\
+\textbf{Requirements.} Install, upgrade to a deliberately broken image tag, observe the failure, roll back to the previous revision.\\
+\textbf{Constraints.} No \code{kubectl edit} --- everything through Helm, so the ledger stays truthful.\\
+\textbf{Hints.} \code{helm history} shows revisions; \code{helm get manifest <rel> --revision N} shows exactly what was applied.\\
+\textbf{Expected outcome.} Rollback under thirty seconds, with the release history explaining what happened.\\
+\textbf{Production considerations.} What makes a rollback \emph{unsafe}? (Start with database migrations.)\\
+\textbf{Common pitfalls.} Editing objects with \code{kubectl} between Helm operations, so the ledger and reality diverge.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~75 min}
+\textbf{Goal.} Route two services through one Ingress with TLS, and prove the load-balancer saving.\\
+\textbf{Business context.} Finance flagged the cloud bill: fourteen load balancers for fourteen services.\\
+\textbf{Architecture.} One Ingress controller, one Ingress object, two Services, one hostname, two paths.\\
+\textbf{Requirements.} Path-based routing to both backends, TLS terminating at the controller, HTTP redirected to HTTPS.\\
+\textbf{Constraints.} Exactly one \code{LoadBalancer} Service in the whole cluster --- the controller's.\\
+\textbf{Hints.} Use a local issuer or self-signed certificate if you have no public DNS; the flow is identical.\\
+\textbf{Expected outcome.} Both paths reachable over HTTPS through a single address, with the certificate served by SNI.\\
+\textbf{Production considerations.} Write down what breaks if the controller Pod is a single replica, and fix it.\\
+\textbf{Common pitfalls.} A missing \code{ingressClassName}; a wrong \code{pathType}; the TLS Secret in the wrong namespace --- it must be in the Ingress's namespace.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2.5 h}
+\textbf{Goal.} Take CloudBase from "running" to "defensible in a design review".\\
+\textbf{Business context.} A traffic event is scheduled in two weeks; the service must scale and must not be a lateral-movement path.\\
+\textbf{Architecture.} Chart with dev/staging/prod values $\rightarrow$ Ingress with TLS $\rightarrow$ Deployment with probes and measured resources $\rightarrow$ HPA 3--20 on CPU $\rightarrow$ scoped ServiceAccount.\\
+\textbf{Requirements.} Load-test-derived requests and limits; separated probes; HPA with explicit scale-up and scale-down behaviour; a Role granting only what the app calls; token automount disabled if it calls nothing.\\
+\textbf{Constraints.} No \code{cluster-admin} anywhere. \code{helm upgrade} must be safe while the HPA is active.\\
+\textbf{Hints.} Record the load-test numbers in the repository next to the values file so the chosen figures are auditable.\\
+\textbf{Expected outcome.} A documented scaling event: load applied, replica count over time, the formula's prediction beside the observed number.\\
+\textbf{Production considerations.} Add a PodDisruptionBudget so a node drain cannot take you below safe capacity.\\
+\textbf{Common pitfalls.} Setting a CPU limit equal to the request and then blaming the application for p99 latency spikes.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{costnote}
+Ingress consolidation is one of the few Kubernetes changes with an immediately legible line-item saving: forty \code{LoadBalancer} Services become one, and forty hourly load-balancer charges plus their data-processing fees become one. The subtler savings are on the other side of the same chapter --- honest requests stop you paying for reserved capacity nobody uses, and scale-down that actually happens stops you paying peak rates at 4\,am. Orphaned PVCs from deleted StatefulSets are the classic silent cost; nothing reminds you they exist except the invoice.
+\end{costnote}
+
+\begin{reliability}
+Add a PodDisruptionBudget to anything that matters. Requests, limits and an HPA govern steady state; a PDB governs \emph{voluntary} disruption --- a node drain during a cluster upgrade, a rebalance. Without one, a routine upgrade can evict every replica of a service at once, and it will do so at exactly the moment your attention is on the upgrade rather than on the application.
+\end{reliability}
+
+\begin{seniornote}
+Everything in this chapter is the same shape: watch a declared state, compute a desired state, write the difference, repeat. The Ingress controller does it to a proxy config, cert-manager to a Secret, the HPA to a replica count, the StatefulSet controller to Pods and PVCs. When you meet an unfamiliar Kubernetes component, three questions get you to competence fast: what does it watch, what does it compute, and what does it write? Then \code{kubectl describe} that object and read the events, which are the loop narrating itself.
+\end{seniornote}
+
+\begin{interview}
+Expect: \emph{"Why do CPU limits throttle but memory limits kill?"} The answer that lands is mechanical, not definitional: CPU is compressible --- the kernel's CFS bandwidth controller hands out a quota per period and simply deschedules the cgroup when it is exhausted, so the process gets slower. Memory is incompressible --- there is no way to take back bytes already allocated, so the kernel's only lever is the OOM killer, and the container exits 137. Then connect it forward: that is why CPU limits show up as p99 latency mysteries and memory limits show up as restart loops.
+\end{interview}
+
+\begin{autotip}
+Render and validate charts in CI before they reach a cluster: \code{helm lint}, then \code{helm template} piped into a policy checker, then a diff of the rendered output against the currently deployed release. Reviewing a diff of \emph{rendered manifests} rather than of template source is the single highest-value habit in Helm-based delivery --- template changes look small and produce large diffs surprisingly often.
+\end{autotip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 1 gave CloudBase a hardened host and a strict bootstrap script; Day 2 put it under version control with reviewable history; Day 3 gave it a network and DNS story; Day 4 turned it into a lean, non-root container image; Day 5 got that image running on Kubernetes as raw manifests --- a Deployment, a Service and a ConfigMap applied by hand. Today those manifests stop being a demo.
+
+\begin{buildalong}[Day 06 — package it, expose it, scale it, scope it]
+\begin{wbitem}
+  \item Convert Day 5's manifests into \code{charts/cloudbase} with \code{Chart.yaml}, \code{values.yaml} and \code{templates/}. Verify \code{helm template} reproduces the Day 5 output before parameterising anything.
+  \item Add \code{values-dev.yaml}, \code{values-staging.yaml} and \code{values-prod.yaml} carrying \emph{only} the deltas: image tag, replicas, resources, hostname, and the ingress and autoscaling toggles.
+  \item Guard \code{replicas} behind \code{if not .Values.autoscaling.enabled} so an upgrade can never fight the autoscaler.
+  \item Add an Ingress with an explicit \code{ingressClassName}, host-and-path routing to the API, and a \code{tls} block naming \code{cloudbase-tls}.
+  \item Install cert-manager, declare a ClusterIssuer against the ACME staging endpoint first, and let it issue and populate the Secret. Move to the production endpoint only once the staging flow is clean.
+  \item Separate the probes: readiness on the dependency-aware endpoint with a fast threshold, liveness on a process-only endpoint with a slow one, plus a startup probe sized to a real cold start.
+  \item Load-test the API and set requests and limits from what you measured. Commit the numbers alongside the values file.
+  \item Add an HPA, 3--20 replicas at 70\% CPU, with \code{behavior} set for fast scale-up and damped scale-down. Record predicted versus observed replica counts during a load run.
+  \item Create a \code{cloudbase-api} ServiceAccount with a Role scoped to the exact resources the app reads, and set \code{automountServiceAccountToken: false} if it reads none.
+  \item Add a StatefulSet plus headless Service and \code{volumeClaimTemplates} for CloudBase's datastore, and write \code{docs/stateful-decision.md} arguing for either this or a managed database --- with the operational cost of each stated plainly.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{helm upgrade --install cloudbase ./charts/cloudbase -f values-prod.yaml} brings up the full stack from a clean namespace; the public hostname serves a valid, automatically issued certificate; a load test moves the replica count between 3 and 20 and back down on its own; \code{kubectl auth can-i --list} for the app's ServiceAccount shows only the permissions you deliberately granted; and a \code{helm rollback} to the previous revision restores the working state in under a minute.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item A Helm chart is templates plus values; a release is a numbered revision stored as a Secret, which is why rollback is instant.
+  \item Helm upgrades use a three-way merge --- old, live, new --- so fields other controllers set are preserved.
+  \item An Ingress is data. An Ingress controller is a reverse proxy watching the API server and rewriting its own config; \code{ingressClassName} decides which one owns the object.
+  \item TLS termination ends encryption at the controller. cert-manager automates ACME issuance and renewal through Certificate, Order and Challenge objects.
+  \item Liveness restarts, readiness de-routes. Never let a dependency failure reach liveness.
+  \item CPU is compressible (throttle), memory is not (OOMKill, exit 137). Set both from measurement.
+  \item \code{desiredReplicas = ceil(currentReplicas × currentMetric / targetMetric)}, damped by a tolerance band and a scale-down stabilisation window.
+  \item RBAC is additive with no deny rules; per-workload ServiceAccounts are the unit of least privilege.
+  \item StatefulSets give identity and storage --- never replication, failover or backups.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item \code{averageUtilization} is a percentage of the container's \emph{request}, not of a core or a node.
+  \item An HPA without metrics-server shows \code{<unknown>} and does nothing, silently.
+  \item The TLS Secret must live in the same namespace as the Ingress that references it.
+  \item \code{ingress-nginx} retires in March 2026 with no further security fixes; new platform work should target the Gateway API.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Hardcoded \code{replicas} fighting an HPA \quad$\bullet$\quad missing \code{ingressClassName} \quad$\bullet$\quad DB check in liveness
+  \item \code{cluster-admin} as a debugging tool \quad$\bullet$\quad limits copied from a blog \quad$\bullet$\quad port 80 closed, so ACME never completes
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Chart}{templates + values + \code{Chart.yaml}; rendered client-side into plain manifests.}
+\cheatitem{Release}{a numbered revision stored as \code{sh.helm.release.v1.<name>.v<N>}; the basis of rollback.}
+\cheatitem{Ingress}{routing data; a controller with a matching \code{ingressClassName} makes it real.}
+\cheatitem{TLS termination}{handshake ends at the controller; certificate chosen per hostname via SNI.}
+\cheatitem{Probes}{liveness restarts · readiness de-routes · startup suppresses both until boot completes.}
+\cheatitem{Requests/limits}{request = scheduling reservation; limit = cgroup ceiling. CPU throttles, memory OOM-kills.}
+\cheatitem{HPA}{\code{ceil(replicas × current/target)}, plus tolerance and a scale-down stabilisation window.}
+\cheatitem{RBAC}{Role/ClusterRole + binding; additive only, no deny; a RoleBinding to a ClusterRole scopes it to one namespace.}
+\cheatitem{StatefulSet}{ordinals + headless DNS + one PVC per Pod. Identity and storage only.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 6 commands worth memorising]
+# helm: render, inspect, ship, revert
+helm template cloudbase ./charts/cloudbase -f values-prod.yaml   # no cluster
+helm upgrade --install cloudbase ./charts/cloudbase -f values-prod.yaml --wait
+helm history cloudbase                  # every revision and its status
+helm get manifest cloudbase --revision 3
+helm rollback cloudbase 3
+
+# ingress & tls
+kubectl get ingress -A                  # empty ADDRESS = no controller claimed it
+kubectl get ingressclass
+kubectl describe certificate cloudbase-tls
+kubectl get order,challenge -A          # ACME flow in progress
+
+# probes, resources, scaling
+kubectl get pods -w                     # watch READY vs RESTARTS separately
+kubectl top pods                        # uses the same API the HPA reads
+kubectl describe hpa order-api          # conditions explain every non-decision
+kubectl get events --sort-by=.lastTimestamp | tail -20
+
+# rbac
+kubectl auth can-i --list --as=system:serviceaccount:cloudbase:cloudbase-api
+kubectl get rolebinding,clusterrolebinding -A -o wide | grep cluster-admin
+
+# stateful
+kubectl get pvc -n cloudbase            # orphaned claims still cost money
+kubectl get statefulset db -o wide
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the difference between a liveness and a readiness probe, concretely --- and what breaks if you conflate them?}
+\iq{Why do CPU limits throttle but memory limits kill?}
+\iq{When would you reach for a StatefulSet instead of a Deployment, and what does it \emph{not} give you?}
+\iq{How does an Ingress Controller reduce the number of cloud load balancers you need, and what does it do when a Pod comes or goes?}
+\iq{What does the Horizontal Pod Autoscaler actually watch, and what formula does it apply?}
+\iq{Why is RBAC least-privilege important even inside a single cluster?}
+\iq{What does Helm store in the cluster, and how does that make \code{helm rollback} instant?}
+\iq{Walk me through what happens between \code{kubectl apply -f ingress.yaml} and a browser getting a valid certificate.}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Kubernetes docs --- \emph{Horizontal Pod Autoscaling}: the exact algorithm, tolerance behaviour and the \code{behavior} field (kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/).
+  \item Kubernetes docs --- \emph{Using RBAC Authorization}: Role vs ClusterRole, binding semantics, and the privilege-escalation prevention rules (kubernetes.io/docs/reference/access-authn-authz/rbac/).
+  \item Kubernetes blog --- \emph{Ingress NGINX Retirement: What You Need to Know} (11 November 2025), and the Gateway API guides at gateway-api.sigs.k8s.io.
+  \item Kubernetes blog --- \emph{Kubernetes v1.33: HorizontalPodAutoscaler Configurable Tolerance}, on per-direction tolerance.
+  \item Helm docs --- \emph{Changes Since Helm 2} (helm.sh/docs/v3/faq/changes\_since\_helm2/): the removal of Tiller, Secret-based release storage and the three-way merge patch.
+  \item cert-manager docs --- \emph{HTTP01 challenge type} (cert-manager.io/docs/configuration/acme/http01/): the solver Pod, Service and temporary Ingress.
+  \item RFC 8555 --- \emph{Automatic Certificate Management Environment (ACME)}: the protocol cert-manager and Let's Encrypt implement.
+  \item Shopify Engineering --- \emph{Iterating Towards a More Scalable Ingress}: the NGINX reload bottleneck and the Lua dynamic-endpoint fix.
+  \item Zalando --- \code{kube-ingress-aws-controller} and \code{kube-metrics-adapter} on GitHub: autoscaling on request rate and queue depth in a 100+ cluster estate.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Every environment ships from one chart; environments differ only by values files.
+  \item \code{replicas} is omitted from any Deployment an HPA owns.
+  \item Every Ingress sets \code{ingressClassName} explicitly.
+  \item Certificate renewal is automated \emph{and} monitored, with an alert on days-to-expiry.
+  \item Liveness, readiness and startup probes check different things, deliberately.
+  \item Every container has memory requests and limits derived from a load test.
+  \item Every HPA has a metrics source that is verified working, and an alert on \code{ScalingActive=False}.
+  \item Every workload has its own ServiceAccount; no workload is bound to \code{cluster-admin}.
+  \item Token automount is disabled for Pods that never call the API server.
+  \item Anything stateful has a tested restore, not just a replica.
+  \item Critical services have a PodDisruptionBudget.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 07).} You now have an application that packages, exposes, scales and defends itself --- on a cluster that someone created by hand. Tomorrow you remove that last manual step: Terraform's declarative model, the state file and why it is the most dangerous artefact you own, the plan/apply cycle, modules, and how to describe an entire cluster, its network and its DNS as reviewable code.
+\end{keyidea}

@@ -1,0 +1,647 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 14 ============================
+\daychapter{14}{Capstone}{Final Project --- CloudBase}{Assembling, operating and presenting production infrastructure --- built by you}{10 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item State what "production-ready" means as a checklist of properties, not a feeling --- and defend each item.
+  \item Read a specification the way an engineer reads a ticket: separating functional from non-functional requirements and turning ambiguity into documented decisions.
+  \item Design for failure explicitly --- multi-AZ topology, RTO/RPO targets, and the failure modes each choice does and does not cover.
+  \item Operate what you built: run a rollback under pressure, a DR restore drill, a cost audit and a game day.
+  \item Present the system as a senior engineer would --- architecture, trade-offs, known weaknesses, and what you would do at ten times the scale.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} For thirteen days you learned mechanisms in isolation: a process and a signal, a commit graph, a subnet, an image layer, a scheduler, a state file, a playbook, a pipeline, a VPC, a time-series database, a policy engine, a reconciliation loop. Every one of them was correct on its own and useless on its own. The problem this chapter solves is \emph{integration}: making thirteen independently-correct mechanisms behave as one system that a stranger can deploy, observe, break, and recover --- without you in the room.
+
+\glabel{Why DevOps engineers need it.} Nobody is paid to run Terraform. They are paid for the property that emerges when Terraform, a container registry, a scheduler, a secrets store and an alert route are wired together correctly: \keyterm{a change can go from a commit to production safely, and come back}. That property is the job. It is also the thing an interview probes for, because it cannot be memorised --- it can only be built and then explained.
+
+\begin{keyidea}
+"Production-ready" is not a quality level; it is a set of \emph{answered questions}. Who can deploy this? What happens when a node dies? Where does the data live and how far back can we restore it? Who is paged, on what signal, with what runbook? How do we undo the last change in ninety seconds? A system where those questions have written answers is production-ready --- even if it is small. A system where they do not is a demo, no matter how many services it has.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} CloudBase is deliberately a \emph{small} application carrying a \emph{large} amount of operational weight. Read the diagram as a convergence: each earlier day contributed one layer, and today they stack.
+
+\begin{wbfigure}{Fig 14.0 — The convergence. Thirteen days of isolated mechanisms become five layers of one operable system.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=74mm, minimum height=7.6mm, align=left, text width=68mm}]
+  \node[lyr, wbboxops] (gov) {\textbf{Evidence \& governance} \hfill \scriptsize runbook · README · ADRs · checklist};
+  \node[lyr, wbboxk8s, below=of gov] (del) {\textbf{Delivery} \hfill \scriptsize Day 2, 9, 13 --- git, CI, GitOps, canary};
+  \node[lyr, wbboxsec, below=of del] (sec) {\textbf{Security \& secrets} \hfill \scriptsize Day 12 --- IAM, RBAC, NetworkPolicy, scans};
+  \node[lyr, wbboxaccent, below=of sec] (obs) {\textbf{Observability} \hfill \scriptsize Day 11 --- metrics, logs, one real SLO};
+  \node[lyr, wbboxcloud, below=of obs] (run) {\textbf{Runtime} \hfill \scriptsize Day 4, 5, 6 --- image, cluster, probes, HPA};
+  \node[lyr, below=of run] (inf) {\textbf{Infrastructure} \hfill \scriptsize Day 1, 3, 7, 8, 10 --- Linux, net, IaC, config};
+  \foreach \a/\b in {gov/del,del/sec,sec/obs,obs/run,run/inf}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=4mm of inf, text width=22mm, anchor=west] {rebuilt from code, not memory};
+  \node[wbcap, right=4mm of gov, text width=22mm, anchor=west] {what makes it \emph{operable}};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Every earlier Build-Along instalment was a component of this one. Day 1 gave the host baseline and strict-mode scripting; Day 2 the repository and its protections; Day 3 and 10 the network and the cloud account; Day 4 the hardened image; Days 5--6 the cluster, probes and ingress; Day 7 the Terraform root modules and remote state; Day 8 idempotent host configuration; Day 9 the pipeline; Day 11 the metrics and the SLO; Day 12 least privilege and secret storage; Day 13 GitOps reconciliation and progressive delivery. Today adds no new mechanism. It adds \emph{assembly, operation and evidence}.
+
+\glabel{Where companies use it in production.} Monzo, a UK bank running on Kubernetes, published how it moved from a flat network --- where any of roughly 1,500 microservices could call any other, giving about 9,300 live service-to-service connections --- to a default-deny model enforced by Calico-backed NetworkPolicies. The engineering insight is not the policy syntax: it is that they \emph{derived} the rules from code with an internal tool, shipped them first in a dry-run logging mode to measure what \emph{would} have been dropped, and only then enforced. After the change the average service had roughly six allowed outbound destinations instead of the whole platform. That is the shape of every hardening project you will ever run: derive, measure in shadow mode, then enforce.
+
+Netflix pushed the same idea to the infrastructure layer. Its Simian Army escalated from Chaos Monkey (kill one instance) to Chaos Gorilla (fail an entire Availability Zone) to Chaos Kong (evacuate a whole AWS region), because the only way to know a failover works is to perform it on purpose, on a weekday, with the team watching. Your Day 14 game day is the same exercise at a scale you can afford.
+
+\glabel{Common misconceptions.} That a capstone should be \emph{big} (a small system operated excellently is a far stronger signal than a sprawl of half-wired services); that "it works on my cluster" is a completed project (reproducibility from a clean state is the deliverable); that documentation is what you do afterwards if there is time (the README explaining \emph{why} is the artefact a reviewer reads first); and that a rollback path counts if nobody has ever executed it.
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 14.1 — CloudBase target architecture. Only the load balancer and NAT gateways live in public subnets; every workload and datastore is private.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxghost] (inet) {Internet\\clients};
+  \node[wbboxcloud, below=8mm of inet] (alb) {ALB\\TLS termination};
+  \node[wbboxcloud, below left=7mm and 4mm of alb] (nata) {NAT gw · AZ-a};
+  \node[wbboxcloud, below right=7mm and 4mm of alb] (natb) {NAT gw · AZ-b};
+  \node[wbboxk8s, below=9mm of nata] (na) {EKS nodes AZ-a\\app pods};
+  \node[wbboxk8s, below=9mm of natb] (nb) {EKS nodes AZ-b\\app pods};
+  \node[wbcyl, below=8mm of na] (dba) {RDS primary};
+  \node[wbcyl, below=8mm of nb] (dbb) {RDS standby};
+  \draw[wbflow] (inet)--(alb);
+  \draw[wbflow] (alb)--(na); \draw[wbflow] (alb)--(nb);
+  \draw[wbarrow] (na)--(dba); \draw[wbarrow] (nb)--(dba);
+  \draw[wbarrowg, dashed] (dba)--node[wbcap,above,font=\sffamily\tiny]{sync}(dbb);
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(alb)(nata)(natb)] (pub) {};
+    \node[wbzonelabel, anchor=north west] at (pub.north west) {public subnets · 2 AZs};
+    \node[wbzone, fit=(na)(nb)(dba)(dbb)] (priv) {};
+    \node[wbzonelabel, anchor=north west] at (priv.north west) {private subnets · no route to IGW};
+    \node[wbzone, draw=cInfra, fit=(pub)(priv)] (vpc) {};
+    \node[wbzonelabel, anchor=south west] at (vpc.south west) {VPC 10.0.0.0/16};
+  \end{scope}
+  % sidecar column: anchor to the VPC zone's OUTER edge, not to a node inside it
+  \node[wbboxsec, anchor=north west, text width=22mm] (sm)
+     at ([xshift=10mm]vpc.north east) {Secrets Manager\\IRSA-scoped};
+  \node[wbboxops, below=6mm of sm, text width=22mm] (obs) {Prometheus\\Grafana · alerts};
+  \node[wbboxk8s, below=6mm of obs, text width=22mm] (argo) {Argo CD\\reconcile loop};
+  \node[wbboxcloud, below=6mm of argo, text width=22mm] (ci) {CI + ECR\\SHA-tagged images};
+  \draw[wbarrowg] (sm.west)--(vpc.east|-sm);
+  \draw[wbarrowg] (obs.west)--(vpc.east|-obs);
+  \draw[wbarrowg] (argo.west)--(vpc.east|-argo);
+  \draw[wbarrowg] (ci)--(argo);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{requirement} $\rightarrow$ \keyterm{architecture decision} $\rightarrow$ \keyterm{blast radius} $\rightarrow$ \keyterm{RTO/RPO} $\rightarrow$ \keyterm{SLO} $\rightarrow$ \keyterm{error budget} $\rightarrow$ \keyterm{runbook} $\rightarrow$ \keyterm{game day} $\rightarrow$ \keyterm{post-mortem}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Reading the Specification: Functional Requirements}
+
+\glabel{What is it?} A functional requirement says what the system must \emph{do}. It is testable by pointing at the system and observing behaviour. The CloudBase specification below is your contract with yourself; each row names the day whose mechanism satisfies it.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{34mm} X L{15mm}@{}}
+\wbtablehead{Capability} & \wbtablehead{Requirement --- and how you prove it} & \wbtablehead{From}\\
+Network & VPC with public and private subnets across two Availability Zones; route tables prove the private subnets have no path to an internet gateway. & Day 3, 10\\
+Container image & Multi-stage build, non-root user, pinned base digest, scanned in CI before push. & Day 4, 9, 12\\
+Orchestration & Cluster runs the app via Helm with \emph{separate} liveness and readiness probes, resource requests/limits, and a working HPA. & Day 5, 6\\
+Edge & Ingress terminates TLS and routes to the Service; certificate renewal is automated, not diarised. & Day 6\\
+Pipeline & test $\rightarrow$ scan $\rightarrow$ build $\rightarrow$ push $\rightarrow$ deploy, each stage a gate that can fail the build. & Day 9\\
+GitOps & Cluster state reconciled from git by Argo CD or Flux; a canary strategy governs promotion. & Day 13\\
+Observability & Prometheus metrics, a Grafana dashboard, structured logs with correlation IDs, one real SLO with an alert. & Day 11\\
+Secrets & Sourced from a secrets manager at runtime; never in git, never baked into an image layer. & Day 12\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why does it exist?} Before requirements were written down, "done" was whatever the last person to touch the system believed. Specifications exist so that \emph{done} is falsifiable. Notice how each row above is phrased so a reviewer can disprove it in under a minute --- that is the test of a well-written requirement.
+
+\glabel{How does it work internally?} A requirement becomes real only when something automatic enforces it. "Images must be scanned" is a wish; a pipeline stage that fails on a HIGH-severity finding is a requirement. "Secrets must not be in git" is a wish; a pre-commit hook plus a repository secret scanner is a requirement. When you write your README, mark each requirement with the mechanism that enforces it --- the ones you cannot name an enforcer for are the ones that will silently rot.
+
+\begin{seniornote}
+Juniors deliver features; seniors deliver \emph{enforced invariants}. The interview-winning sentence is not "the app runs on Kubernetes". It is "no image reaches the cluster without a passing scan and an immutable SHA tag, because the only identity allowed to push to the registry is the CI role, and Argo CD only syncs from a protected branch." That is one sentence describing four Days of work as a single closed loop.
+\end{seniornote}
+
+\wbsub{3.2\quad Non-Functional Requirements: the Ones That Decide Whether You Sleep}
+
+\glabel{What is it?} A non-functional requirement (NFR) constrains \emph{how} the system does what it does --- its reproducibility, security posture, delivery discipline, observability and documentation. NFRs are what separate a working system from an operable one.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{34mm} X@{}}
+\wbtablehead{Concern} & \wbtablehead{Requirement}\\
+Infrastructure as Code & The entire environment is provisioned by Terraform with remote state and locking. No console clicks that are not later codified.\\
+Configuration management & Any non-containerised host configuration is applied idempotently with Ansible --- re-runnable to the same end state.\\
+Security & Least-privilege IAM and Kubernetes RBAC throughout; NetworkPolicies restrict lateral movement; image scanning is a CI gate, not a report.\\
+Networking & Database and application tiers sit in private subnets; only the load balancer and NAT gateways are public.\\
+Delivery & Immutable SHA-tagged images promoted \emph{unchanged} across environments, plus a rollback path that has actually been rehearsed.\\
+Observability & A dashboard someone would genuinely open during an incident, and an alert tied to a user-visible SLO rather than raw metric noise.\\
+Documentation & A README explaining architectural \emph{decisions and trade-offs}, not merely how to run it.\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why does it exist?} Every NFR above is the scar tissue of a real class of outage. Remote state with locking exists because two engineers ran \code{apply} at the same time and corrupted a state file. Immutable promotion exists because "rebuild for staging, rebuild for prod" quietly picked up a different transitive dependency between the two builds. Alerting on SLOs exists because alerting on CPU trained an entire generation of on-call engineers to ignore their pagers.
+
+\glabel{How does it work internally?} "Promoted unchanged" has a precise mechanical meaning: the artefact's identity is a content digest. When CI pushes \code{registry/cloudbase-api@sha256:...}, staging and production reference \emph{that digest}, so the bytes running in production are provably the bytes the tests ran against. A mutable tag like \code{latest} breaks the proof, because the name can be repointed after the test passed.
+
+\begin{wbfigure}{Fig 14.2 — The delivery plane. The pipeline never touches the cluster; it changes git, and the cluster converges.}
+\wbscale{\begin{tikzpicture}[node distance=3.8mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.2mm, align=left, text width=56mm}]
+  \node[stg] (a) {\textbf{1 · commit pushed} \hfill \scriptsize protected branch, reviewed};
+  \node[stg, below=of a] (b) {\textbf{2 · test + SAST + deps} \hfill \scriptsize fail = no artefact};
+  \node[stg, wbboxsec, below=of b] (c) {\textbf{3 · build + image scan} \hfill \scriptsize HIGH CVE blocks push};
+  \node[stg, wbboxcloud, below=of c] (d) {\textbf{4 · push by digest} \hfill \scriptsize immutable, SHA-tagged};
+  \node[stg, wbboxk8s, below=of d] (e) {\textbf{5 · bump digest in GitOps repo} \hfill \scriptsize the only deploy action};
+  \node[stg, wbboxk8s, below=of e] (f) {\textbf{6 · Argo CD reconciles} \hfill \scriptsize desired vs live};
+  \node[stg, wbboxaccent, below=of f] (g) {\textbf{7 · canary + metric analysis} \hfill \scriptsize promote or auto-abort};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f,f/g}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=4mm of e, text width=24mm, anchor=west] {git is the audit log};
+  \node[wbcap, right=4mm of g, text width=24mm, anchor=west] {rollback = revert step 5};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{tradeoff}
+GitOps buys you an auditable, revertible record of every production change and removes cluster credentials from CI entirely. It costs you a second repository to keep in sync, a reconciliation delay between merge and effect, and a new failure mode --- drift between what a human \code{kubectl apply}-ed and what git says. Accept the trade-off knowingly and write it in the README; "we chose Argo CD" is not an architecture decision, "we chose Argo CD \emph{because} we wanted CI to hold no cluster credentials, accepting a 3-minute reconciliation lag" is.
+\end{tradeoff}
+
+\wbsub{3.3\quad High Availability: Multi-AZ and the Failure Modes It Does \emph{Not} Cover}
+
+\glabel{What is it?} High availability is redundancy plus automatic failure detection plus automatic traffic redirection. Remove any of the three and you have expensive idle capacity rather than availability.
+
+\glabel{Why does it exist?} An Availability Zone is a distinct set of data centres with independent power, cooling and networking inside one region. Spreading across two AZs exists because correlated failure is the enemy: two servers in the same rack share a power feed, and a system whose "redundant" replicas all die together is not redundant.
+
+\glabel{How does it work internally?} Multi-AZ works only if \emph{every} layer is spread and every layer's failure detector is faster than your users' patience. A pod spread constraint places replicas across nodes in different AZs. The ALB health-checks targets and stops routing to failed ones within seconds. RDS Multi-AZ maintains a synchronous standby in the second AZ and, on failover, repoints a DNS CNAME --- which is why your application must handle a connection drop and reconnect, and why an over-long JVM DNS cache turns a 60-second failover into a 20-minute outage.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{32mm} X L{30mm}@{}}
+\wbtablehead{Failure} & \wbtablehead{What multi-AZ does} & \wbtablehead{What still bites you}\\
+One node dies & Scheduler reschedules pods onto surviving nodes. & Capacity: if each AZ runs at 90\% you cannot absorb the other half.\\
+One AZ lost & ALB drains targets; RDS fails over to the standby. & Stale DNS caches; single-AZ resources you forgot (a lone NAT gw).\\
+Whole region lost & Nothing. Multi-AZ is not multi-region. & Only a DR strategy helps --- see 3.4.\\
+Bad deploy & Nothing. The bug is in every AZ simultaneously. & Only canary analysis and rollback help.\\
+Database corrupted & Nothing --- corruption replicates synchronously. & Only point-in-time restore from backup helps.\\
+\end{tabularx}
+\end{center}
+
+\begin{misconception}
+"We are Multi-AZ, so we are covered." Multi-AZ addresses \emph{infrastructure} failure in one facility. It offers zero protection against the three failure classes that actually cause most outages: a bad deploy, a bad configuration change, and data corruption --- all of which replicate faithfully to your standby. Redundancy protects against things breaking; it never protects against things being wrong.
+\end{misconception}
+
+\begin{reliability}
+Design the capacity, not just the topology. If your HPA minimum is 2 replicas across 2 AZs, losing one AZ leaves a single replica serving 100\% of traffic --- which will then fall over from load, and the incident you get is not "AZ failure" but "cascading overload". The rule of thumb is $N+1$ per AZ: each zone must be able to carry the full load alone, or you must accept degradation and say so explicitly in the README.
+\end{reliability}
+
+\wbsub{3.4\quad Disaster Recovery: RTO, RPO and Choosing a Strategy Honestly}
+
+\glabel{What is it?} AWS's Well-Architected Reliability Pillar defines the two numbers precisely. \keyterm{RTO} (Recovery Time Objective) is the maximum acceptable delay between the interruption of service and its restoration --- how long you may be down. \keyterm{RPO} (Recovery Point Objective) is the maximum acceptable amount of time since the last recovery point --- how much data you may lose. They are \emph{targets set by the business}, not properties of your tooling.
+
+\glabel{Why does it exist?} Without stated numbers, "we have backups" is unfalsifiable. With them, every DR conversation becomes an engineering problem: a 15-minute RPO means transaction-log shipping at least every 15 minutes; a 1-hour RTO means an automated restore, because a human paging in at 3am and reading a wiki will not make it.
+
+\glabel{How does it work internally?} The four canonical strategies trade cost against recovery. Each one is a different amount of infrastructure kept warm in the recovery region.
+
+\begin{wbfigure}{Fig 14.3 — The DR ladder. Every step down buys recovery speed with standing cost and operational complexity.}
+\wbscale{\begin{tikzpicture}[node distance=3.8mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=64mm, minimum height=7.4mm, align=left, text width=58mm}]
+  \node[stg, wbboxghost] (a) {\textbf{Backup \& restore} \hfill \scriptsize cheapest · RTO hours};
+  \node[stg, below=of a] (b) {\textbf{Pilot light} \hfill \scriptsize data replicated, compute off};
+  \node[stg, wbboxaccent, below=of b] (c) {\textbf{Warm standby} \hfill \scriptsize scaled-down live copy};
+  \node[stg, wbboxgood, below=of c] (d) {\textbf{Active/active} \hfill \scriptsize RTO near zero · costliest};
+  \foreach \x/\y in {a/b,b/c,c/d}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=4mm of a, text width=25mm, anchor=west] {cost \& complexity rise};
+  \node[wbcap, right=4mm of d, text width=25mm, anchor=west] {RTO \& RPO fall};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} For CloudBase, backup and restore with a written, \emph{rehearsed} procedure is the correct choice, and saying so is a stronger answer than building an active/active setup you cannot justify. Declare it: "RPO 24 hours from automated RDS snapshots, plus 5-minute point-in-time recovery within the retention window; RTO 2 hours, measured in a restore drill on 2026-07-19."
+
+\glabel{When should I \emph{not}?} Do not build multi-region for a portfolio project or an internal tool. Multi-region doubles your surface area, forces you to solve data residency and split-brain, and roughly doubles standing spend --- for a failure mode that is far rarer than the bad deploys you have not yet defended against.
+
+\begin{drtip}
+A backup is a hypothesis; a restore is the experiment. Until you have restored into a fresh environment and connected the application to it, you do not have backups --- you have snapshots of unknown validity. Put the restore drill on a schedule and record the measured RTO in the runbook each time. When the number drifts upward, that is a finding.
+\end{drtip}
+
+\begin{costnote}
+DR cost is dominated by what you keep running, not by what you store. Snapshots and object storage are cheap; an idle warm-standby cluster is not. The cost-aware pattern is to keep \emph{data} continuously replicated (cheap, and it is what sets your RPO) while keeping \emph{compute} defined in Terraform but not applied --- your recovery step is \code{terraform apply} in the second region, which is exactly why the whole environment had to be code in the first place.
+\end{costnote}
+
+\wbsub{3.5\quad Cost as a First-Class Engineering Constraint}
+
+\glabel{What is it?} Cost optimisation is not a finance activity that happens to you quarterly. It is a design constraint with the same standing as latency: every architectural choice has a monthly price, and an engineer who cannot state it is only half-designing.
+
+\glabel{Why does it exist?} On-premises, capacity was a capital purchase reviewed by committee. In the cloud, any engineer can create a recurring monthly liability with one \code{terraform apply}, and nothing forces them to look at it again. The discipline exists to replace the committee with attribution and feedback.
+
+\glabel{How does it work internally?} Three mechanisms carry most of the value:
+
+\begin{wbitem}
+  \item \textbf{Attribution.} Cost allocation tags on every resource (owner, environment, service), applied by Terraform \code{default\_tags} so they cannot be forgotten. Untagged spend is unownable spend.
+  \item \textbf{Right-sizing.} Kubernetes requests are a \emph{reservation}: the scheduler subtracts them from node capacity whether or not the pod uses them. A deployment requesting 2 CPU and using 100m is billing you for idle cores across every replica. Set requests from observed p95 usage, and limits from the point where you would rather throttle than let one pod starve its neighbours.
+  \item \textbf{Elasticity and lifecycle.} Non-production environments do not need to exist at 2am. Log retention that nobody has ever queried past 14 days is a subscription to your own past. Both are one-line policy changes with permanent effect.
+\end{wbitem}
+
+\glabel{When should I \emph{not}?} Do not optimise cost on the critical path of an incident, and do not trade away redundancy for savings without writing down the availability you just sold. The classic self-inflicted outage is deleting the second NAT gateway to save money and discovering months later that one AZ lost all egress.
+
+\begin{scalenote}
+Cost per request is the metric that scales; total bill is the metric that panics people. A system whose bill grows linearly with traffic is healthy. A system whose bill grows while traffic is flat has a leak --- orphaned volumes, forgotten load balancers, a log pipeline indexing debug output, a cross-AZ chatty service paying data-transfer charges on every hop. Track the ratio, and the leaks announce themselves.
+\end{scalenote}
+
+\wbsub{3.6\quad Operability: Runbooks, SLOs and the Evidence a Reviewer Reads}
+
+\glabel{What is it?} Operability is the property that someone other than the author can run the system. Its artefacts are a runbook (what to do when the alert fires), an SLO (what "working" means, numerically), and an architecture README (why it is shaped this way).
+
+\glabel{Why does it exist?} Before runbooks, operational knowledge lived in the one engineer who had seen the failure before --- so incidents were resolved at the speed of that person's availability. The runbook is a mechanism for moving knowledge out of a head and into the repository, next to the code that will trigger the next incident.
+
+\glabel{How does it work internally?} A good runbook entry is not prose; it is a decision procedure. Alert name $\rightarrow$ what the user is experiencing $\rightarrow$ the first three commands or dashboard panels to check $\rightarrow$ the two most likely causes with their distinguishing evidence $\rightarrow$ the mitigation, including the rollback command, verbatim and copy-pasteable. Anything requiring judgement is marked as requiring judgement, so nobody pastes it half-asleep.
+
+\begin{outbox}[docs/runbook.md — one alert entry, abbreviated]
+## ALERT: CloudBaseAPIErrorBudgetBurn (severity: page)
+
+User impact: checkout requests failing; SLO 99.5% success over 30d.
+
+Triage (in order, 5 min budget):
+  1. Grafana "CloudBase / API overview" -> error rate by endpoint + version
+  2. argocd app history cloudbase-api      # was there a sync in the window?
+  3. kubectl -n cloudbase get rollout cloudbase-api
+
+Most likely causes:
+  A. Bad release      evidence: errors confined to the canary version label
+     -> mitigate: kubectl argo rollouts abort cloudbase-api
+  B. DB saturation    evidence: errors across ALL versions, latency up,
+                      pool wait time rising in the app dashboard
+     -> mitigate: scale down non-critical consumers; DO NOT restart pods
+        (restart storms make pool exhaustion worse)
+
+Escalate after 15 min with no improvement. Post-mortem required: yes.
+\end{outbox}
+
+\begin{opsnote}
+Write the runbook \emph{before} the incident, and edit it \emph{during} the next one. The half-hour after an incident, while the details are still loaded in your head, is worth more than any planned documentation sprint. If an incident produced no runbook diff, either nothing was learned or nothing was recorded --- both are failures.
+\end{opsnote}
+
+\begin{interview}
+Expect: \emph{"What is your SLO and why that number?"} The weak answer names 99.9\% because it sounds serious. The strong answer is: "99.5\% success over a rolling 30 days, which is a budget of about 3.6 hours of failed requests a month. We chose it because our deploy cadence spends roughly an hour of it, leaving headroom for one genuine incident. When the budget is half-spent we stop shipping features and fix reliability." That answer proves you understand an error budget as a \emph{decision rule}, not a dashboard number.
+\end{interview}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Every requirement in the spec is paired with the automated mechanism that enforces it.
+  \item Artefacts are immutable and promoted by digest; environments differ only by configuration.
+  \item RTO and RPO are written numbers, and the restore has actually been performed and timed.
+  \item Alerts fire on user-visible symptoms tied to an SLO, and every alert has a runbook entry.
+  \item Every resource carries owner and environment tags applied automatically by Terraform.
+  \item The README explains decisions and trade-offs, and honestly names the system's weak points.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Adding more services instead of operating one service properly.
+  \item Treating multi-AZ as disaster recovery, and snapshots as a tested restore path.
+  \item A rollback procedure that has never been executed by anyone.
+  \item Alerting on CPU and memory rather than on error rate and latency.
+  \item Requests and limits copied from a tutorial, so the cluster bills for idle reservations.
+  \item A README that explains \code{how to run it} but never says \emph{why} anything is the way it is.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+You will be asked to draw these on a whiteboard, from memory, with someone watching. Practise now, on paper, with nothing open.
+
+\begin{writespace}[Redraw: the full CloudBase network --- VPC, both AZs, public vs private subnets, ALB, NAT, nodes, RDS primary/standby --- and mark which resources are reachable from the internet]
+\reflectionlines[7]
+\end{writespace}
+
+\begin{writespace}[Redraw: the delivery plane from commit to production, naming every gate and the exact rollback action at each stage]
+\reflectionlines[6]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Build CloudBase in the Right Order}
+
+\textbf{Goal.} Assemble the whole system in a sequence where each step is verifiable before the next depends on it. The order matters: it is chosen so that every layer can be tested in isolation, and so that a failure tells you unambiguously which layer broke.
+
+\resetlab
+\labstep{Network layer in Terraform}
+VPC, public and private subnets in two AZs, internet gateway, NAT gateways, route tables. Remote state with locking configured \emph{first}, before any resource exists.
+\labwhy{The network is the only layer nothing else can be tested without, and the hardest to change later because every subsequent resource references its IDs. Prove correctness by reading the private route table and confirming there is no 0.0.0.0/0 route to the IGW --- do not infer it from the resource names.}
+
+\labstep{Containerise the application}
+Multi-stage Dockerfile, non-root user, pinned base image digest, no build tooling in the final layer. Run it locally against a local database before any cluster is involved.
+\labwhy{A container that fails in a cluster is ambiguous --- image, manifest, network or RBAC. A container proven locally reduces the next failure to the orchestration layer, which is worth the ten minutes.}
+
+\labstep{Stand up the cluster and deploy with Helm}
+Chart with configurable image digest, resource requests and limits, distinct liveness and readiness probes, a pod anti-affinity or topology spread across AZs, and an HPA.
+\labwhy{Probes are the single most consequential five lines in the chart. Liveness failing restarts the container; readiness failing only removes it from load balancing. Pointing both at a handler that touches the database converts a slow database into a cluster-wide restart storm.}
+
+\labstep{Expose it: Ingress and TLS}
+Ingress terminating TLS, certificate issued and renewed automatically, DNS pointing at the load balancer.
+\labwhy{This is the first moment the system has real users' shape. It is also where you discover whether your readiness probe is honest --- if it reports ready before the app can serve, the load balancer will send traffic into a 502.}
+
+\labstep{Wire the pipeline}
+test $\rightarrow$ SAST and dependency scan $\rightarrow$ build $\rightarrow$ image scan $\rightarrow$ push by SHA. Each stage must be able to fail the build; prove it by breaking one deliberately.
+\labwhy{An unproven gate is decoration. Push a deliberately vulnerable dependency once and watch the pipeline stop --- that single experiment is what turns "we scan images" into a claim you can defend.}
+
+\labstep{Move deployment to GitOps}
+Install Argo CD (or Flux), point it at a manifests repository, and remove every cluster credential from CI. CI's last act becomes a commit that bumps the image digest.
+\labwhy{This inverts the trust direction: the cluster pulls, rather than CI pushing. A compromised CI runner can now propose a change but cannot reach the cluster's API server --- and every production change is a reviewable commit.}
+
+\labstep{Layer in observability}
+Application metrics, a dashboard organised by user-facing symptom, structured JSON logs carrying a correlation ID, and exactly one alert bound to your SLO.
+\labwhy{One good alert beats forty. Every alert you add that does not require human action trains the team to ignore the channel, and the cost of that training is paid during the incident that mattered.}
+
+\labstep{Add canary rollout and rehearse the rollback}
+Configure a canary with automated analysis against your Prometheus success-rate query, then deliberately ship a broken version and watch it abort. Time the rollback.
+\labwhy{You are not testing the canary; you are testing yourself. The number you want is "how many seconds from noticing to healthy", and the only way to know it is to have done it once when nothing was at stake.}
+
+\labstep{Security pass}
+Default-deny NetworkPolicies with explicit allows, secrets migrated out of manifests into the secrets manager with workload identity, and an audit of every IAM role and Kubernetes Role for unused permissions.
+\labwhy{Doing security last is a deliberate choice here, not a mistake --- you cannot write a least-privilege policy for traffic you have not yet observed. Follow Monzo's pattern: observe real traffic, derive the rules from it, run them in dry-run, then enforce.}
+
+\begin{prodtip}
+Destroy and rebuild the entire environment from scratch at least once before you call it done. \code{terraform destroy} followed by \code{terraform apply} into an empty account is the only honest test of "provisioned from code". Every project has one resource somebody created by hand and forgot; this is how you find it, and it is exactly what an interviewer means when they ask whether they could reproduce your environment.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Your CloudBase is Multi-AZ, GitOps-managed and monitored --- and the worst outage you experience is caused by a configuration change that was reviewed, merged and reconciled exactly as designed. Every safety mechanism worked, and the outage still happened. What does that tell you about where to invest the next unit of reliability effort, and why is "add more redundancy" the wrong answer?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+You are asked to cut CloudBase's monthly cost by 40\% without an availability regression. List the changes you would make in order, and for each one name the failure mode you are now closer to. Which change would you refuse to make, and what sentence would you write in the README to justify the refusal?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+An interviewer says: "Show me the weakest part of this architecture." Answer it truthfully for your own build --- name the component, the failure it is vulnerable to, why you accepted that risk given your constraints, and what you would build first if the system had ten times the traffic.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Intermittent 5xx --- roughly one request in twenty}
+\textbf{Symptom.} Error rate rose from 0.02\% to 4\% forty minutes after a routine deploy. Not every request fails; retries usually succeed. Nobody rolled back because "it is only sometimes".
+
+\begin{outbox}[error rate by pod, and one failing request's log line]
+$ kubectl -n cloudbase logs -l app=cloudbase-api --since=10m | grep '"level":"ERROR"' | head -3
+{"ts":"...","level":"ERROR","corr":"9f3a","pod":"api-7c9d-x2k","msg":"upstream timeout"}
+{"ts":"...","level":"ERROR","corr":"b81c","pod":"api-7c9d-x2k","msg":"upstream timeout"}
+{"ts":"...","level":"ERROR","corr":"44de","pod":"api-7c9d-x2k","msg":"upstream timeout"}
+
+$ kubectl -n cloudbase get pods -o wide
+api-7c9d-x2k   1/1  Running   0  41m   10.0.12.9   node-az-b
+api-7c9d-p4m   1/1  Running   0  41m   10.0.11.4   node-az-a
+api-7c9d-t8v   1/1  Running   0  41m   10.0.11.7   node-az-a
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Every error carries the same \code{pod} field. One replica of three is failing --- which is why the rate is a fraction, not 100\%, and why retries "fix" it.
+  \item \textbf{Hypothesise.} This is not a code defect (the same image runs on all three). It is environmental and specific to that pod or its node --- a node-local network path, a stale DNS resolution, or a per-pod resource condition.
+  \item \textbf{Investigate.} Compare the failing pod against a healthy one: is it in a different AZ? \code{kubectl describe} for throttling and restart counts, \code{kubectl exec} to resolve the upstream name from inside both pods, and check whether the upstream's endpoint list changed at the time errors began.
+  \item \textbf{Root cause.} The pod on \code{node-az-b} was resolving the database writer endpoint to an address that stopped serving after an RDS maintenance failover; the client had cached the DNS answer for the process lifetime.
+  \item \textbf{Fix.} Delete the affected pod so a fresh process re-resolves, restoring service immediately.
+  \item \textbf{Prevent.} Bound the client-side DNS cache TTL explicitly, add a readiness probe that actually exercises a datastore round trip so a pod with a dead connection removes \emph{itself} from load balancing, and alert on per-pod error-rate divergence rather than only on the aggregate --- an aggregate hides one-in-three.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{Connection pool exhaustion that looks like a slow database}
+\textbf{Symptom.} p99 latency climbed from 120\,ms to 9\,s across \emph{all} pods and all versions. The database's own CPU is at 25\% and its slow-query log is empty. Somebody suggests restarting the pods.
+
+\begin{outbox}[application metrics — the two series that matter]
+cloudbase_db_pool_active{pod="api-7c9d-p4m"}   10
+cloudbase_db_pool_idle{pod="api-7c9d-p4m"}      0
+cloudbase_db_pool_pending{pod="api-7c9d-p4m"}  87
+cloudbase_db_pool_wait_seconds{quantile="0.99"} 8.4
+
+# replicas after the morning traffic ramp
+NAME                READY   UP-TO-DATE   AVAILABLE
+cloudbase-api       24/24   24           24
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Time is spent \emph{waiting for a connection}, not executing queries. The database is idle because requests never reach it. Latency is uniform across pods, so this is systemic rather than pod-local.
+  \item \textbf{Hypothesise.} The HPA scaled to 24 replicas; each holds a pool of 10, so the deployment demands 240 connections against a database limit well below that --- or, equally likely, a query path is holding connections while doing slow non-database work.
+  \item \textbf{Investigate.} Multiply replicas by pool size and compare with the server's \code{max\_connections}. Check whether pending grew at exactly the moment the HPA scaled. Look for a request path that opens a transaction and then calls an external API inside it.
+  \item \textbf{Root cause.} Horizontal scaling multiplied a fixed per-pod pool past the database's connection ceiling. Adding replicas made it \emph{worse}, which is why the auto-scaler and the incident amplified each other.
+  \item \textbf{Fix.} Cap total connections: reduce per-pod pool size, or put a connection pooler in front of the database so pods multiplex over a bounded server-side set. Do not restart pods --- a restart storm makes every pod re-establish connections simultaneously.
+  \item \textbf{Prevent.} Treat connections as a cluster-wide finite resource with an explicit budget (replicas $\times$ pool $\le$ ceiling, with headroom for migrations and admin sessions). Alert on pool saturation and wait time, not just on query latency. Add a maximum-replicas bound that respects the budget.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The rollback that made the incident longer}
+\textbf{Symptom.} A release is clearly bad. Under pressure an engineer runs the CI pipeline against the previous commit to "rebuild the good version". Eleven minutes later the build fails on an unrelated dependency resolution error, and the site is still down.
+
+\begin{outbox}[what should have happened instead]
+# WRONG under pressure: rebuild from source
+$ git checkout v1.4.2 && ./ci/build.sh      # 11 min, and it can fail
+
+# RIGHT: redeploy an artefact that already exists and already passed
+$ argocd app history cloudbase-api
+ID  DATE                  REVISION   IMAGE
+14  2026-07-19 09:41 UTC  a91f0c3    cloudbase-api@sha256:7d2f...
+13  2026-07-19 08:02 UTC  4b7e118    cloudbase-api@sha256:1c8a...   <- last known good
+
+$ argocd app rollback cloudbase-api 13        # or: git revert the digest bump
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Recovery time is being spent in a build system, which is neither deterministic nor fast, while users are down.
+  \item \textbf{Hypothesise.} The team's rollback path was never rehearsed, so under stress people fell back to the workflow they use daily --- building.
+  \item \textbf{Investigate.} Ask the only question that matters mid-incident: does a known-good, already-tested artefact exist? With SHA-tagged immutable images the answer is always yes, and its identity is in the deploy history.
+  \item \textbf{Root cause.} A procedural gap, not a technical one. The mechanism (immutable digests plus GitOps history) was in place; the rehearsed procedure was not.
+  \item \textbf{Fix.} Redeploy the last known-good digest --- a git revert of the digest bump, reconciled by Argo CD, typically under two minutes.
+  \item \textbf{Prevent.} Put the exact rollback command in the runbook, verbatim. Rehearse it monthly in a game day. Measure and publish the rollback time, and treat any regression in that number as a reliability defect in its own right.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~60 min}
+\textbf{Goal.} Run a cost audit of CloudBase and produce a costed architecture diagram.\\
+\textbf{Business context.} Finance asks what the environment costs and which parts are optional; nobody currently knows.\\
+\textbf{Architecture.} Your existing Terraform state plus the provider's cost and usage data.\\
+\textbf{Requirements.} List every billable resource with an estimated monthly cost; identify the top three line items; find at least one resource nobody owns; propose two reductions with the availability impact of each stated.\\
+\textbf{Constraints.} No change may reduce redundancy without an explicit written trade-off.\\
+\textbf{Hints.} Start from \code{terraform state list} rather than the billing console --- it tells you what \emph{should} exist, and the difference between the two lists is the interesting part. Check NAT gateways, idle load balancers, unattached volumes and log retention.\\
+\textbf{Expected outcome.} A one-page costed diagram and a ranked reduction list committed to \code{docs/}.\\
+\textbf{Production considerations.} Add \code{default\_tags} in the provider block so future resources are attributable automatically.\\
+\textbf{Common pitfalls.} Optimising the cheapest resources because they are easiest; deleting the second NAT gateway without noting the AZ-isolation risk you just accepted.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~90 min}
+\textbf{Goal.} Perform a disaster-recovery restore drill and measure your real RTO and RPO.\\
+\textbf{Business context.} The README claims a 2-hour RTO. Nobody has ever tested the claim.\\
+\textbf{Architecture.} A fresh namespace or a second Terraform workspace, restored from the latest automated snapshot.\\
+\textbf{Requirements.} Restore the database into a new instance from a snapshot; point a copy of the application at it; verify data integrity with a known query; record the wall-clock time of each phase and the age of the recovered data.\\
+\textbf{Constraints.} Use only what is written in the runbook --- if a step is missing, stop, add it, and restart the timer. That gap \emph{is} the finding.\\
+\textbf{Hints.} Time four phases separately: decide, provision, restore, verify. Most teams discover their RTO is dominated by "decide", not by the restore.\\
+\textbf{Expected outcome.} A dated drill record with measured RTO and RPO, plus a runbook diff.\\
+\textbf{Production considerations.} Schedule the drill quarterly and treat an unrehearsed quarter as an open risk.\\
+\textbf{Common pitfalls.} Restoring the data but never connecting the application, so schema or credential mismatches stay hidden until the real disaster.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2--3 h}
+\textbf{Goal.} Run a game day: inject a failure on purpose, with the team watching, and let your alerts and runbook do the work.\\
+\textbf{Business context.} You claim the system survives losing an Availability Zone. Prove it before reality asks.\\
+\textbf{Architecture.} Your live non-production CloudBase, plus a hypothesis written down \emph{before} you touch anything.\\
+\textbf{Requirements.} State a hypothesis ("if AZ-b becomes unavailable, error rate stays under 1\% and recovery is automatic within 3 minutes"); define an abort condition; inject the failure --- cordon and drain all AZ-b nodes, or fail the database over deliberately; observe whether the alert fires, whether the dashboard shows it, and whether the runbook is sufficient; then restore and write it up.\\
+\textbf{Constraints.} Blast radius must be bounded and reversible; one person runs the experiment, another observes only the dashboards, as an on-call engineer would.\\
+\textbf{Hints.} A managed fault-injection service can script this reproducibly, but a cordon-and-drain plus a forced database failover teaches the same lesson today.\\
+\textbf{Expected outcome.} A short post-mortem: hypothesis, what actually happened, every gap found in alerting or documentation, and dated follow-up actions.\\
+\textbf{Production considerations.} Escalate the blast radius only as confidence grows --- one pod, then one node, then one AZ. Netflix took years to get from Chaos Monkey to Chaos Kong.\\
+\textbf{Common pitfalls.} Running the experiment with no stated hypothesis (then any outcome looks acceptable); silently fixing what breaks instead of recording it; skipping the write-up, which is the only durable output.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{seniornote}
+The strongest signal a portfolio project can send is not sophistication --- it is \emph{completeness under constraint}. A small API with a rehearsed rollback, a tested restore, one meaningful alert and a README that names its own weaknesses outranks a sprawling microservice estate that only its author can deploy. Senior engineers recognise the difference instantly, because they have maintained both.
+\end{seniornote}
+
+\begin{secwarn}[the audit nobody performs]
+Permissions accumulate and never shrink, because every grant is added during an urgency and removed during nobody's urgency. Schedule the audit as work: for every IAM role and Kubernetes Role, ask which specific action requires each permission, and delete the ones nobody can justify. Do the same for NetworkPolicies. A permission you cannot explain is a permission an attacker will explain to you later.
+\end{secwarn}
+
+\begin{autotip}
+Anything you did twice by hand during this capstone is a candidate for automation, but the criterion is not repetition --- it is \emph{consequence of getting it wrong at 3am}. Automate the rollback, the restore and the environment rebuild first, because those are executed under stress by a tired person. Leave the pleasant, low-stakes manual steps alone; a script nobody trusts is worse than a documented command.
+\end{autotip}
+
+\begin{infranote}
+The deepest lesson of the fourteen days is that infrastructure is a \emph{program} whose runtime is a cloud account. It has source (Terraform, Helm, manifests), a build (CI), a deploy (GitOps reconciliation), tests (plan, policy checks, game days), observability (metrics and alerts) and a rollback. Every engineering practice you already trust for application code applies without modification. Teams that internalise this stop treating infrastructure work as a lesser discipline --- and their environments stop being unique snowflakes.
+\end{infranote}
+
+\begin{reliability}
+Availability is not bought once; it decays. Certificates expire, quotas tighten, base images accrue CVEs, a dependency deprecates an API, an alert threshold drifts out of relevance as traffic grows. A system that is production-ready today and untouched for six months is not production-ready. The maintenance loop --- patch, re-scan, re-drill, re-audit --- is part of the architecture, not an afterthought to it.
+\end{reliability}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Thirteen instalments built the parts: a hardened host and strict-mode scripts (Day 1), a protected repository (Day 2), a network design (Day 3), an image (Day 4), a cluster and workloads (Days 5--6), Terraform with remote state (Day 7), idempotent host configuration (Day 8), a pipeline (Day 9), a real cloud account (Day 10), metrics and an SLO (Day 11), least privilege and secrets (Day 12), GitOps and progressive delivery (Day 13). Today you assemble them into one environment and --- just as importantly --- produce the evidence that it is operable by somebody who is not you.
+
+\begin{buildalong}[Day 14 — final assembly, the runbook and the architecture README]
+\begin{wbitem}
+  \item Assemble the full environment from code: \code{terraform destroy} then \code{terraform apply} into a clean state, then deploy the application through the pipeline and GitOps, touching nothing by hand.
+  \item Confirm every functional requirement from 3.1 and every NFR from 3.2, naming for each one the mechanism that enforces it --- not the intention.
+  \item Write \code{docs/runbook.md}: one entry per alert with user impact, a time-boxed triage sequence, the two most likely causes with distinguishing evidence, verbatim mitigation commands, escalation criteria, plus standalone procedures for rollback, database restore and full environment rebuild.
+  \item Write \code{docs/README.md} as an architecture document: the diagram, the request path, and a numbered list of decisions, each in the form \emph{decision --- alternatives considered --- why --- what it costs us}. Include a "known weaknesses and what I would do at 10x" section.
+  \item Record the measured numbers, dated: rollback time, restore time (RTO), data-loss window (RPO), monthly cost, and the SLO with its error budget.
+  \item Run one game day against a non-production copy; commit the post-mortem and the runbook diff it produced.
+  \item Perform the security pass: default-deny NetworkPolicies, secrets sourced at runtime from the secrets manager, and an IAM/RBAC audit removing every permission you cannot justify out loud.
+  \item Tag the repository \code{v1.0}, and record in the README exactly what a reviewer must run to reproduce the environment from zero.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a stranger with cloud credentials, your repository and no access to you can bring the entire environment up from an empty account with the documented commands, watch a change reach production through the pipeline, break it, and restore it using only \code{docs/runbook.md} --- and the measured rollback time, RTO, RPO and monthly cost are written down and dated.
+\end{buildalong}
+
+\begin{prodtip}
+Record a five-minute screen capture of the whole loop: commit $\rightarrow$ pipeline $\rightarrow$ canary $\rightarrow$ dashboard $\rightarrow$ deliberate break $\rightarrow$ rollback. It costs one afternoon and it converts every claim in your README into something a reviewer can verify in the time it takes to drink a coffee. It is also the artefact you will be most grateful for six months from now, when you have forgotten which command does what.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Production-ready is a set of answered questions --- deploy, failure, data, paging, rollback --- not a size or a technology list.
+  \item A requirement is real only when an automated mechanism enforces it; otherwise it is an intention.
+  \item Immutable, digest-identified artefacts make promotion provable and rollback a redeploy rather than a rebuild.
+  \item Multi-AZ addresses infrastructure failure only; bad deploys, bad config and data corruption replicate faithfully.
+  \item RTO and RPO are business-set targets; an untested backup is a hypothesis, not a recovery plan.
+  \item Cost is a design constraint with the same standing as latency, and attribution comes before optimisation.
+  \item The runbook, the README's decision log and the measured numbers are what make the system operable by someone else.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Replicas $\times$ per-pod pool size must stay under the database connection ceiling --- horizontal scaling can amplify an incident.
+  \item Errors confined to one pod point at the environment; errors spread across all versions point at a shared dependency.
+  \item Never rebuild from source under incident pressure. Redeploy a known-good digest.
+  \item "I would improve X next" is a stronger interview answer than "it is complete".
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Adding services instead of depth \quad$\bullet$\quad untested restores \quad$\bullet$\quad unrehearsed rollbacks
+  \item Alerting on CPU rather than symptoms \quad$\bullet$\quad a README that only says how to run it
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Production-ready}{deploy path, failure behaviour, data recovery, paging, rollback --- all answered in writing.}
+\cheatitem{RTO / RPO}{max acceptable downtime / max acceptable data loss. Targets set by the business, proven by a drill.}
+\cheatitem{DR ladder}{backup-restore $\rightarrow$ pilot light $\rightarrow$ warm standby $\rightarrow$ active/active; cost up, recovery time down.}
+\cheatitem{Multi-AZ}{covers facility failure; covers neither bad deploys nor corruption nor region loss.}
+\cheatitem{Immutable promotion}{same digest across environments; environments differ only by configuration.}
+\cheatitem{Error budget}{allowed SLO violation per window; when it is spent, reliability outranks features.}
+\cheatitem{Game day}{stated hypothesis, bounded blast radius, abort condition, written post-mortem.}
+\cheatitem{Runbook entry}{impact $\rightarrow$ triage steps $\rightarrow$ likely causes with evidence $\rightarrow$ verbatim mitigation $\rightarrow$ escalation.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 14 — assembly, verification and incident commands]
+# rebuild the world from code (the honest reproducibility test)
+terraform destroy -auto-approve && terraform apply -auto-approve
+terraform state list                  # what SHOULD exist; diff vs the bill
+
+# verify the runtime
+kubectl -n cloudbase get deploy,hpa,ingress,networkpolicy
+kubectl -n cloudbase describe pod <pod> | sed -n '/Events/,$p'
+kubectl -n cloudbase top pods         # requests vs actual usage (rightsizing)
+
+# delivery + rollback
+argocd app history cloudbase-api      # find the last known-good digest
+argocd app rollback cloudbase-api <id>
+kubectl argo rollouts status  cloudbase-api
+kubectl argo rollouts abort   cloudbase-api
+
+# game day: bounded, reversible AZ failure
+kubectl cordon -l topology.kubernetes.io/zone=eu-west-1b
+kubectl drain  -l topology.kubernetes.io/zone=eu-west-1b --ignore-daemonsets
+kubectl uncordon -l topology.kubernetes.io/zone=eu-west-1b
+
+# DR drill
+aws rds describe-db-snapshots --db-instance-identifier cloudbase
+aws rds restore-db-instance-to-point-in-time --help
+\end{bashbox}
+
+\begin{iqbox}
+\iq{Walk me through your architecture, then tell me its weakest point and why you accepted that risk.}
+\iq{What are your RTO and RPO, how did you measure them, and when did you last test the restore?}
+\iq{The app is intermittently returning 5xx. Walk me through your process, in order.}
+\iq{How do you safely roll back a bad deploy under pressure --- and why not rebuild from source?}
+\iq{Why put the database in a private subnet if security groups already restrict access?}
+\iq{Multi-AZ versus a read replica --- which problem does each one solve?}
+\iq{Why tag images by commit SHA instead of \code{latest}, and why promote rather than rebuild?}
+\iq{What would you change about this system at ten times the traffic, and what would you leave alone?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item AWS Well-Architected Framework, Reliability Pillar --- "Disaster Recovery (DR) objectives" and "Plan for Disaster Recovery" (\code{docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/}). The authoritative definitions of RTO and RPO used in this chapter.
+  \item AWS Architecture Blog --- "Disaster Recovery (DR) Architecture on AWS, Part I: Strategies for Recovery in the Cloud". The four-strategy ladder in Fig 14.3.
+  \item AWS Fault Injection Service User Guide (\code{docs.aws.amazon.com/fis/latest/userguide/}) --- experiment templates, targets, actions and stop conditions for scripted game days.
+  \item Monzo engineering blog --- "We built network isolation for 1,500 services". How default-deny NetworkPolicies were derived from code and rolled out in dry-run before enforcement.
+  \item Argo Rollouts documentation --- "Analysis \& Progressive Delivery" and the Prometheus provider page (\code{argo-rollouts.readthedocs.io}) --- AnalysisTemplate, background analysis and automatic abort.
+  \item Kubernetes documentation --- "Network Policies" and "Configure Liveness, Readiness and Startup Probes" (\code{kubernetes.io/docs/}).
+  \item Google SRE Book, chapters on Service Level Objectives and Postmortem Culture --- error budgets as a decision rule, and blameless write-ups.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item All thirteen prior days' concepts are represented somewhere in the infrastructure.
+  \item \code{terraform apply} brings up the full environment from a clean state, verified by an actual destroy-and-rebuild.
+  \item The CI/CD pipeline is green and genuinely gates on tests and security scans --- each gate proven by breaking it once.
+  \item A dashboard and at least one alert exist and reflect a real SLO, with a runbook entry per alert.
+  \item Database and application tiers are in private subnets; only the load balancer and NAT gateways are public.
+  \item Secrets are sourced at runtime from a secrets manager; nothing sensitive is in git or in an image layer.
+  \item Rollback, restore and full rebuild have each been executed at least once and timed.
+  \item The README explains architecture decisions and trade-offs, and names the system's known weaknesses.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What comes next (after Day 14).} You now hold the thing this book existed to produce: a system you can defend line by line. The next step is not another tool --- it is repetition under different constraints. Run the game day again with a failure you did not choose. Re-cost the environment after a traffic change. Hand the runbook to somebody else and watch where they hesitate; that hesitation is your next ticket. The senior engineer is not the one who knows the most services --- it is the one who has broken their own system on purpose, most often, and written down what happened each time. Now go build something and break it on purpose.
+\end{keyidea}

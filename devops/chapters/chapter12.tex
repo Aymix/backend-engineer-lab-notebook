@@ -1,0 +1,669 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 12 ============================
+\daychapter{12}{Security}{Security \& Secrets Management}{Least privilege, secrets, image scanning and pipeline supply chain}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Apply least privilege as a mechanism --- IAM policy evaluation, Kubernetes RBAC, pipeline tokens --- not as a slogan.
+  \item Explain precisely what a secret is at rest, in transit and in memory, and why base64 in a Kubernetes Secret is encoding rather than encryption.
+  \item Issue short-lived dynamic credentials from a secrets manager instead of shipping long-lived static ones.
+  \item Gate a pipeline with three distinct scans --- SAST, dependency (SCA) and image --- and say what each one alone cannot see.
+  \item Contain lateral movement in a cluster with default-deny NetworkPolicies, and run a leaked-credential incident correctly.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} Everything you built in the previous eleven days assumed the participants were honest. The Terraform state, the registry, the CI runner, the flat pod network, the database password in a \code{ConfigMap} --- each is a good design right up to the moment one credential leaks or one dependency turns malicious. Today's controls decide whether that moment is an inconvenience or a breach. The goal is narrow: \emph{shrink what any single compromised identity can reach, and shorten how long any credential stays valid.}
+
+\glabel{Why DevOps engineers need it.} Security is not a separate team's deliverable arriving after the platform is built. Every control today is an infrastructure decision --- an IAM policy document, a Kubernetes object, a pipeline stage, a Vault role. If the platform engineer does not encode them, nobody else can. The industry name is \keyterm{shifting left}: the cheapest place to stop a vulnerable image is the build, not the runtime.
+
+\begin{keyidea}
+There is no such thing as "secure". There is only \emph{blast radius} and \emph{time-to-invalid}. Assume every credential you issue will leak, every image you build will contain a CVE, and every pod will be compromised --- then design so each of those costs a rotation and a redeploy, not a breach. That assumption, not any single tool, is what separates a senior architecture from a junior one.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Security is not a layer in the stack; it is a set of enforcement points \emph{distributed through} the stack you already built. Read the diagram as "one control per boundary you have already crossed in this book".
+
+\begin{wbfigure}{Fig 12.0 — Today's controls are enforcement points on boundaries you already built. Each one limits a different blast radius.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=70mm, minimum height=7.4mm, align=left, text width=64mm}]
+  \node[lyr, wbboxsec] (dev) {\textbf{Developer \& repo} \hfill \scriptsize push protection · SAST · Day 2};
+  \node[lyr, wbboxsec, below=of dev] (ci) {\textbf{CI pipeline} \hfill \scriptsize SCA · image scan · OIDC · Day 9};
+  \node[lyr, wbboxsec, below=of ci] (reg) {\textbf{Registry \& artifact} \hfill \scriptsize signing · provenance · Day 4};
+  \node[lyr, wbboxk8s, below=of reg] (k8s) {\textbf{Cluster runtime} \hfill \scriptsize RBAC · NetworkPolicy · Day 5--6};
+  \node[lyr, wbboxaccent, below=of k8s] (sec) {\textbf{Secrets plane} \hfill \scriptsize Vault / Secrets Manager · dynamic creds};
+  \node[lyr, wbboxcloud, below=of sec] (iam) {\textbf{Cloud IAM} \hfill \scriptsize scoped roles · no static keys · Day 10};
+  \foreach \a/\b in {dev/ci,ci/reg,reg/k8s,k8s/sec,sec/iam}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=4mm of sec, text width=22mm, anchor=west] {this chapter's centre of gravity};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1's \code{chmod 777} warning was least privilege on one host; the enforcement point now moves to the cloud control plane. Day 2's immutable Git object graph is exactly why a deleted secret is still there. Day 4's image layers are why a base image ships CVEs you never wrote. Day 6's RBAC and Day 10's IAM are the policy engines you will audit, Day 9's pipeline is where the gates go, and Day 11's observability is how you \emph{detect} what these controls contain.
+
+\glabel{Where companies use it in production.} Netflix describes an internal "paved road" for application security: rather than asking every team to solve authentication, secret storage and TLS certificates individually, the security organisation ships centralised, secure-by-default platforms so product engineers inherit the correct behaviour without choosing it. Its edge architecture takes the same shape --- external tokens terminate at the Zuul gateway, which converts them into an internal, cryptographically verifiable identity object propagated onward, so no downstream service ever handles a customer credential. GitHub runs secret scanning with \keyterm{push protection}, blocking a push containing a recognised credential pattern before it lands in history. Shopify's hybrid-operations guidance is to centralise secrets behind one retrieval interface with different back ends per environment, so credentials stop being scattered across environment files and deploy scripts.
+
+\glabel{Common misconceptions.} That a Kubernetes Secret is encrypted (it is base64-encoded, and by default stored in plaintext in etcd); that deleting a committed secret in a follow-up commit removes it (it does not, and the secret is already burned); that "we scan our dependencies" covers the supply chain (it misses everything in the base image); that a private cluster network is a security boundary (by default every pod can reach every other pod).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 12.1 — The Day 12 territory. One principle, four enforcement domains, and one incident path when it all fails anyway.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (lp) {Least privilege\\identity · scope · time};
+  \node[wbboxcloud, above right=4mm and 12mm of lp] (iam) {IAM \& RBAC\\policy evaluation};
+  \node[wbboxsec, below right=4mm and 12mm of lp] (sec) {Secrets\\rest · transit · memory};
+  \draw[wbarrow] (lp)--(iam); \draw[wbarrow] (lp)--(sec);
+  \node[wbboxcloud, right=of iam] (aud) {Audit\\unused access};
+  \node[wbboxaccent, right=of sec] (dyn) {Dynamic creds\\lease · TTL · revoke};
+  \draw[wbarrow] (iam)--(aud); \draw[wbarrow] (sec)--(dyn);
+  \node[wbboxsec, below=9mm of sec] (sup) {Supply chain\\SAST · SCA · image};
+  \node[wbboxk8s, right=of sup] (np) {NetworkPolicy\\default deny};
+  \draw[wbarrow] (sup)--(np);
+  \draw[wbarrowg] (lp.south) |- (sup.west);
+  \node[wbboxwarn, right=of dyn] (ir) {Leak response\\rotate first};
+  \draw[wbarrow] (dyn)--(ir);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{least privilege} $\rightarrow$ \keyterm{blast radius} $\rightarrow$ \keyterm{static vs dynamic credential} $\rightarrow$ \keyterm{lease / TTL} $\rightarrow$ \keyterm{envelope encryption} $\rightarrow$ \keyterm{SBOM} $\rightarrow$ \keyterm{provenance} $\rightarrow$ \keyterm{lateral movement} $\rightarrow$ \keyterm{defense in depth}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad Least Privilege as a Mechanism, Not a Slogan}
+
+\glabel{What is it?} Every identity --- human, service account, CI job, pod --- holds exactly the permissions it needs, on exactly the resources it needs, for no longer than it needs them. Three axes: \emph{who}, \emph{what}, \emph{how long}. Most teams remember the first, approximate the second, and ignore the third.
+
+\glabel{Why does it exist?} Before identity systems, access control was the Unix model of Day 1: a handful of users and groups, and \code{root} for anything awkward. That scaled to one machine, not to a thousand ephemeral ones, so operators did the obvious thing --- they created one admin credential and shared it. Every large breach post-mortem of the last two decades contains a sentence of the form "the attacker obtained credentials for X and, because those credentials were broadly scoped, was able to reach Y". Least privilege exists to make that second clause impossible to write.
+
+\glabel{How does it work internally?} You cannot audit a policy engine you cannot simulate in your head. Both engines you use are \emph{deny by default with explicit allow}, but they differ crucially.
+
+AWS IAM evaluates a request against every applicable policy --- identity, resource, permission boundaries, SCPs, session policies --- with fixed precedence: an \textbf{explicit deny anywhere wins immediately}; otherwise the request needs an \textbf{explicit allow} in every applicable category; otherwise the implicit deny stands. This is why an organisation-level SCP makes an account-level \code{Allow} irrelevant, and why "but I attached AdministratorAccess" does not always work.
+
+Kubernetes RBAC is smaller and purely additive: there is \emph{no} deny rule at all. A request is allowed if \emph{any} \code{RoleBinding} or \code{ClusterRoleBinding} grants the (verb, resource, namespace) triple to the subject. Because there are no denies, you cannot carve out an exception --- the only way to reduce a subject's power is to stop granting it. That single fact is why \code{cluster-admin} bound to a service account is unrecoverable without editing the binding.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{27mm} X X@{}}
+\wbtablehead{Property} & \wbtablehead{AWS IAM} & \wbtablehead{Kubernetes RBAC}\\
+Explicit deny & Yes --- always wins & \textbf{Does not exist}\\
+Combination & Intersection across policy types & Pure union of all bindings\\
+Scope unit & ARN + condition keys & namespace + resource + verb\\
+Reducing access & Add a deny, boundary or SCP & Remove or narrow the binding\\
+\end{tabularx}
+\end{center}
+
+\begin{behind}
+Kubernetes has a second, quieter authoriser in front of RBAC: the \keyterm{Node authoriser}, which restricts what a kubelet may read --- roughly, only the Secrets and ConfigMaps mounted by pods scheduled on \emph{that node}. Without it, one compromised node could read every Secret in the cluster. This is also why bound, audience-scoped ServiceAccount tokens replaced the old forever-valid tokens that used to be auto-mounted into every pod.
+\end{behind}
+
+\glabel{When should I use it?} Always, but the practical entry point is \emph{new} grants. Retro-fitting least privilege across an existing account is a multi-month project; making every new role start from an empty policy and grow by observed need costs nothing.
+
+\glabel{When should I \emph{not}?} Do not hand-craft resource-level policies for a three-person prototype in a sandbox with no customer data --- you will spend the week debugging \code{AccessDenied}. Use a broad role there, then let tooling generate the tight policy from the record of what the workload actually did. Observe, then constrain.
+
+\glabel{Production example.} AWS's own recommended path is mechanical rather than heroic. IAM Access Analyzer runs two distinct analyses: \emph{policy generation}, which reads CloudTrail logs for a principal over a chosen window and emits a policy containing only the actions actually used; and \emph{unused access} findings, which continuously flag unused roles, unused access keys and, for active principals, untouched services and actions. Large organisations run the second as a scheduled report and treat "unused for 90 days" as an automatic ticket. The insight worth stealing: least privilege becomes tractable the moment it is driven by \emph{measured} access rather than by a design meeting.
+
+\begin{secwarn}[the wildcard that looks harmless]
+\code{iam:PassRole} with \code{Resource: "*"} is one of the most consequential grants in AWS, and it appears in countless "CI deploy" policies. It lets the principal hand \emph{any} role to \emph{any} service --- so a pipeline that can create a Lambda function and pass an administrator role has, in effect, administrator. Always scope \code{PassRole} to specific role ARNs and add an \code{iam:PassedToService} condition. The same class of bug in Kubernetes is granting \code{create} on \code{pods} in a namespace whose service account is powerful: pod creation is arbitrary code execution as that identity.
+\end{secwarn}
+
+\wbsub{3.2\quad What a Secret Actually Is: at Rest, in Transit, in Memory}
+
+\glabel{What is it?} A secret is any value whose disclosure grants access --- a password, an API token, a TLS private key. The engineering question is never "is it secret?" but "in which of its three states is it exposed, and to whom?"
+
+\glabel{Why does it exist as a separate discipline?} Configuration and secrets look identical --- both are strings in a file --- but have opposite lifecycles. Configuration should be versioned, diffed, reviewed and copied freely; a secret must be none of those. Teams that treat them as one category end up with credentials in Git, because Git is where configuration correctly belongs.
+
+\glabel{How does it work internally? --- the three states.}
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} X L{34mm}@{}}
+\wbtablehead{State} & \wbtablehead{Where it lives, and the real threat} & \wbtablehead{The control that helps}\\
+At rest & Disk, etcd, a backup, an S3 object, a laptop. Threat: anyone who reads the storage or restores the backup. & Envelope encryption with an external KMS; short TTLs so old copies are useless.\\
+In transit & Hops between the store, the API server, the kubelet and the pod. Threat: interception, a rogue proxy. & TLS everywhere; mTLS between control-plane components.\\
+In memory & The heap, environment variables, \code{/proc}. Threat: a crash dump, a log line, an exception trace, any child process. & Files with \code{0400} over env vars; never log the value.\\
+\end{tabularx}
+\end{center}
+
+\glabel{The base64 point, precisely.} A Kubernetes Secret's \code{data} field is base64. Base64 is a \emph{transport encoding} that maps arbitrary bytes to a safe ASCII alphabet --- it takes no key, and \code{base64 -d} reverses it in one command. It exists so binary values (a TLS key, a certificate) survive YAML. It provides zero confidentiality. What a Secret really buys you over a ConfigMap is that it is a distinct RBAC resource type (you can grant \code{get} on ConfigMaps without granting it on Secrets), that the kubelet only delivers it to nodes running pods that reference it, and that it can be selected for encryption at rest.
+
+\glabel{What encryption at rest actually requires.} By default the API server writes Secret objects into etcd unencrypted. To change that you supply an \code{EncryptionConfiguration} via \code{-{}-encryption-provider-config}, listing providers for the \code{secrets} resource. The serious option is the \keyterm{KMS provider}, which uses \keyterm{envelope encryption}: the API server generates a unique \keyterm{data encryption key} (DEK) per resource, encrypts the object with it, and sends the DEK to an external KMS to be wrapped by a \keyterm{key encryption key} (KEK) that never leaves the KMS. etcd stores the ciphertext plus the wrapped DEK; on read the API server has the KMS unwrap it. The property this buys: an attacker with a raw etcd snapshot holds ciphertext and wrapped keys, and no way to unwrap them without also compromising the KMS and the IAM permission to call it.
+
+\begin{wbfigure}{Fig 12.2 — Envelope encryption. The key that matters never leaves the KMS, so an etcd backup on its own is useless.}
+\wbscale{\begin{tikzpicture}[node distance=4.6mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.2mm, align=left, text width=56mm}]
+  \node[stg] (a) {\textbf{1 · Secret written} \hfill \scriptsize kubectl apply / controller};
+  \node[stg, wbboxaccent, below=of a] (b) {\textbf{2 · API server makes a DEK} \hfill \scriptsize unique per resource};
+  \node[stg, wbboxsec, below=of b] (c) {\textbf{3 · KMS wraps the DEK} \hfill \scriptsize KEK never leaves the KMS};
+  \node[stg, wbboxcloud, below=of c] (d) {\textbf{4 · etcd stores ciphertext + wrapped DEK} \hfill \scriptsize read path reverses it};
+  \foreach \x/\y in {a/b,b/c,c/d}{\draw[wbarrow] (\x)--(\y);}
+  \node[wbcap, right=4mm of c, text width=22mm, anchor=west] {this call needs IAM permission};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{misconception}
+"We enabled encryption at rest, so Secrets are safe." Encryption at rest defends against \emph{offline} access to storage --- a stolen disk, a leaked backup, a misconfigured snapshot. It does nothing against an attacker who can call the API server, because the API server decrypts on read by design. If a principal has \code{get secrets} in a namespace, encryption at rest is invisible to them. RBAC, not encryption, is the control for that threat.
+\end{misconception}
+
+\begin{k8sbox}[secret-vs-reality.yaml]
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudbase-db
+type: Opaque
+data:
+  # base64 is ENCODING, not encryption. Anyone with `get secrets` here
+  # reads the plaintext: kubectl get secret cloudbase-db \
+  #   -o jsonpath='{.data.password}' | base64 -d
+  password: c3VwZXJzZWNyZXQxMjM=
+\end{k8sbox}
+
+\begin{secwarn}[env vars leak in more places than you think]
+Injecting a secret as an environment variable exposes it to every child process, to \code{/proc/<pid>/environ}, to crash dumps, to APM agents that snapshot the environment, and --- most commonly --- to an exception handler that helpfully prints the whole environment into your Day 11 log pipeline. Mounting it as a file with mode \code{0400} narrows that to one path one process reads once.
+\end{secwarn}
+
+\wbsub{3.3\quad Dynamic Secrets: Making Credentials Expire by Construction}
+
+\glabel{What is it?} Instead of storing one long-lived database password and distributing it, the application asks a broker for credentials at startup. The broker \emph{creates a brand-new database user on the spot}, returns it with a lease, and destroys that user when the lease expires. Every workload instance gets a distinct, short-lived identity.
+
+\glabel{Why does it exist?} Static credentials have an unbounded exposure window. A password created in 2021 and stored in a config repo, a CI variable, three laptops and a Slack thread cannot meaningfully be rotated, because nobody knows the distribution list --- so rotation never happens and the credential's value to an attacker grows monotonically. Dynamic secrets invert the economics: the useful lifetime is an hour, a leaked credential is usually already dead, and rotation stops being an operation anyone performs.
+
+\glabel{How does it work internally?} HashiCorp Vault's database secrets engine is the canonical implementation and worth understanding mechanically.
+
+\begin{wbitem}
+  \item \textbf{Connection.} Vault holds one privileged \emph{root} connection. Standard practice is to hand it the root credential once and immediately call \code{rotate-root}, so from then on no human knows it.
+  \item \textbf{Role.} A role maps a name to \code{creation\_statements} --- literal SQL with \code{\{\{username\}\}}, \code{\{\{password\}\}} and \code{\{\{expiration\}\}} placeholders --- plus a default and maximum TTL.
+  \item \textbf{Request.} A client authenticates (in Kubernetes, by presenting its projected ServiceAccount token, which Vault verifies via the TokenReview API) and reads \code{database/creds/<role>}. Vault runs the creation statements and returns a unique username and password.
+  \item \textbf{Lease.} Vault's expiration manager tracks every outstanding lease and, on expiry or revoke, runs the revocation statements to drop the user. The dynamic-role default TTL is one hour.
+  \item \textbf{Renew or re-read.} A long-running app renews within \code{max\_ttl}, then requests fresh credentials and reconnects --- which is why connection pools need a "credentials changed" path. That is the single most common integration bug.
+\end{wbitem}
+
+\begin{bashbox}[vault-database-engine.sh]
+# 1. Point the engine at Postgres, then burn the root password
+vault write database/config/cloudbase-pg \
+  plugin_name=postgresql-database-plugin allowed_roles="orders-ro" \
+  connection_url="postgresql://{{username}}:{{password}}@pg:5432/orders"
+vault write -f database/rotate-root/cloudbase-pg   # now nobody knows it
+
+# 2. A role = the exact SQL Vault runs, plus how long the user may live
+vault write database/roles/orders-ro db_name=cloudbase-pg \
+  default_ttl=1h max_ttl=8h \
+  creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD \
+    '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT ON ALL \
+    TABLES IN SCHEMA public TO \"{{name}}\";"
+
+# 3. What the workload does - a different database user every single time
+vault read database/creds/orders-ro
+\end{bashbox}
+
+\glabel{What Vault is doing beneath that.} Vault's storage holds only ciphertext. On start it is \emph{sealed}: the key protecting the data is itself encrypted by a master key Vault does not have. Unsealing reconstructs it --- classically from Shamir shares held by different people, in production via auto-unseal delegated to a cloud KMS. Same envelope pattern as Kubernetes KMS encryption, one level up: the root of trust sits deliberately outside the system that needs it.
+
+\glabel{When should I use it?} Anything with a database, and any credential whose blast radius exceeds one service. Dynamic credentials also give audit teams something no other approach can: because every workload has a distinct database user, a slow query or a destructive statement is attributable to a specific pod and lease.
+
+\glabel{When should I \emph{not}?} Self-hosting Vault is a real operational commitment --- an HA quorum, unseal key custody, upgrade discipline, and a hard dependency that can stop every deploy when unavailable. For a small AWS-only team, Secrets Manager with rotation Lambdas or SSM Parameter Store with KMS gives most of the benefit with none of the on-call burden. And some third-party APIs simply issue one static key with no rotation API: accept it, store it centrally, scope it as tightly as the vendor allows, and monitor its use.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{34mm} X L{30mm}@{}}
+\wbtablehead{Approach} & \wbtablehead{How it actually works} & \wbtablehead{Choose it when}\\
+Env vars from a store & CI or orchestrator injects at deploy; nothing committed & Baseline; the minimum bar\\
+External Secrets Operator & Controller syncs an external store into native K8s Secrets & Existing charts must work unchanged\\
+Secrets Store CSI driver & Mounts secrets as a volume at pod start, as the pod's ServiceAccount & The value must never become an etcd object\\
+Vault dynamic secrets & Creates and destroys a per-workload DB user under a lease & Rotation must be automatic and attributable\\
+AWS Secrets Manager / SSM & Managed, IAM-integrated, rotation via Lambda & AWS-centric team, low ops overhead\\
+\end{tabularx}
+\end{center}
+
+\begin{tradeoff}
+The Secrets Store CSI driver and the External Secrets Operator solve the same problem with opposite trade-offs. ESO writes a real Kubernetes Secret, so everything that already consumes Secrets keeps working --- but the value now lives in etcd, visible to anyone with \code{get secrets}. The CSI driver mounts it straight into the pod's filesystem, so it never becomes an API object --- but the app must read a file, and nothing expecting \code{envFrom} works unchanged. Compatibility versus exposure surface: pick deliberately, and write down why.
+\end{tradeoff}
+
+\wbsub{3.4\quad The Supply Chain: Three Scans That See Three Different Things}
+
+\glabel{What is it?} Your artefact is not just your code. A container image is a few hundred lines you wrote, several hundred transitive dependencies you did not read, and an entire OS userland from the base image. Supply-chain security means knowing and gating all three.
+
+\glabel{Why does it exist?} Because attackers moved upstream: compromising one popular build tool or library reaches thousands of organisations at once, where attacking each individually does not scale. Once that arithmetic was obvious, "we review our own code" stopped being a defence.
+
+\glabel{How does it work internally?} The three scan types read three different inputs --- which is the whole point.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{25mm} L{30mm} X@{}}
+\wbtablehead{Scan} & \wbtablehead{Input it reads} & \wbtablehead{What it alone can never see}\\
+SAST & Your source, as a syntax tree / data-flow graph & Anything in a dependency or in the OS layer; also blind to runtime config\\
+Dependency (SCA) & The lockfile / dependency graph, matched against CVE databases & OS packages baked into the base image; logic flaws in your own code\\
+Image scanning & The image's package databases across all layers & Your source logic; a vulnerable dependency vendored without a lockfile entry\\
+\end{tabularx}
+\end{center}
+
+An image scanner such as Trivy or Grype does not "look for malware". It unpacks each layer, reads the package metadata it finds --- the \code{dpkg}/\code{rpm}/\code{apk} databases plus language manifests like \code{package-lock.json} --- builds an inventory (a \keyterm{Software Bill of Materials}, or SBOM), and joins it against vulnerability feeds keyed by package name and version. Two consequences follow. A result is only as fresh as the feed, so \emph{the same image scanned tomorrow can fail} --- which is why you re-scan the registry. And a package installed by unpacking a tarball rather than through a package manager is invisible, because it left no metadata.
+
+\begin{bashbox}[ci-security-gates.sh]
+set -euo pipefail
+semgrep ci --config auto                        # gate 1 - your own source
+trivy fs --scanners vuln --severity CRITICAL,HIGH --exit-code 1 .   # gate 2
+
+# Gate 3 - the built image, including all the base image dragged in.
+# --ignore-unfixed matters: a CVE with no upstream fix cannot be actioned
+# today, and blocking on it only teaches the team to bypass the gate.
+trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+  --format sarif --output trivy.sarif "ghcr.io/cloudbase/api:${GIT_SHA}"
+
+# Keep the SBOM as a build artefact: it answers "are we affected?" the day
+# a new CVE lands, without rebuilding anything.
+trivy image --format cyclonedx --output sbom.json "ghcr.io/cloudbase/api:${GIT_SHA}"
+\end{bashbox}
+
+\glabel{Production example.} GitHub's build attestations follow the SLSA provenance model and sign through Sigstore: rather than long-lived signing keys, the CI job's OIDC identity is exchanged at the Fulcio CA for a short-lived certificate, the signature is recorded in the Rekor transparency log, and the private key is discarded. The verification question changes shape --- from "do I trust this key?" to "was this artefact built by \emph{that} workflow, in \emph{that} repository, at \emph{that} commit?" It is dynamic credentials applied to signing.
+
+\begin{seniornote}
+The scanner is not the hard part; installing Trivy takes ten minutes. The hard part is the day it reports 340 findings on an image built from a base you did not choose. Junior response: raise the severity threshold and ship. Senior response: change the input. Moving from a general-purpose base to a slim or distroless one often drops the OS package count --- and therefore the CVE count --- by an order of magnitude, because most of those packages were a shell, a package manager and a locale database you never used. Fix the supply, not the report.
+\end{seniornote}
+
+\begin{misconception}
+"The build passed the scan, so the image is safe." A scan is a statement about \emph{known} CVEs at \emph{that instant} --- nothing about zero-days, your own logic bugs, or tomorrow's disclosures. A passing scan is evidence you are not shipping a \emph{known} problem: genuinely valuable, genuinely limited.
+\end{misconception}
+
+\wbsub{3.5\quad NetworkPolicies: Containing the Pod You Have Already Lost}
+
+\glabel{What is it?} A Kubernetes object restricting which pods may talk to which pods, on which ports, selected by labels --- the same mechanism Services use from Day 5.
+
+\glabel{Why does it exist?} Kubernetes' network model mandates that every pod reach every other pod without NAT. That flatness makes discovery and scheduling simple --- and lets a compromised front-end pod open a TCP connection to the database, the metrics backend, the cloud metadata endpoint and every other namespace. The pre-Kubernetes control, a security group per subnet tier, does not work when every workload shares nodes and IP space. NetworkPolicy restores segmentation at the identity level rather than the IP level.
+
+\glabel{How does it work internally?} Three mechanics, and beginners get all three wrong at least once.
+
+\begin{wbitem}
+  \item \textbf{The API object does nothing on its own.} Enforcement lives in the CNI plugin --- Calico, Cilium, Antrea. On a cluster whose CNI does not implement NetworkPolicy, the object is accepted and silently has no effect. Calico programs iptables (or eBPF) rules per node; Cilium compiles eBPF programs onto the pod's virtual interface. Either way enforcement is per-node and per-packet, never centralised.
+  \item \textbf{Isolation is opt-in per pod, then deny-by-default.} A pod is non-isolated until \emph{some} policy selects it. The moment one selects it with \code{Ingress} in \code{policyTypes}, all ingress not explicitly allowed is dropped. Hence the correct pattern: a default-deny with an empty \code{podSelector: \{\}} first, then narrow allow policies.
+  \item \textbf{Policies are additive and unordered.} No deny rule, no precedence --- exactly like RBAC. What is permitted is the union of all matching allow rules. You cannot write "allow everything except X".
+\end{wbitem}
+
+A fourth mechanic causes more incidents than the other three combined: a default-deny \emph{egress} policy also blocks DNS. CoreDNS is a pod like any other, so every workload instantly fails to resolve anything, and the symptom looks like a total application outage rather than a policy problem. Every default-deny egress policy needs a companion rule allowing UDP and TCP 53 to the DNS pods.
+
+\begin{wbfigure}{Fig 12.4 — Default-deny then explicit allow. The dashed boundary is enforced by the CNI on each node, not by a firewall appliance.}
+\wbscale{\begin{tikzpicture}[node distance=6mm and 12mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxk8s] (api) {order-api\\app=order-api};
+  \node[wbboxk8s, right=28mm of api] (db) {postgres\\app=postgres};
+  \node[wbboxwarn, below=9mm of api] (bad) {compromised\\sidecar pod};
+  \node[wbboxops, above=8mm of api] (ing) {ingress-nginx};
+  \draw[wbflow] (ing)--(api);
+  \draw[wbarrow] (api)--node[wbcap,above]{tcp/5432 allowed}(db);
+  \draw[wbarrowg, dashed, draw=cSecurity] (bad) -- node[wbcap,text=cSecurity,pos=0.5,fill=cFigBg,inner sep=1.2pt]{dropped by CNI} (db);
+  \begin{scope}[on background layer]
+    \node[wbzonesec, fit=(api)(db)(bad)] (ns) {};
+    \node[wbzonelabelsec, anchor=south west] at ([yshift=0.5mm]ns.north west) {namespace cloudbase · default-deny ingress};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{k8sbox}[netpol-default-deny-then-allow.yaml]
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: cloudbase
+spec:
+  podSelector: {}         # every pod becomes ingress-isolated;
+  policyTypes: [Ingress]  # no rules at all means allow nothing
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-order-api
+  namespace: cloudbase
+spec:
+  podSelector:
+    matchLabels: { app: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: order-api }
+      ports:
+        - protocol: TCP
+          port: 5432
+\end{k8sbox}
+
+\begin{secwarn}[the two-space bug that opens the whole cluster]
+In a \code{from} list, a dash before \code{namespaceSelector} starts a new element; without it, \code{namespaceSelector} and \code{podSelector} combine into one. Two elements mean \emph{OR} --- "pods labelled X here, OR every pod in namespaces labelled Y". One combined element means \emph{AND}. The wrong indentation silently widens the policy from one deployment to a whole set of namespaces, and \code{kubectl apply} reports success either way. Verify a policy by \emph{testing a connection that must fail}, never by reading the YAML.
+\end{secwarn}
+
+\glabel{When should I \emph{not}?} Do not hand-write policies for forty microservices on day one; you will produce forty policies nobody can reason about and an on-call engineer who deletes them all at 3am. Start with the boundaries that matter: default-deny in the namespace holding data, an explicit allow for the app tier, and an egress rule blocking pods from reaching the cloud metadata endpoint. Those three cover most real lateral-movement paths. Note the honest limits too: NetworkPolicy is layer 3/4 only --- no HTTP paths, no methods --- and \code{hostNetwork: true} pods bypass it entirely. Layer-7 policy is a service-mesh concern.
+
+\wbsub{3.6\quad When a Secret Leaks: the Only Correct Order of Operations}
+
+\glabel{What is it?} An incident procedure. Someone commits a credential and pushes; a token appears in a CI log; a key lands in a Jira attachment. A team is measured by the next fifteen minutes.
+
+\glabel{How does it work internally? --- why deletion does not help.} From Day 2 you know Git stores immutable objects addressed by content hash, and a commit merely points at a tree. A follow-up commit that deletes the file creates a \emph{new} tree; the old blob is untouched and remains reachable via the old commit, any tag, every clone, every fork, and every CI cache. On a hosted platform, unreferenced objects can still be fetched by hash until garbage collection runs --- and forks may never garbage-collect at all. Therefore: \textbf{once pushed, the secret is public. Treat the value as burned.}
+
+\glabel{The correct order.} \textbf{Rotate first} --- before rewriting history, before discussing it, before confirming whether anyone actually saw it. Rewriting history is cleanup, and cleanup is worthless while the credential is still valid. Then check the audit log (CloudTrail, Vault audit device, database logs) for use from unexpected sources; then rewrite history with \code{git filter-repo} and force-push, coordinating with everyone holding a clone; then fix the cause --- push protection, a pre-commit hook, or removing the need for a static secret at all.
+
+\begin{bashbox}[leaked-credential-response.sh]
+# STEP 1 - ROTATE. Nothing else matters until this is done.
+aws secretsmanager rotate-secret --secret-id cloudbase/db/orders
+vault lease revoke -prefix database/creds/orders-rw   # if it was dynamic
+
+# STEP 2 - Look for abuse between commit and rotation.
+aws cloudtrail lookup-events --start-time 2026-07-15T00:00:00Z \
+  --lookup-attributes AttributeKey=AccessKeyId,AttributeValue=AKIAEXAMPLE
+
+# STEP 3 - Only now clean history (rewrites every later commit hash).
+git filter-repo --path config/prod.env --invert-paths
+git push --force-with-lease --all
+
+# STEP 4 - Prevent: make the next one impossible to push at all.
+gitleaks protect --staged --redact
+\end{bashbox}
+
+\begin{opsnote}
+Write the runbook before you need it. Under time pressure the on-call engineer does the first thing that feels productive --- almost always deleting the file, because it is visible and satisfying. A one-page runbook whose first line is "ROTATE FIRST" in bold is worth more than any tool you could buy: like Day 11's alert runbooks, its value is removing decision-making from the worst possible moment.
+\end{opsnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Default-deny everywhere: no IAM allow without a resource, no namespace without a default-deny NetworkPolicy.
+  \item Prefer short-lived, dynamically issued credentials; make rotation the system's normal behaviour, not a quarterly project.
+  \item Mount secrets as files with restrictive modes rather than injecting them as environment variables.
+  \item Run SAST, dependency and image scanning as three separate gates, and re-scan images already in the registry.
+  \item Pin base images by digest and shrink the base to shrink the CVE surface --- do not raise the severity threshold.
+  \item Use CI OIDC federation to assume a cloud role, never a long-lived access key. Rotate first, investigate second, rewrite history third.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Believing base64 is encryption, or that encryption at rest protects against a principal holding \code{get secrets}.
+  \item Deleting a leaked secret in a follow-up commit and considering the incident closed.
+  \item Running only dependency scanning and calling the supply chain covered.
+  \item Leaving cluster networking flat, so one compromised pod reaches the database and the metadata endpoint.
+  \item Applying default-deny egress without allowing DNS, then debugging it as an application outage.
+  \item Granting a broad IAM policy under deadline pressure with a \code{TODO} nobody revisits.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the mechanism, you can defend the design decision in a review.
+
+\begin{writespace}[Redraw: envelope encryption --- write and read path, where the DEK lives, where the KEK lives, and what an attacker with only an etcd snapshot holds]
+\reflectionlines[5]
+\end{writespace}
+
+\begin{writespace}[Redraw: a namespace with default-deny ingress plus one allow policy. Mark which arrows the CNI drops, and add the egress rule DNS needs]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Harden CloudBase End to End}
+
+\textbf{Goal.} Take the running, observable CloudBase of Day 11 and remove its three standing weaknesses: static secrets, an unguarded supply chain, a flat pod network. Practise the \emph{decisions}, not the typing.
+
+\resetlab
+\labstep{Inventory every secret CloudBase currently holds}
+Grep the repository, Helm values, CI variables and running manifests. For each secret record: what it grants, who can read it, when it was last rotated, how many copies exist.
+\labwhy{You cannot apply least privilege to an inventory you do not have. This step almost always finds a credential nobody knew was live --- and "last rotated: never" justifies the rest of the day.}
+
+\labstep{Enable encryption at rest, and prove it changes nothing you can see}
+Configure a KMS provider for the \code{secrets} resource, then read a Secret through the API as a user holding \code{get secrets}.
+\labwhy{You will see plaintext, exactly as before. Encryption at rest defends storage; RBAC defends the API. Confusing the two is the most common security misconception in Kubernetes.}
+
+\labstep{Replace the database password with a dynamic credential, then delete the old one}
+Configure the secrets engine against CloudBase's Postgres, define a role with a one-hour TTL, have the API obtain credentials at startup via its ServiceAccount identity --- then drop the original database user entirely and watch what breaks.
+\labwhy{The workload's identity becomes its ServiceAccount token rather than a shared string, which forces you to design what your connection pool does at lease expiry. And the dependency graph of a shared credential is invisible until you cut it: better discovered deliberately at 2pm than during an incident.}
+
+\labstep{Add the three scanning gates, then fail the build on purpose}
+SAST advisory, dependency scanning blocking on CRITICAL and HIGH, image scanning blocking with \code{-{}-ignore-unfixed}, SBOM retained. Then pin a deliberately old base image, watch the gate block, and fix it by switching to a slim or distroless base.
+\labwhy{Blocking on findings with no upstream fix teaches the team to bypass the gate, which is worse than no gate. And the fix for a vulnerability report is usually a change of input, not a change of threshold.}
+
+\labstep{Apply default-deny, then the minimum allow set}
+Default-deny ingress in the CloudBase namespace, then allow ingress-controller to API, API to Postgres on 5432, and everything to DNS.
+\labwhy{Building the allow list from an empty set is what makes the policy readable. Starting from allow-all and subtracting is how you get rules nobody dares delete.}
+
+\labstep{Prove the isolation, do not assume it}
+From a throwaway debug pod, open a TCP connection to Postgres --- it must fail. From the API pod --- it must succeed.
+\labwhy{A NetworkPolicy that silently does nothing (wrong labels, wrong namespace, a CNI that does not enforce policy) looks identical to one that works. The only evidence is a connection that fails.}
+
+\begin{prodtip}
+Do the final step twice: once with your CNI enforcing policy, once on a cluster that does not enforce NetworkPolicy at all (a plain kind cluster will do). Both accept the object; only one drops the packet. Having seen that failure mode once, you will check for it first every time a policy "does not work".
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+Dynamic credentials with a one-hour TTL are strictly better than a static password --- until Vault is unavailable, and now no pod can start or reconnect. You have traded a confidentiality risk for an availability risk. How would you quantify that trade, and what would you actually build to make the availability side acceptable?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Kubernetes RBAC deliberately has no deny rule; AWS IAM's explicit deny always wins. Both designs are defensible. What does each choice make easy, and what does each make dangerous? Which would you rather audit at 3am, and why?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Your image scanner reports 340 vulnerabilities: 12 CRITICAL, 9 of them with no available fix. The release is due tomorrow. What decision do you make, what evidence supports it, and --- most importantly --- what do you put in place so this conversation does not recur next month?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Every pod suddenly cannot resolve anything after a "security improvement"}
+\textbf{Symptom.} A default-deny egress NetworkPolicy was applied to the \code{cloudbase} namespace at 14:02. By 14:03 every service is failing with name-resolution errors, not connection refusals. The cluster looks healthy: nodes Ready, pods Running, no restarts.
+
+\begin{outbox}[kubectl logs deploy/order-api  and  kubectl get netpol]
+2026-07-19T14:03:11Z ERROR db.pool: dial tcp: lookup pg.cloudbase.svc
+  .cluster.local on 10.96.0.10:53: read udp 10.244.2.17:41233->10.96.0.10:53:
+  i/o timeout
+
+NAME                   POD-SELECTOR   AGE
+default-deny-egress    <none>         67s
+db-allow-order-api     app=postgres   9d
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The failure is at DNS resolution and began exactly when an egress policy was applied. Pods are Running --- not a scheduling or image problem.
+  \item \textbf{Hypothesise.} The policy made every pod egress-isolated. CoreDNS is an ordinary pod, so traffic to it on port 53 is now dropped like any other egress.
+  \item \textbf{Investigate.} Confirm the policy has \code{Egress} in \code{policyTypes} and no \code{egress} rules at all; from a pod try \code{nc -zvu 10.96.0.10 53}.
+  \item \textbf{Root cause.} Default-deny egress with no companion DNS allow rule --- every lookup is dropped by the CNI before it leaves the pod's interface.
+  \item \textbf{Fix.} Add an egress rule allowing UDP and TCP 53 to the DNS pods, selected by a \code{namespaceSelector} for kube-system plus the DNS pod labels. Verify resolution from a debug pod.
+  \item \textbf{Prevent.} Ship default-deny egress and the DNS allow rule as one atomic change, and add a smoke test that resolves a service name and fails the rollout if it cannot.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The deployment works in staging and gets AccessDenied in production}
+\textbf{Symptom.} The CI job assumes a role and calls S3. Identical pipeline, identical policy JSON, works in staging, denied in production. The engineer has already attached a second, broader policy --- still denied, which is the clue.
+
+\begin{outbox}[CI step output, production account]
+Run: aws s3 cp ./dist s3://cloudbase-prod-artifacts/build-4831/ --recursive
+upload failed: ./dist/app.tar.gz to s3://cloudbase-prod-artifacts/...
+An error occurred (AccessDenied) when calling the PutObject operation:
+User: arn:aws:sts::4455:assumed-role/cloudbase-ci/gha-4831 is not authorized
+to perform: s3:PutObject on resource: "arn:aws:s3:::cloudbase-prod-artifacts
+/build-4831/app.tar.gz" with an explicit deny in a service control policy
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The message names the deciding policy type: \emph{an explicit deny in a service control policy}. Adding allows cannot help --- that is what "explicit deny" means in IAM evaluation.
+  \item \textbf{Hypothesise.} The production account sits under an OU with an SCP constraining S3 --- to approved buckets, prefixes, or a required condition such as encryption or region.
+  \item \textbf{Investigate.} Read the SCPs on the account's OU and the root; re-run the IAM policy simulator against the production principal; compare with staging's OU.
+  \item \textbf{Root cause.} A guardrail SCP requires \code{s3:x-amz-server-side-encryption} on \code{PutObject}; the upload does not set it, so the SCP denies regardless of identity policy.
+  \item \textbf{Fix.} Set the encryption header (or enable bucket default encryption and match the condition). Then remove the broader policy attached while debugging --- it grants real access and fixed nothing.
+  \item \textbf{Prevent.} Make guardrails discoverable: document them, and run \code{simulate-principal-policy} as a pre-merge check so the denial surfaces in review, not in a production deploy.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~40 min}
+\textbf{Goal.} Prove a Kubernetes Secret is not encrypted, and that RBAC is the control that matters.\\
+\textbf{Business context.} A teammate argued in review that "Secrets are encrypted, so a ConfigMap and a Secret are equivalent". Settle it with evidence.\\
+\textbf{Architecture.} One local cluster, one Secret, two ServiceAccounts with different RBAC.\\
+\textbf{Requirements.} Create a Secret; decode it in one command; create a ServiceAccount with \code{get} on ConfigMaps but not Secrets and show the difference.\\
+\textbf{Constraints.} No external secret store --- this lab is about the primitive itself.\\
+\textbf{Hints.} \code{kubectl auth can-i get secrets -{}-as=system:serviceaccount:ns:sa}.\\
+\textbf{Expected outcome.} A note stating what base64 gives you (nothing) and what the Secret type gives you (separate RBAC resource, node-scoped delivery, encryption eligibility).\\
+\textbf{Production considerations.} Which of your namespaces grant \code{get secrets} more broadly than intended?\\
+\textbf{Common pitfalls.} Concluding "Secrets are useless" --- the type matters, just not for the reason people assume.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~75 min}
+\textbf{Goal.} Add three scanning gates to the Day 9 pipeline and tune them until they are actionable rather than ignored.\\
+\textbf{Business context.} A dependency CVE reached production last quarter; leadership wants a gate, engineering does not want one that blocks every release.\\
+\textbf{Architecture.} CI job $\rightarrow$ SAST $\rightarrow$ dependency scan $\rightarrow$ build $\rightarrow$ image scan $\rightarrow$ push.\\
+\textbf{Requirements.} Three separate steps; blocking on CRITICAL and HIGH with unfixed excluded; SBOM retained; SARIF uploaded so findings appear in review.\\
+\textbf{Constraints.} The security stage must add under two minutes --- cache the vulnerability database between runs.\\
+\textbf{Hints.} Pin a deliberately old base image first, so you see a real failure before tuning anything.\\
+\textbf{Expected outcome.} A pipeline that blocks a bad image, passes a good one, and a written exception policy.\\
+\textbf{Production considerations.} Who grants an exception, for how long, recorded where? A gate with no exception path gets disabled the first time it is inconvenient.\\
+\textbf{Common pitfalls.} Blocking on unfixed CVEs; never re-scanning the registry; treating a passing scan as proof of safety.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2.5 hours}
+\textbf{Goal.} Eliminate every static long-lived credential from CloudBase, and prove it.\\
+\textbf{Business context.} An audit requires no credential lifetime over 24 hours, and every database action attributable to a workload.\\
+\textbf{Architecture.} Workload identity (ServiceAccount / IRSA) $\rightarrow$ secrets broker $\rightarrow$ leased database credentials; CI authenticates by OIDC federation, not an access key.\\
+\textbf{Requirements.} Per-workload credentials with a one-hour TTL; no stored cloud key; clean reconnection on lease expiry; audit logging on every secret read.\\
+\textbf{Constraints.} Zero downtime --- old and new credential paths must both work during the cutover.\\
+\textbf{Hints.} Run both behind a flag, migrate one deployment, confirm in the audit log that the dynamic path is really being used, then drop the static user.\\
+\textbf{Expected outcome.} A repository-wide grep returning no credential material, plus an audit excerpt showing per-pod database users.\\
+\textbf{Production considerations.} What happens if the broker is down for ten minutes during a rolling deploy? Write the answer down.\\
+\textbf{Common pitfalls.} A pool that caches credentials for the process lifetime and fails silently at the one-hour mark; forgetting migration jobs and cron tasks hold the old credential too.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{seniornote}
+The most valuable security artefact a platform team produces is not a policy document --- it is a \emph{paved road}. If the easy way to get a database connection already issues a short-lived credential, and the easy way to build an image already scans and signs it, engineers get the secure behaviour by doing the convenient thing. Security that depends on people choosing the harder path erodes under every deadline. Netflix's application-security programme is built explicitly around this: centralise the hard parts so teams inherit them by default.
+\end{seniornote}
+
+\begin{tradeoff}
+Every control here trades availability for confidentiality. Default-deny means a mislabelled pod cannot talk; short-lived credentials mean an unavailable broker stops deploys; blocking scans mean an unfixable CVE can stop a release. These are real costs, and pretending otherwise is how security teams lose credibility with engineers. Name the cost, measure it, and make the exception path explicit --- a documented, time-boxed, logged override is far safer than a control quietly disabled.
+\end{tradeoff}
+
+\begin{reliability}
+Treat the secrets broker as a tier-0 dependency: cache credentials in the workload for the lease duration so a brief outage restarts nothing; make lease-renewal failures a warning long before they are fatal; and rehearse "broker unavailable" as a game day. A security control that takes production down during its own outage will be removed --- correctly --- by the next on-call engineer.
+\end{reliability}
+
+\begin{interview}
+Expect: \emph{"A secret was committed and pushed --- what do you do?"} The answer that fails is "remove it from history". The one that lands starts with \textbf{rotate or revoke immediately}, because Git objects are immutable and content-addressed, so the value is already public across every clone and fork. Then audit the exposure window, then rewrite history as cleanup, then prevent it structurally. The interviewer is testing whether you know that history rewriting is hygiene, not containment.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+By Day 11 CloudBase runs in production shape: containerised on Kubernetes, provisioned by Terraform, deployed by a pipeline, observable through metrics, logs and traces. It is also, honestly assessed, wide open --- a database password in a manifest, an unscanned image, a flat pod network, an IAM role grown by accretion. Today you close all four.
+
+\begin{buildalong}[Day 12 — harden every boundary]
+\begin{wbitem}
+  \item \textbf{Inventory and evict secrets.} Grep the Day 2 repository, the Day 7 Terraform, the Day 9 CI variables and the Day 6 manifests for credential material. Move every one into the secrets manager (or Vault) and reference it at deploy time --- nothing secret remains in Git, in an image, or in a \code{ConfigMap}.
+  \item \textbf{Go dynamic for the database.} Configure a database secrets engine or managed rotation so the API receives a per-workload credential with a one-hour TTL, authenticating with its ServiceAccount identity. Delete the original static database user and fix whatever breaks.
+  \item \textbf{Encrypt at rest, and document the limit.} Enable a KMS provider for the \code{secrets} resource, then write one paragraph in \code{docs/security.md} on why this does \emph{not} protect a Secret from a principal holding \code{get secrets} --- and what does.
+  \item \textbf{Gate the supply chain.} Extend the Day 9 pipeline with SAST (advisory), dependency scanning and image scanning, the last two blocking on CRITICAL and HIGH with unfixed excluded. Retain an SBOM per build. If the gate blocks, replace the base image --- do not raise the threshold.
+  \item \textbf{Segment the cluster.} Default-deny ingress in the CloudBase namespace, then the minimum allow set: ingress controller $\rightarrow$ API, API $\rightarrow$ Postgres on 5432, and DNS. Prove it with a debug pod whose connection to Postgres is refused.
+  \item \textbf{Audit IAM and RBAC, then write the runbook.} Regenerate the CI role's policy from CloudTrail activity, remove unjustified wildcards, scope \code{iam:PassRole} to named roles, replace stored access keys with OIDC federation, and drop every \code{cluster-admin} binding that is not human break-glass. Then add \code{docs/runbooks/leaked-credential.md} --- rotate, audit, rewrite, prevent --- and enable push protection.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} a repository-wide search for credential material returns nothing; the CloudBase API runs on a database credential that expires within one hour and is attributable to a single pod; the pipeline blocks a deliberately vulnerable image and passes the current one; a debug pod in the CloudBase namespace cannot open a TCP connection to Postgres while the API can; and the leaked-credential runbook has been walked end to end by someone who did not write it.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item Least privilege has three axes --- who, what, \emph{how long}. The third is the one teams skip and the one dynamic credentials solve.
+  \item IAM: explicit deny always wins, and an allow is needed in every applicable policy category. Kubernetes RBAC has no deny at all and is purely additive.
+  \item Base64 is encoding. Encryption at rest needs an \code{EncryptionConfiguration}, ideally a KMS provider --- and it protects storage, not the API.
+  \item A secret exists at rest, in transit and in memory; env vars are the leakiest. SAST, dependency and image scanning read three different inputs; none substitutes for another.
+  \item Pod networking is flat by default: a pod is non-isolated until some policy selects it, and then everything not explicitly allowed is dropped.
+  \item A pushed secret is burned. Rotate first; history rewriting is cleanup, not containment.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item A NetworkPolicy on a cluster whose CNI does not enforce policy is accepted and does nothing --- test with a connection that must fail. Default-deny egress breaks DNS: ship the DNS allow rule in the same change.
+  \item \code{iam:PassRole} with a wildcard resource is effectively privilege escalation.
+  \item The same image can pass a scan today and fail tomorrow --- feeds change. Re-scan what is already in the registry.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item "Secrets are encrypted" \quad$\bullet$\quad deleting a leaked secret instead of rotating it \quad$\bullet$\quad one scan type \quad$\bullet$\quad flat pod networking \quad$\bullet$\quad default-deny egress without DNS \quad$\bullet$\quad wildcard IAM under deadline pressure
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Least privilege}{who · what · how long. Generate policies from observed access; alert on unused access.}
+\cheatitem{IAM vs RBAC}{IAM: explicit deny wins, intersection across policy types. RBAC: no deny, pure union of bindings.}
+\cheatitem{Base64}{a transport encoding with no key. \code{base64 -d} reverses it. Not a security control.}
+\cheatitem{Envelope encryption}{per-resource DEK encrypts the object; a KMS-held KEK wraps the DEK; etcd stores both ciphertexts.}
+\cheatitem{Dynamic secret}{a per-workload DB user under a lease; expiry drops the user, so a leaked one is already dead.}
+\cheatitem{Three scans}{SAST = your source · SCA = your lockfile · image scan = the OS layers you inherited.}
+\cheatitem{NetworkPolicy}{label-selected, additive, no deny rule, CNI-enforced. Default-deny first, then allow.}
+\cheatitem{Leak response}{rotate $\rightarrow$ audit $\rightarrow$ rewrite $\rightarrow$ prevent. In that order, always.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 12 commands worth memorising]
+# --- audit what an identity can actually do ---
+kubectl auth can-i --list --as=system:serviceaccount:cloudbase:order-api
+aws iam simulate-principal-policy --policy-source-arn <role-arn> \
+  --action-names s3:PutObject --resource-arns <bucket-arn>
+
+# --- prove base64 is not encryption ---
+kubectl get secret cloudbase-db -o jsonpath='{.data.password}' | base64 -d
+
+# --- supply chain gates ---
+trivy image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 IMAGE
+trivy image --format cyclonedx --output sbom.json IMAGE
+cosign verify-attestation --type slsaprovenance IMAGE
+
+# --- segmentation: PROVE it (must fail from an unauthorised pod) ---
+kubectl run probe --rm -it --image=nicolaka/netshoot --restart=Never \
+  -- nc -zv postgres 5432
+
+# --- dynamic credentials and leak response (rotate FIRST) ---
+vault read database/creds/orders-rw
+vault lease revoke -prefix database/creds/orders-rw
+aws secretsmanager rotate-secret --secret-id cloudbase/db/orders
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is the very first thing you do when a secret is accidentally committed and pushed --- and why is deleting the file not it?}
+\iq{Why do you need SAST, dependency scanning and image scanning as three separate gates?}
+\iq{How does a Kubernetes NetworkPolicy limit blast radius if a pod is compromised, and what does it not cover?}
+\iq{What does "defense in depth" mean in practice, not as a buzzword?}
+\iq{Why prefer short-lived dynamically issued credentials over static long-lived ones, and what new failure mode does that introduce?}
+\iq{How would you audit whether an IAM policy actually follows least privilege?}
+\iq{A Kubernetes Secret is base64-encoded. What does that give you, and what does encryption at rest actually protect against?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Kubernetes docs --- "Encrypting Confidential Data at Rest", "Using a KMS provider for data encryption" (both under kubernetes.io/docs/tasks/administer-cluster/) and "Network Policies": the \code{EncryptionConfiguration} format, the envelope mechanism, and the isolation model with its explicit list of what NetworkPolicy cannot do.
+  \item HashiCorp Vault docs --- "Database secrets engine" (developer.hashicorp.com, under Vault $\rightarrow$ Secrets engines): roles, creation statements, leases, static roles, root rotation.
+  \item AWS --- "Using AWS IAM Access Analyzer" in the IAM User Guide, plus the AWS Security Blog post on generating IAM policies from CloudTrail access activity.
+  \item GitHub docs --- "About push protection" under Code security $\rightarrow$ Secret scanning; and Trivy's CI/CD documentation at trivy.dev for the \code{exit-code} and severity behaviour used above.
+  \item The SLSA specification (slsa.dev) and the Sigstore project (Cosign, Fulcio, Rekor) for build provenance and keyless signing; CIS Kubernetes Benchmark and NIST SP 800-218 for the checklists auditors cite.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item No credential material exists in Git, in a container image, or in a \code{ConfigMap}.
+  \item Database credentials are short-lived and attributable to a single workload.
+  \item Encryption at rest is enabled for Secrets via a KMS provider --- and the team knows what it does not protect.
+  \item CI authenticates to the cloud by OIDC federation; no long-lived access key is stored anywhere.
+  \item SAST, dependency and image scanning run as separate gates, with a documented, time-boxed exception path, and registry images are re-scanned on a schedule.
+  \item Every namespace holding data has a default-deny NetworkPolicy, with DNS explicitly allowed.
+  \item No \code{cluster-admin} binding exists except a documented human break-glass account, and unused IAM roles and keys are reviewed on a schedule.
+  \item The leaked-credential runbook exists, starts with "rotate first", and has been rehearsed.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 13).} You have now built, deployed, observed and hardened a real platform. Tomorrow you consolidate: the architecture-level thinking that ties the thirteen days together --- reasoning about a system end to end, presenting the trade-offs you accepted, and answering the question every senior interview asks: \emph{"walk me through something you built, and tell me what you would do differently."}
+\end{keyidea}

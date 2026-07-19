@@ -1,0 +1,711 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 04 ============================
+\daychapter{04}{Containers}{Docker Deep Dive}{Images, layers, namespaces and cgroups --- what a container actually is}{8 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Explain what a container \emph{is} at kernel level --- namespaces, cgroups and a root filesystem --- without saying "lightweight VM".
+  \item Reason about image layers, content addressing and copy-on-write well enough to make a slow build fast.
+  \item Write a production-grade multi-stage Dockerfile: pinned base, non-root \code{USER}, build stage discarded.
+  \item Choose deliberately between a named volume, a bind mount and \code{tmpfs}, and defend the choice.
+  \item Diagnose container lifecycle failures --- exit 137, OOMKill, PID 1 signal handling, a ballooning build context.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} "It works on my machine" is not a joke about developers; it is a statement about \emph{dependency resolution happening at the wrong time}. A traditional deploy resolves dependencies on the target host, at deploy time, against whatever library versions that host happens to carry. Every host drifts differently, so every host fails differently. A container image moves that resolution to \emph{build} time and freezes the result: the application, its runtime, its shared libraries and its filesystem layout are sealed into one artifact that is byte-for-byte identical everywhere it runs. What ships is not "the code" --- it is the whole userspace.
+
+\glabel{Why DevOps engineers need it.} Every layer you build from here on consumes container images. Kubernetes (Day 5--6) schedules them. CI (Day 9) builds and pushes them. Image scanning (Day 12) is a supply-chain control on them. If you treat the Dockerfile as a magic incantation copied from a blog post, everything above inherits that fog: builds that take eleven minutes because the cache is busted on every commit, images that ship a full compiler toolchain into production, and containers that die at exit 137 for reasons nobody on the team can articulate.
+
+\begin{keyidea}
+A container is not a small virtual machine. It is one ordinary Linux process --- scheduled by the same kernel scheduler as everything else on the host --- given a restricted \emph{view} of the system (namespaces) and a restricted \emph{budget} of resources (cgroups), with its root filesystem assembled from stacked read-only image layers. Every "container" concept in this chapter resolves to one of those three mechanisms. There is no hypervisor, no guest kernel, no emulation.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} The image is the unit of exchange between every tool in the rest of this book. Read the diagram downward: each layer hands the next one an image reference and nothing else.
+
+\begin{wbfigure}{Fig 4.0 — The image is the contract. Everything above the container layer consumes an immutable digest; everything below is the Linux you learned on Day 1.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=64mm, minimum height=7.2mm, align=left, text width=58mm}]
+  \node[lyr, wbboxk8s] (k8s) {\textbf{Kubernetes schedules the image} \hfill \scriptsize Day 5--6};
+  \node[lyr, wbboxops, below=of k8s] (ci) {\textbf{CI builds, scans, pushes the image} \hfill \scriptsize Day 9, 12};
+  \node[lyr, wbboxaccent, below=of ci] (img) {\textbf{Image: layers + manifest + digest} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, below=of img] (rt) {\textbf{Runtime: containerd + runc} \hfill \scriptsize OCI};
+  \node[lyr, wbboxghost, below=of rt] (krn) {\textbf{Kernel: namespaces · cgroups · overlayfs} \hfill \scriptsize Day 1 revisited};
+  \foreach \a/\b in {k8s/ci,ci/img,img/rt,rt/krn}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=4mm of img, text width=22mm, anchor=west] {one immutable artifact};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 1 taught processes, signals, permissions and \code{/proc}. Today you discover that was not preparation for containers --- it \emph{was} containers, viewed from underneath. Exit code 137 is still \code{128 + 9}. A non-root \code{USER} in a Dockerfile is the same reasoning as the dedicated service user in \code{bootstrap.sh}. Day 2's Git discipline is what makes an image reproducible from a commit, and Day 3's networking is what the container's bridge, veth pair and NAT rules are made of.
+
+\glabel{Where companies use it in production.} Netflix built \keyterm{Titus}, its own container management platform, before standardising on Kubernetes-era tooling: a leader-elected \emph{Titus Master} scheduler placing work onto a large pool of EC2 \emph{Titus Agents}, each agent launching containers with Docker and wiring them into AWS VPC networking, IAM roles and security groups so that a container --- not the VM --- is the identity boundary. Uber, which builds on the order of a hundred thousand container images per week, wrote \keyterm{Makisu} specifically because the standard builder needed access to \code{/proc} to launch nested containers, which their unprivileged build environment would not allow; their distributed layer cache cut build time by up to ninety percent on some repositories. Both stories are the same lesson: at scale, the image \emph{build} becomes the bottleneck long before the container runtime does.
+
+\glabel{Common misconceptions.} That containers "virtualise the OS" (they share one kernel --- a container cannot run a different kernel version than its host); that images are tarballs of a running machine (they are ordered, content-addressed layer sets plus a JSON manifest); that \code{docker run} "boots" something (it forks a process); and that a container is a security boundary equivalent to a VM (by default it is not --- Day 12 covers what actually hardens it).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 4.1 — The Day 4 territory. The Dockerfile produces layers; the kernel produces isolation; the two meet in a running container.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (df) {Dockerfile\\instructions};
+  \node[wbbox, right=of df] (layer) {Layers\\content-addressed};
+  \node[wbbox, right=of layer] (image) {Image\\manifest + digest};
+  \draw[wbarrow] (df)--(layer); \draw[wbarrow] (layer)--(image);
+  \node[wbbox, below=8mm of df] (cache) {Build cache\\invalidation};
+  \node[wbbox, below=8mm of layer] (cow) {overlayfs\\copy-on-write};
+  \node[wbboxgood, below=8mm of image] (ctr) {Container\\= process};
+  \draw[wbarrowg] (df)--(cache); \draw[wbarrowg] (layer)--(cow); \draw[wbarrow] (image)--(ctr);
+  \node[wbboxsec, below=8mm of cache] (ns) {Namespaces\\view isolation};
+  \node[wbboxops, below=8mm of cow] (cg) {cgroups\\resource limits};
+  \node[wbboxdb, below=8mm of ctr] (vol) {Volumes\\persistence};
+  \draw[wbarrow] (ns)--(ctr); \draw[wbarrow] (cg)--(ctr); \draw[wbarrow] (vol)--(ctr);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{Dockerfile} $\rightarrow$ \keyterm{layer} $\rightarrow$ \keyterm{digest} $\rightarrow$ \keyterm{image manifest} $\rightarrow$ \keyterm{registry} $\rightarrow$ \keyterm{copy-on-write} $\rightarrow$ \keyterm{namespace} $\rightarrow$ \keyterm{cgroup} $\rightarrow$ \keyterm{volume}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad What a Container Actually Is}
+
+\glabel{What is it?} A container is a normal Linux process, started by a normal \code{clone()} syscall, that the kernel has been told to lie to. It sees a filesystem that is not the host's, a process table that starts at PID 1 and contains only its own children, and network interfaces that belong only to it. Nothing about the process itself is special --- \code{ps aux} on the host shows it sitting alongside \code{sshd} and \code{cron}.
+
+\glabel{Why does it exist?} Engineers wanted isolation without paying for a second kernel. The lineage is long: \code{chroot} (1979) changed a process's apparent root directory but isolated nothing else; FreeBSD Jails (2000) and Solaris Zones (2004) added process and network isolation; Google contributed \emph{process containers} --- later renamed \keyterm{cgroups} --- to Linux in 2007 to bound CPU and memory; the \code{namespaces} family landed incrementally through the 2000s and 2010s. LXC glued these together around 2008. All of that existed before Docker. What Docker added in 2013 was not isolation --- it was a \emph{portable, layered, content-addressed image format} and a one-command developer workflow. That is why the image, not the runtime, is the durable contribution.
+
+\begin{whyexists}
+Before containers, the reproducibility answer was a full virtual machine per service: a whole guest kernel, a whole init system, gigabytes of disk and tens of seconds of boot, all to isolate one Java process. The alternative was shared hosts with dependency conflicts --- two applications needing incompatible OpenSSL versions on one box. Containers exist to give VM-grade dependency isolation at process-grade cost.
+\end{whyexists}
+
+\glabel{How does it work internally?} Three kernel mechanisms, applied to one process.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{22mm} L{26mm} X@{}}
+\wbtablehead{Namespace} & \wbtablehead{Isolates} & \wbtablehead{What you observe}\\
+mnt & Mount points & The container's \code{/} is the image, not the host's root.\\
+pid & Process IDs & The entrypoint is PID 1; it cannot see or signal host processes.\\
+net & Interfaces, routes, iptables & Its own \code{eth0}, its own port space, its own routing table.\\
+uts & Hostname, domain & \code{hostname} returns the container ID, not the host's name.\\
+ipc & Shared memory, semaphores & No accidental SysV IPC collisions with the host.\\
+user & UID/GID mapping & Root inside can map to an unprivileged UID outside.\\
+cgroup & cgroup root view & The container cannot see the wider cgroup hierarchy.\\
+\end{tabularx}
+\end{center}
+
+Namespaces answer \emph{"what can this process see?"} \keyterm{cgroups} answer the orthogonal question \emph{"how much can this process consume?"} --- CPU shares and quota, memory ceiling, block-I/O weight, PID count. On modern distributions cgroup v2 is the default: a single unified hierarchy where each container gets a directory with files such as \code{memory.max} and \code{cpu.max}. Writing a byte count into \code{memory.max} is literally all that \code{docker run -m 512m} does.
+
+The third mechanism is the root filesystem: \code{pivot\_root} (a safer descendant of \code{chroot}) swaps the process's \code{/} for the assembled image. Then the runtime drops Linux capabilities, applies a seccomp filter restricting which syscalls are allowed, and \code{exec}s your binary.
+
+\begin{wbfigure}{Fig 4.2 — One host kernel, two containers. The dashed boundaries are namespaces (view) and the meters are cgroups (budget). Nothing here is virtualised.}
+\wbscale{\begin{tikzpicture}[node distance=4mm and 6mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox, minimum width=26mm] (p1) {app process\\PID 1 inside};
+  \node[wbboxops, below=4mm of p1, minimum width=26mm] (c1) {cgroup\\mem 512M · cpu 0.5};
+  \node[wbbox, right=22mm of p1, minimum width=26mm] (p2) {db process\\PID 1 inside};
+  \node[wbboxops, below=4mm of p2, minimum width=26mm] (c2) {cgroup\\mem 1G · cpu 1.0};
+  \begin{scope}[on background layer]
+    \node[wbzonesec, fit=(p1)(c1)] (n1) {};
+    \node[wbzonelabelsec, anchor=north west] at (n1.north west) {namespaces: mnt pid net};
+    \node[wbzonesec, fit=(p2)(c2)] (n2) {};
+    \node[wbzonelabelsec, anchor=north west] at (n2.north west) {namespaces: mnt pid net};
+  \end{scope}
+  \node[wbboxaccent, below=10mm of $(c1)!0.5!(c2)$, minimum width=62mm] (k) {\textbf{one shared Linux kernel} --- scheduler, page cache, drivers};
+  \draw[wbarrowg] (n1)--(k); \draw[wbarrowg] (n2)--(k);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{behind}
+Run \code{ps aux} on the host while a container is running and you will find its process listed with an ordinary host PID. Then look at \code{/proc/<pid>/ns/} --- a directory of symbolic links, one per namespace, each pointing at an inode identifier. Two processes sharing a namespace share that inode. That is the entire implementation of "being in the same container", and it is why Kubernetes sidecars --- separate containers in one pod --- work: they are simply given the same net and ipc namespace inodes.
+\end{behind}
+
+\begin{misconception}
+"Containers are more secure than processes." They are the same processes, with the kernel attack surface fully shared. A kernel privilege-escalation bug is exploitable from inside a container. Namespaces raise the cost of escape; they do not create a hypervisor boundary. When you genuinely need that boundary --- untrusted multi-tenant code --- the answer is a sandboxed runtime such as gVisor or Firecracker microVMs, not more Docker flags.
+\end{misconception}
+
+\wbsub{3.2\quad Images Are Layers; Containers Are a Writable Layer on Top}
+
+\glabel{What is it?} An image is an ordered stack of read-only \keyterm{layers} plus a JSON manifest describing them. Each layer is a tar archive of filesystem changes --- files added, modified or deleted relative to the layer beneath. Each is identified by the SHA-256 digest of its content, which makes layers \keyterm{content-addressed}: identical content is the same layer everywhere in the world.
+
+\glabel{Why does it exist?} Naive packaging ships the whole filesystem on every release. If your base OS is 120\,MB and your application jar is 40\,MB, a one-line code change should not cost a 160\,MB transfer. Layers make the delta explicit: the base layer is pulled once per host and shared by every image built on it, and the registry, the host and the CI cache all deduplicate by digest. Twenty microservices on the same base image consume that base's disk space exactly once.
+
+\glabel{How does it work internally?} The default storage driver, \code{overlay2}, is a union filesystem. It stacks the image layers as \code{lowerdir} (read-only), adds one empty \code{upperdir} (read-write, created per container), and presents the union as \code{merged}, which becomes the container's \code{/}. Reads fall through the stack top-down until a file is found. On the \emph{first} write to an existing file, overlayfs performs a \keyterm{copy-up}: it copies the whole file from the lower layer into the upper layer and modifies the copy. Deletion does not delete anything --- it writes a \emph{whiteout} entry in the upper layer that masks the lower file.
+
+\begin{wbfigure}{Fig 4.3 — Copy-on-write. The image layers are shared and never mutated; only the thin upper layer belongs to this container, and it is destroyed with it.}
+\wbscale{\begin{tikzpicture}[node distance=3mm, every node/.style={font=\sffamily\scriptsize},
+   L/.style={wbbox, minimum width=60mm, minimum height=6.6mm, align=left, text width=54mm}]
+  \node[L, wbboxwarn] (rw) {\textbf{upperdir} --- container writable layer \hfill \scriptsize deleted on rm};
+  \node[L, below=of rw] (l4) {layer 4 \ \ COPY app source \hfill \scriptsize changes every commit};
+  \node[L, below=of l4] (l3) {layer 3 \ \ RUN install deps \hfill \scriptsize cached};
+  \node[L, below=of l3] (l2) {layer 2 \ \ COPY manifest files \hfill \scriptsize cached};
+  \node[L, wbboxghost, below=of l2] (l1) {layer 1 \ \ FROM base image \hfill \scriptsize shared by all images};
+  \node[wbcap, right=4mm of rw, text width=21mm, anchor=west] {copy-up on write};
+  \node[wbcap, right=4mm of l1, text width=21mm, anchor=west] {pulled once per host};
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(l4)(l1)] (ro) {};
+    \node[wbzonelabel, anchor=north west] at (ro.north west) {read-only image (lowerdir)};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+This is why containers start in milliseconds: nothing is copied at start, only an empty directory is created and a mount is assembled. It is also why data written inside a container vanishes when the container is removed --- the upper layer goes with it. And because overlayfs supports page-cache sharing, one hundred containers reading the same library file from the same lower layer share one page-cache entry, not one hundred.
+
+\glabel{The build cache.} During a build, each instruction produces a layer and a cache key. For \code{RUN}, the key is derived from the command string itself; for \code{COPY} and \code{ADD}, it is derived from the \emph{checksum of the copied files}. On a rebuild, the builder walks instructions from the top, reusing cached layers while keys match. The moment one key differs, that layer and \emph{every layer after it} is rebuilt --- a cache miss is irreversible for the rest of the file.
+
+\begin{wbfigure}{Fig 4.4 — Cache invalidation cascades downward. Copying source before installing dependencies means every commit reinstalls the world.}
+\wbscale{\begin{tikzpicture}[node distance=3mm, every node/.style={font=\sffamily\scriptsize},
+   S/.style={wbbox, minimum width=40mm, minimum height=6.4mm, align=left, text width=35mm}]
+  \node[S, wbboxgood] (a1) {FROM base \hfill \scriptsize HIT};
+  \node[S, wbboxgood, below=of a1] (a2) {COPY pom.xml \hfill \scriptsize HIT};
+  \node[S, wbboxgood, below=of a2] (a3) {RUN deps \hfill \scriptsize HIT};
+  \node[S, wbboxwarn, below=of a3] (a4) {COPY src \hfill \scriptsize MISS};
+  \node[S, wbboxwarn, below=of a4] (a5) {RUN build \hfill \scriptsize rebuild};
+  \node[wbcap, above=2mm of a1] {\textbf{correct order}};
+  \node[S, wbboxgood, right=16mm of a1] (b1) {FROM base \hfill \scriptsize HIT};
+  \node[S, wbboxwarn, below=of b1] (b2) {COPY . . \hfill \scriptsize MISS};
+  \node[S, wbboxwarn, below=of b2] (b3) {RUN deps \hfill \scriptsize rebuild};
+  \node[S, wbboxwarn, below=of b3] (b4) {RUN build \hfill \scriptsize rebuild};
+  \node[wbcap, above=2mm of b1] {\textbf{wrong order}};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{perfnote}
+The single highest-leverage change most teams can make to their CI time is reordering four lines of a Dockerfile. Copy only the dependency manifest (\code{pom.xml}, \code{package-lock.json}, \code{requirements.txt}, \code{go.sum}), install dependencies, \emph{then} copy the source. Dependencies change weekly; source changes hourly. Uber built an entire distributed layer cache around this principle and reported up to ninety percent build-time reductions on some repositories --- but the ordering rule is free and gets you most of the way.
+\end{perfnote}
+
+\begin{misconception}
+"\code{RUN rm -rf /var/cache} at the end of my Dockerfile shrinks the image." It does not. Deleting a file in a later layer writes a whiteout; the bytes still sit in the earlier layer and still travel over the network. To actually remove them, the deletion must happen inside the \emph{same} \code{RUN} instruction that created them --- or, far better, the artifact must never enter the final image at all, which is what multi-stage builds are for.
+\end{misconception}
+
+\wbsub{3.3\quad Multi-Stage Builds}
+
+\glabel{What is it?} A single Dockerfile containing several \code{FROM} instructions. Each \code{FROM} starts a new stage with its own filesystem; a later stage can reach back with \code{COPY --from=<stage>} to take specific paths. Only the last stage becomes the published image.
+
+\glabel{Why does it exist?} Building software needs a compiler, a package manager, dev dependencies, headers and test fixtures. Running it needs a runtime and one artifact. Before multi-stage builds, teams either shipped the entire toolchain to production --- a 900\,MB image to run a 40\,MB jar --- or maintained a fragile "builder container plus outer script plus second Dockerfile" pipeline that only worked on the CI machine. Multi-stage collapses that into one reviewable file.
+
+\begin{dockerbox}[Dockerfile — CloudBase API, production-grade multi-stage]
+# syntax=docker/dockerfile:1
+
+# ---------- stage 1: build (never shipped) ----------
+FROM eclipse-temurin:21-jdk-alpine AS build
+WORKDIR /src
+
+# dependency manifest first -> this layer is cached across code commits
+COPY pom.xml ./
+COPY .mvn/ .mvn/
+COPY mvnw ./
+RUN ./mvnw -B dependency:go-offline
+
+# source last -> only this layer and below rebuild on a commit
+COPY src/ src/
+RUN ./mvnw -B -DskipTests package && \
+    mv target/cloudbase-*.jar /src/app.jar
+
+# ---------- stage 2: runtime (this is what ships) ----------
+FROM eclipse-temurin:21-jre-alpine AS runtime
+
+# non-root identity, created explicitly with a fixed UID
+RUN addgroup -g 10001 -S cloudbase && \
+    adduser  -u 10001 -S cloudbase -G cloudbase
+
+WORKDIR /app
+COPY --from=build --chown=cloudbase:cloudbase /src/app.jar ./app.jar
+
+USER 10001:10001
+EXPOSE 8080
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75"
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/actuator/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
+\end{dockerbox}
+
+\glabel{How does it work internally?} BuildKit --- the default builder since Docker 23 --- does not execute the Dockerfile top to bottom. It parses the whole file into a dependency \keyterm{DAG}, prunes stages the final target does not need, and executes independent stages \emph{in parallel}. If a stage's output is not reachable from the target, it is never built at all. This is why adding a \code{test} stage to a Dockerfile costs nothing when you build \code{--target runtime}.
+
+Two details in the file above earn their place. \code{--chown} on the \code{COPY} sets ownership as the layer is written; doing it afterwards with \code{RUN chown} would copy-up every file into a second layer and double the image's size contribution. And \code{USER 10001:10001} uses the numeric UID rather than the name, because Kubernetes' \code{runAsNonRoot} check (Day 6) can only verify a numeric UID --- a named user makes the admission check fail.
+
+\begin{tradeoff}
+Smaller is not automatically better. \code{alpine} uses musl libc, not glibc; some JVM workloads, native extensions and DNS resolution edge cases behave differently under musl. \code{distroless} images are smaller and have almost no CVE surface, but they contain no shell --- so \code{docker exec -it ... sh} to debug a production incident is impossible, and your \code{HEALTHCHECK} cannot shell out. The senior move is to pick per-workload: distroless for stable services with good remote observability, a slim glibc base for anything you still need to poke at by hand.
+\end{tradeoff}
+
+\begin{secwarn}[build secrets never belong in a layer]
+\code{ARG NPM\_TOKEN} followed by \code{RUN npm install} bakes the token into the layer's metadata and history --- \code{docker history} will show it, and anyone who pulls the image can read it. Deleting it in a later layer does nothing (whiteouts, again). Use BuildKit secret mounts --- \code{RUN --mount=type=secret,id=npmtoken ...} --- which expose the value on a tmpfs for the duration of that one instruction and leave nothing in the layer.
+\end{secwarn}
+
+\wbsub{3.4\quad Container Networking}
+
+\glabel{What is it?} Each container gets its own network namespace: its own interfaces, routing table, iptables rules and port space. Docker offers several ways to populate that namespace.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{20mm} X L{34mm}@{}}
+\wbtablehead{Mode} & \wbtablehead{Behaviour} & \wbtablehead{When to use}\\
+bridge (default) & Private virtual switch on the host; a veth pair per container; outbound traffic is NATed & Local dev, Compose, single host\\
+host & No net namespace at all --- the container uses the host's stack directly & Latency-critical or high packet-rate agents; rare\\
+none & Only a loopback interface & Batch jobs that must not touch the network\\
+overlay & VXLAN tunnel spanning hosts & Swarm / multi-host, superseded by CNI in K8s\\
+\end{tabularx}
+\end{center}
+
+\glabel{How does it work internally?} On bridge mode the runtime creates a \keyterm{veth pair} --- a virtual cable with two ends. One end is moved into the container's namespace and renamed \code{eth0}; the other stays on the host and is enslaved to the \code{docker0} bridge, a software switch. Outbound packets are source-NATed by a MASQUERADE rule so they leave with the host's address. A published port (\code{-p 8080:8080}) installs a DNAT rule that rewrites the destination of arriving packets to the container's private address. There is no proxy in the data path --- it is kernel packet rewriting, the same mechanism as any Linux router.
+
+\begin{wbfigure}{Fig 4.5 — Bridge networking. Each container owns one end of a veth pair; the host end plugs into a software switch, and iptables does the address translation.}
+\wbscale{\begin{tikzpicture}[node distance=4mm and 9mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbbox, minimum width=24mm] (app) {app\\eth0 172.18.0.2};
+  \node[wbbox, right=of app, minimum width=24mm] (db) {db\\eth0 172.18.0.3};
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(app)(db)] (net) {};
+    \node[wbzonelabel, anchor=north west] at (net.north west) {user-defined bridge cloudbase-net};
+  \end{scope}
+  \node[wbboxops, below=11mm of net, minimum width=52mm] (br) {docker0-style bridge + embedded DNS 127.0.0.11};
+  \draw[wbarrow] (app.south)--(br) node[wbcap, midway, left]{veth};
+  \draw[wbarrow] (db.south)--(br) node[wbcap, midway, right]{veth};
+  \node[wbboxsec, below=5mm of br, minimum width=52mm] (nat) {iptables: MASQUERADE out · DNAT for -p};
+  \node[wbboxcloud, below=5mm of nat, minimum width=52mm] (eth) {host eth0};
+  \draw[wbarrow] (br)--(nat); \draw[wbflow] (nat)--(eth);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Service discovery.} On a \emph{user-defined} bridge --- not the legacy default bridge --- Docker runs an embedded DNS resolver at \code{127.0.0.11} inside each container's namespace. A lookup of \code{db} returns the current IP of the container named \code{db}, refreshed as containers restart and change addresses. This is why your application connects to \code{db:5432}, never to \code{localhost:5432} and never to a hardcoded IP: \code{localhost} inside a container is that container's own loopback, so \code{localhost:5432} is a promise that nothing is listening. Kubernetes generalises exactly this idea into Services and cluster DNS on Day 5.
+
+\begin{scalenote}
+Port publishing is a single-host concept. It does not compose: two replicas of the same container cannot both publish host port 8080. The moment you need more than one replica you need a scheduler that assigns addresses and a load balancer that fans out to them --- which is precisely the gap Kubernetes fills. If you find yourself scripting port arithmetic in Compose, you have outgrown Compose.
+\end{scalenote}
+
+\wbsub{3.5\quad Volumes, Bind Mounts \& Persistence}
+
+\glabel{What is it?} A container's writable layer is ephemeral by design. To keep data you mount storage into the container that is not part of the image. Three kinds exist, and choosing among them is a real engineering decision.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{24mm} X L{30mm}@{}}
+\wbtablehead{Kind} & \wbtablehead{What it is} & \wbtablehead{Correct use}\\
+Named volume & A directory managed by the engine, outside any container & Databases, queues, any state\\
+Bind mount & A specific host path mapped into the container & Local dev live-reload; host sockets\\
+tmpfs mount & RAM-backed, never touches disk & Secrets, scratch files\\
+\end{tabularx}
+\end{center}
+
+\glabel{Why the distinction matters.} A named volume is addressed by \emph{name}; the engine decides where it lives and manages its lifecycle, so the container is portable to any host. A bind mount is addressed by \emph{host path}, which hardcodes an assumption about the machine: the directory must exist, with the right ownership, on every host that ever runs this container. It also bypasses the image entirely --- a bind mount over \code{/app} means the code you tested in the image is not the code that runs. That is a feature during development and a production incident waiting to happen.
+
+\glabel{How does it work internally?} Both are ordinary Linux bind mounts performed inside the container's mount namespace before the entrypoint runs. Reads and writes go straight to the host filesystem at native speed --- they do \emph{not} pass through overlayfs, which is a second reason databases belong on volumes: the copy-up penalty on first write to a large data file is avoided entirely.
+
+\begin{yamlbox}[compose.yaml — CloudBase local stack]
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: ghcr.io/aymix/cloudbase-api:dev
+    ports: ["8080:8080"]
+    environment:
+      DB_HOST: db
+      DB_PASSWORD_FILE: /run/secrets/db_password
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits: { memory: 512M, cpus: "0.50" }
+
+  db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: cloudbase
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # named volume: survives down/up
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudbase"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+\end{yamlbox}
+
+\begin{drtip}
+A named volume is durability, not a backup. \code{docker compose down -v} destroys it instantly and irreversibly, and a volume lives on exactly one host --- lose the host, lose the data. Treat volumes as the write path and a scheduled \code{pg\_dump} into object storage as the recovery path. "Where is the data?" and "how do I get it back?" are two different questions, and only the second one matters at 3am.
+\end{drtip}
+
+\begin{seniornote}
+Notice \code{depends\_on} with \code{condition: service\_healthy} rather than a bare \code{depends\_on: [db]}. The bare form only waits for the container to be \emph{started}, not for Postgres to accept connections --- so the app races the database on every cold start and the team learns to "just run it twice". Encoding readiness as a healthcheck is the same idea as a Kubernetes readiness probe, and building the habit here means Day 6 is a rename rather than a new concept.
+\end{seniornote}
+
+\wbsub{3.6\quad Lifecycle, Signals \& Why Containers Exit 137}
+
+\glabel{What is it?} A container lives exactly as long as its PID 1 process. When that process exits, the container exits, and its exit code becomes the container's exit code. There is no init system keeping it alive unless you put one there.
+
+\glabel{How does it work internally?} \code{docker stop} sends SIGTERM to PID 1, waits (ten seconds by default, or \code{stop\_grace\_period}), and then sends SIGKILL. Because \code{128 + 9 = 137}, that path produces exit code 137 --- and so does the kernel's OOM killer, for the same reason. Distinguishing them is a daily skill: \code{docker inspect} reports \code{OOMKilled: true} for the memory case; the shutdown-timeout case leaves that false.
+
+\begin{wbfigure}{Fig 4.6 — Two roads to exit 137. The exit code is identical; the root cause, and therefore the fix, is not.}
+\wbscale{\begin{tikzpicture}[node distance=4mm and 7mm, every node/.style={font=\sffamily\scriptsize},
+   S/.style={wbbox, minimum width=44mm, minimum height=6.6mm, align=left, text width=39mm}]
+  \node[S] (a) {docker stop -> SIGTERM to PID 1};
+  \node[S, wbboxgood, below=of a] (b) {app drains, flushes, exits 0};
+  \node[S, wbboxwarn, below=of b] (c) {grace period elapsed -> SIGKILL};
+  \node[S, wbboxwarn, below=of c] (d) {exit 137 · OOMKilled false};
+  \draw[wbarrow] (a)--(b); \draw[wbarrowg] (b)--(c); \draw[wbarrow] (c)--(d);
+  \node[S, right=of a] (x) {RSS exceeds memory.max};
+  \node[S, wbboxwarn, below=of x] (y) {kernel OOM killer fires};
+  \node[S, wbboxwarn, below=of y] (z) {no SIGTERM, no cleanup};
+  \node[S, wbboxwarn, below=of z] (w) {exit 137 · OOMKilled true};
+  \draw[wbarrow] (x)--(y); \draw[wbarrow] (y)--(z); \draw[wbarrow] (z)--(w);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{The PID 1 problem.} If your entrypoint is written in shell form (\code{ENTRYPOINT java -jar app.jar}), Docker runs it as \code{/bin/sh -c "java -jar app.jar"}. The shell becomes PID 1, and most shells do \emph{not} forward signals to their children. SIGTERM arrives, the shell ignores it, the JVM never hears it, the grace period elapses, SIGKILL --- exit 137 on every single deploy, with connections cut mid-request. The fixes are exec form (\code{ENTRYPOINT ["java","-jar","app.jar"]}) or, if you genuinely need shell expansion as in the Dockerfile above, an explicit \code{exec} so the shell replaces itself with the JVM. Additionally, PID 1 has no default signal handlers and does not reap orphaned children, so a container that spawns subprocesses should run a tiny init (\code{docker run --init}, or \code{tini}) to avoid accumulating zombies.
+
+\begin{reliability}
+The grace period is a contract between the orchestrator and your application, and both sides must honour it. The platform promises to send SIGTERM first and wait; the application promises to stop accepting new work, finish in-flight requests, flush buffers and exit. If either side defaults, you get truncated writes and 502s during every routine deploy. Day 1 taught you this with systemd; Day 6 will enforce it with \code{terminationGracePeriodSeconds}. It is one idea in three costumes.
+\end{reliability}
+
+\begin{costnote}
+Memory limits are a bill, not just a safety net. Set them too low and you pay in OOMKill restarts and incident time; set them too high --- or omit them --- and the scheduler reserves capacity nobody uses, so you rent nodes to hold air. Measure actual working-set size under load, set the limit with real headroom above the p99, and revisit it. On Kubernetes this becomes the request/limit distinction on Day 6, where the same numbers directly determine how many nodes you pay for.
+\end{costnote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Order instructions least-changing first: base, then dependency manifest, then dependency install, then source.
+  \item Multi-stage always --- no compiler, package manager or test fixture in a runtime image.
+  \item Pin base images to a specific tag, and to a digest for anything security-sensitive. Never \code{latest}.
+  \item Run as an explicit numeric non-root UID, and \code{--chown} during \code{COPY} rather than after it.
+  \item Commit a \code{.dockerignore} on day one; it shrinks context, speeds builds and keeps \code{.git} and secrets out.
+  \item Named volumes for state, bind mounts for development only, \code{tmpfs} for anything secret.
+  \item Exec-form \code{ENTRYPOINT} (or an explicit \code{exec}) so PID 1 receives SIGTERM.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item \code{COPY . .} before installing dependencies --- every commit reinstalls the world.
+  \item Running as root "for now" and never revisiting it.
+  \item Bind-mounting a host directory as a production database's data directory.
+  \item No \code{.dockerignore}, so a multi-gigabyte context (including \code{.git} and \code{node\_modules}) is uploaded on every build.
+  \item Passing secrets via \code{ARG} or \code{ENV} and assuming a later \code{rm} removes them.
+  \item Treating exit 137 as "Docker being flaky" instead of reading \code{OOMKilled}.
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the copy-on-write stack and the two paths to exit 137 on a whiteboard, you can debug almost any container problem you will meet this year.
+
+\begin{writespace}[Redraw: the overlayfs layer stack --- lowerdir, upperdir, merged --- and mark where a copy-up happens and what a whiteout does]
+\reflectionlines[6]
+\end{writespace}
+
+\begin{writespace}[Redraw: the two roads to exit 137 (stop timeout vs OOM kill), and name the one field that tells them apart]
+\reflectionlines[5]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Containerize CloudBase Properly}
+
+\textbf{Goal.} Turn the CloudBase application into an image a Kubernetes cluster would be happy to run: small, pinned, non-root, cache-friendly and correctly signalled. You are practising \emph{decisions}, not typing --- at each step, predict the outcome before you measure it.
+
+\resetlab
+\labstep{Build a deliberately naive single-stage image and record its size}
+One \code{FROM}, \code{COPY . .}, install everything, run it as root. Note the size and the build time.
+\labwhy{You need a baseline you personally produced. "Multi-stage is smaller" is a claim; a number you measured is knowledge, and it is the number you will quote when a colleague asks why the extra stage is worth it.}
+
+\labstep{Measure the build context before writing a \code{.dockerignore}}
+Watch the "Sending build context to Docker daemon" figure, then add \code{.dockerignore} excluding \code{.git}, build output, local env files and dependency directories. Rebuild.
+\labwhy{The context is tarred and uploaded to the daemon \emph{before the first instruction runs}. A repository with deep Git history routinely ships hundreds of megabytes that no layer will ever use --- and \code{COPY . .} would silently bake credentials from a stray \code{.env} into the image.}
+
+\labstep{Split into build and runtime stages}
+Compile in a JDK stage; copy only the artifact into a JRE stage. Compare against your baseline.
+\labwhy{You are separating the two different dependency sets a program has --- what it needs to be \emph{made}, and what it needs to \emph{run}. Everything in the first set is attack surface and CVE noise if it ships.}
+
+\labstep{Deliberately break the cache, then fix it}
+Put \code{COPY . .} above the dependency install. Change one character in a source file, rebuild, time it. Move it back below, repeat.
+\labwhy{Feeling the difference between a nine-second and a four-minute rebuild is what makes the ordering rule stick. Notice also that the cache miss cascades --- every instruction below the miss reruns, regardless of whether its own inputs changed.}
+
+\labstep{Add a non-root user and prove enforcement}
+Create a group and user with fixed UID 10001, \code{--chown} the artifact, set \code{USER 10001:10001}. Then \code{docker exec} in and try to write to \code{/etc}.
+\labwhy{You want to see the permission denial with your own eyes. This is Day 1's ownership model, unchanged --- the container did not invent a new one, it just gave you a clean place to apply it.}
+
+\labstep{Wire up Compose with a named volume and a healthcheck gate}
+App plus Postgres on a user-defined network, \code{pgdata} named volume, \code{depends\_on} gated on \code{service\_healthy}.
+\labwhy{Two lessons at once: the app resolves \code{db} through Docker's embedded DNS rather than an IP, and startup ordering is expressed as a readiness condition rather than a hopeful sleep.}
+
+\labstep{Prove persistence, then prove its limit}
+Insert a row. \code{docker compose down} then \code{up} --- the row survives. Now \code{down -v} and repeat.
+\labwhy{Knowing precisely which command destroys data is not trivia; it is the difference between a routine restart and an outage. Write the distinction into your runbook while it is fresh.}
+
+\labstep{Reproduce both exit codes 137}
+Run with \code{-m 64m} and allocate past it; inspect \code{OOMKilled}. Then use a shell-form entrypoint that ignores SIGTERM and \code{docker stop} it; inspect again.
+\labwhy{Two identical exit codes, two completely different fixes --- raise the limit versus fix PID 1. Being able to tell them apart in thirty seconds is a senior-engineer signal.}
+
+\begin{prodtip}
+Add \code{docker history <image>} to your routine. It shows every layer, its size and the instruction that created it, so a 400\,MB layer with a suspicious command is immediately visible --- as is any secret you accidentally passed as a build argument. Reviewing image history should be as normal as reading a diff, and on Day 9 you will make it a CI step alongside vulnerability scanning.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+A container shares the host's kernel, yet the whole point is isolation. What classes of failure does that sharing make possible that a virtual machine would contain --- and given that, why did the industry still choose containers as the default unit of deployment?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Image layers are content-addressed, so identical content is stored once regardless of who built it. What does that property make possible for a registry, a CI cache and a supply-chain audit --- and what new problem does it create when a base image you depend on is found to contain a vulnerability?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Bind mounts are convenient in development precisely because they let you bypass the image. Every convenience that bypasses the artifact under test weakens the guarantee the artifact was supposed to give. Where else in a delivery pipeline does that same trade-off appear, and how would you keep the convenience without losing the guarantee?
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Every deploy takes 11 minutes and the container dies at 137 on shutdown}
+\textbf{Symptom.} CI builds are slow even when only one source file changed, and rolling restarts drop in-flight requests. The container always exits 137 after roughly ten seconds.
+
+\begin{outbox}[docker build output and docker inspect excerpt]
+Sending build context to Docker daemon  1.42GB
+Step 3/9 : COPY . .
+ ---> 8a2f1c0d9e11
+Step 4/9 : RUN ./mvnw -B dependency:go-offline
+ ---> Running in 4d1c2f7a8b30      # NOT cached - reruns every build
+
+$ docker inspect --format '{{.State.ExitCode}} {{.State.OOMKilled}}' api
+137 false
+$ docker inspect --format '{{json .Config.Entrypoint}}' api
+["/bin/sh","-c","java -jar /app/app.jar"]
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} Two independent defects: a 1.42\,GB context with an uncached dependency step, and a 137 exit with \code{OOMKilled} false.
+  \item \textbf{Hypothesise.} \code{COPY . .} sits above the dependency install, so any source change invalidates it. Separately, PID 1 is \code{/bin/sh}, which does not forward SIGTERM.
+  \item \textbf{Investigate.} Confirm no \code{.dockerignore} exists and that \code{.git} dominates the context. Confirm the shell-form entrypoint, and time a \code{docker stop} --- it takes exactly the grace period.
+  \item \textbf{Root cause.} Cache-hostile instruction ordering plus a missing ignore file; and a shell wrapper swallowing the shutdown signal.
+  \item \textbf{Fix.} Copy the dependency manifest and install before copying source; add \code{.dockerignore}; switch to exec-form \code{ENTRYPOINT} or prefix the command with \code{exec}.
+  \item \textbf{Prevent.} Assert build-context size and a maximum image size in CI, and add a shutdown test that stops the container and requires exit code 0 within the grace period.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{The database "loses all its data" every few days}
+\textbf{Symptom.} A staging Postgres periodically comes back empty. Nobody admits to deleting anything, and the Compose file "definitely has a volume".
+
+\begin{outbox}[docker inspect on the db container]
+"Mounts": [
+  {
+    "Type": "volume",
+    "Name": "d41d8cd98f00b204e9800998ecf8427e",
+    "Source": "/var/lib/docker/volumes/d41d8cd.../_data",
+    "Destination": "/var/lib/postgresql/data",
+    "Driver": "local"
+  }
+]
+# note: random hex name -> this is an ANONYMOUS volume, not the named one
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The mount exists and is a volume --- but its name is a random hex string, not \code{pgdata}.
+  \item \textbf{Hypothesise.} The Postgres image declares \code{VOLUME /var/lib/postgresql/data}, so when the Compose mapping does not match that exact path the engine creates a fresh anonymous volume per container.
+  \item \textbf{Investigate.} Compare the destination in the Compose file with the image's declared \code{VOLUME}; list volumes and count how many anonymous ones have accumulated.
+  \item \textbf{Root cause.} A path typo (or a \code{down -v} in a teardown script) means each recreate gets a brand-new empty volume; the old data is orphaned, not deleted, which is why disk usage kept climbing.
+  \item \textbf{Fix.} Map the named volume to the exact declared path, migrate data from the most recent anonymous volume, then prune the orphans.
+  \item \textbf{Prevent.} Ban \code{-v} from any shared teardown script, alert on anonymous-volume count, and back up with \code{pg\_dump} to object storage --- a volume is durability, not recovery.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~35 min}
+\textbf{Goal.} Prove that a container is just a process, with your own eyes.\\
+\textbf{Business context.} Your team keeps calling containers "mini VMs" in design reviews and reasoning badly as a result.\\
+\textbf{Architecture.} One Linux host, one long-running container, two terminals.\\
+\textbf{Requirements.} Find the container's host PID; compare \code{/proc/<pid>/ns/} on the host against PID 1's; show the same process listed inside and outside with different PIDs.\\
+\textbf{Constraints.} No orchestrator, no Compose --- \code{docker run} and \code{ps} only.\\
+\textbf{Hints.} \code{docker inspect} exposes the host PID; \code{readlink} the namespace links to see the inode numbers.\\
+\textbf{Expected outcome.} A short write-up naming which namespaces differ from the host's and which are shared.\\
+\textbf{Production considerations.} Explain to a colleague why a container cannot run a different kernel version than its host.\\
+\textbf{Common pitfalls.} Concluding that identical inode numbers mean "no isolation" --- shared namespaces are a deliberate default for some modes.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~60 min}
+\textbf{Goal.} Cut an image from hundreds of megabytes to tens, and measure every step.\\
+\textbf{Business context.} Pull time dominates cold-start latency during an autoscaling event.\\
+\textbf{Architecture.} One application, four builds: naive, plus-dockerignore, multi-stage, slim-base.\\
+\textbf{Requirements.} Record image size, build-context size, cold build time and warm rebuild time for all four in one table.\\
+\textbf{Constraints.} The application must still start and pass its healthcheck in every variant --- shrinking is not a win if it breaks.\\
+\textbf{Hints.} \code{docker history} attributes size to instructions; try both alpine and a slim glibc base and note any behavioural difference.\\
+\textbf{Expected outcome.} A four-row table plus one paragraph on which change gave the best return per unit of effort.\\
+\textbf{Production considerations.} Estimate the saving across a hundred nodes pulling this image during a scale-out.\\
+\textbf{Common pitfalls.} Comparing warm builds against cold ones; forgetting that removing files in a later layer does not shrink the image.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~110 min}
+\textbf{Goal.} Ship the CloudBase image the way a platform team would accept it.\\
+\textbf{Business context.} This exact image is what CI will build on Day 9 and what Kubernetes will schedule on Day 5--6; defects here become everyone's defects.\\
+\textbf{Architecture.} Multi-stage Dockerfile $\rightarrow$ Compose stack (app plus Postgres on a user-defined network with a named volume) $\rightarrow$ a verification script.\\
+\textbf{Requirements.} Pinned base tags, numeric non-root \code{USER}, \code{.dockerignore}, \code{HEALTHCHECK}, exec-form entrypoint, memory and CPU limits, healthcheck-gated \code{depends\_on}.\\
+\textbf{Constraints.} No secret may appear in \code{docker history}; the app must exit 0 within its grace period on \code{docker stop}.\\
+\textbf{Hints.} Use a BuildKit secret mount if the build needs a private registry token; verify shutdown with \code{docker stop} plus an exit-code assertion in the script.\\
+\textbf{Expected outcome.} \code{make verify} builds, starts, health-checks, writes data, restarts, confirms the data survived, stops cleanly and asserts exit 0.\\
+\textbf{Production considerations.} Which of these checks belong in CI as hard gates, and which are advisory?\\
+\textbf{Common pitfalls.} Named \code{USER} instead of numeric (breaks \code{runAsNonRoot} later); \code{latest} tags; secrets via \code{ARG}; a healthcheck with no \code{start-period} that fails during JVM warm-up.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{infranote}
+Docker is no longer the interesting noun. The industry standardised on the \keyterm{OCI} image and runtime specifications, so what you build is an OCI image and what runs it in a cluster is typically containerd invoking runc --- Docker Engine itself became one of several producers and consumers of the same artifact. Kubernetes removed its Docker-specific shim in v1.24. The practical consequence: build with whatever tool you like (BuildKit, Buildah, Kaniko), because the output is a spec-defined artifact, not a vendor format.
+\end{infranote}
+
+\begin{autotip}
+Never let a human decide an image tag. Tag with the immutable Git SHA in CI and let a moving tag like \code{staging} be a pointer that is updated, never a build input. Deploying by digest (\code{image@sha256:...}) rather than by tag removes an entire class of "the same tag now means different bytes" incidents --- and it is what makes a rollback a genuine return to previously-running code rather than a rebuild and a hope.
+\end{autotip}
+
+\begin{opsnote}
+Containers are cattle, but their logs are not. Write to stdout and stderr and let the platform collect them --- writing to a file inside the container puts your incident evidence in the writable layer, which is destroyed exactly when the container crashes and you most need it. Day 11's logging pipeline assumes this discipline was established here.
+\end{opsnote}
+
+\begin{scalenote}
+At Netflix's Titus scale, the container platform's hardest problems were not isolation but placement and integration: a leader-elected scheduler assigning containers to a large fleet of EC2 agents, and each container receiving its own VPC network identity, IAM role and security group so that authorization applies to the workload rather than the machine. That reframing --- identity belongs to the container, not the host --- is exactly what Day 12 formalises with per-workload IAM.
+\end{scalenote}
+
+\begin{interview}
+Expect: \emph{"How is a container different from a virtual machine?"} The weak answer is "it's lighter". The answer that lands: a VM virtualises hardware and runs its own kernel under a hypervisor; a container is a host process with namespaced views and cgroup-bounded resources, sharing the host kernel. Then draw the consequences without being asked --- millisecond starts and no guest OS overhead, but a shared kernel attack surface and no ability to run a different kernel or OS family.
+\end{interview}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Days 1--3 gave CloudBase a hardened base host with a dedicated service user and a supervised \code{systemd} unit, a Git repository with branch protection and reviewable conventions, and a network design with routable and private ranges. Until today the application was a jar copied onto a host. From today it is an \emph{artifact}: one immutable, content-addressed image that CI will build (Day 9), Kubernetes will schedule (Day 5--6) and a scanner will gate (Day 12). The \code{systemd} unit and its restart policy do not disappear --- they are replaced by a scheduler that does the same job across many hosts, which is why understanding the unit first made this easy.
+
+\begin{buildalong}[Day 04 — containerize the application]
+\begin{wbitem}
+  \item Write \code{Dockerfile} as a two-stage build: a JDK build stage that compiles, and a pinned slim JRE runtime stage that receives only the artifact via \code{COPY --from=build}.
+  \item Order instructions for cache reuse --- base, dependency manifest, dependency resolution, then source. Prove it: change one source line and confirm the dependency layer is a cache hit.
+  \item Add \code{.dockerignore} covering \code{.git}, build output, local env files and IDE directories. Record the build-context size before and after in \code{docs/image-baseline.md}.
+  \item Create the numeric non-root user (UID 10001) in the runtime stage, \code{--chown} the artifact during \code{COPY}, and set \code{USER 10001:10001}.
+  \item Pin every base tag explicitly (never \code{latest}); note the resolved digest of each base image in \code{docs/image-baseline.md} so the build is auditable.
+  \item Use exec-form \code{ENTRYPOINT} (or an explicit \code{exec}) so PID 1 is the JVM and receives SIGTERM; add a \code{HEALTHCHECK} with a \code{start-period} that tolerates JVM warm-up.
+  \item Write \code{compose.yaml}: the app plus \code{postgres:16.4-alpine} on a user-defined network, the app reaching the database as \code{db} through embedded DNS, a \code{pgdata} named volume, \code{depends\_on} gated on \code{service\_healthy}, and explicit memory and CPU limits.
+  \item Record the exit-code experiment in \code{docs/runbook-containers.md}: how to tell an OOMKill from a shutdown-timeout 137, and the fix for each.
+  \item Extend \code{scripts/verify.sh} to build, start the stack, wait for health, write a row, recreate the app container, confirm the row survived, then \code{docker stop} and assert exit code 0.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} \code{scripts/verify.sh} passes from a clean checkout on a host with nothing cached; the runtime image contains no compiler or package manager, runs as UID 10001, is built from pinned tags, and stops with exit code 0 inside its grace period; \code{docker history} reveals no secret; and data written to the named volume survives \code{docker compose down} followed by \code{up}.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item A container is a Linux process with namespaces (restricted view) and cgroups (restricted budget), sharing the host kernel.
+  \item An image is an ordered stack of content-addressed read-only layers plus a manifest; a container adds one thin writable layer.
+  \item overlayfs copies a file up on first write and masks deletions with whiteouts --- so removing files in a later layer never shrinks an image.
+  \item A cache miss cascades: every instruction below it rebuilds. Order least-changing first.
+  \item Multi-stage builds keep the toolchain out of production; only \code{COPY --from} results ship.
+  \item On a user-defined bridge, embedded DNS resolves container names --- connect to \code{db}, never \code{localhost}.
+  \item Named volumes are portable and managed; bind mounts hardcode a host path and bypass the image.
+  \item Exit 137 means SIGKILL. \code{OOMKilled} tells you whether the cause was memory or an ignored SIGTERM.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item Shell-form \code{ENTRYPOINT} makes \code{/bin/sh} PID 1, and it will not forward SIGTERM.
+  \item Numeric \code{USER} (not a name) is what Kubernetes' \code{runAsNonRoot} check can verify.
+  \item The build context is uploaded before the first instruction runs --- \code{.dockerignore} is not optional.
+  \item Build-time \code{ARG} values are visible in \code{docker history}; use BuildKit secret mounts instead.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item \code{COPY . .} too early \quad$\bullet$\quad running as root \quad$\bullet$\quad \code{latest} tags \quad$\bullet$\quad no \code{.dockerignore}
+  \item Bind mount for production state \quad$\bullet$\quad secrets in \code{ARG} \quad$\bullet$\quad \code{down -v} in a shared script
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{Container}{a host process + namespaces (view) + cgroups (budget) + an image rootfs. One shared kernel.}
+\cheatitem{Layer}{immutable, content-addressed tar of filesystem changes; deduplicated by digest everywhere.}
+\cheatitem{Copy-on-write}{lowerdir (image) + upperdir (container) = merged; copy-up on first write, whiteout on delete.}
+\cheatitem{Build cache}{\code{RUN} keyed on the command, \code{COPY} on file checksums; one miss invalidates everything below.}
+\cheatitem{Multi-stage}{several \code{FROM}s; only the last stage ships; BuildKit runs independent stages in parallel.}
+\cheatitem{Networking}{user-defined bridge + veth pair + iptables NAT; embedded DNS at 127.0.0.11 resolves service names.}
+\cheatitem{Storage}{named volume = portable managed state; bind mount = host path, dev only; tmpfs = RAM, secrets.}
+\cheatitem{Exit 137}{128 + SIGKILL. \code{OOMKilled:true} = memory limit; false = grace period expired.}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 4 commands worth memorising]
+# build & inspect
+docker build --target runtime -t cloudbase-api:$(git rev-parse --short HEAD) .
+docker history cloudbase-api:dev        # size per layer + the instruction that made it
+docker image inspect --format '{{.RootFS.Layers}}' cloudbase-api:dev
+
+# what actually happened to a container
+docker inspect --format '{{.State.ExitCode}} {{.State.OOMKilled}}' api
+docker logs --since 10m --timestamps api
+docker stats --no-stream                # live cgroup usage per container
+
+# it is just a process
+docker inspect --format '{{.State.Pid}}' api    # host PID
+sudo ls -l /proc/<hostpid>/ns/                  # one link per namespace
+
+# networking & storage
+docker network inspect cloudbase-net
+docker exec api getent hosts db         # embedded DNS resolving a service name
+docker volume ls && docker volume inspect pgdata
+
+# lifecycle & cleanup
+docker stop -t 30 api                   # SIGTERM, wait 30s, then SIGKILL
+docker system df                        # where the disk went
+docker image prune -a --filter "until=168h"
+\end{bashbox}
+
+\begin{iqbox}
+\iq{What is a container, precisely, at the kernel level --- and how does it differ from a virtual machine?}
+\iq{Why do multi-stage builds reduce both final image size and attack surface?}
+\iq{What is the practical difference between a named volume and a bind mount?}
+\iq{How do containers on the same user-defined bridge network resolve each other?}
+\iq{Why does layer ordering in a Dockerfile matter for build speed, and what exactly invalidates a layer?}
+\iq{What happens to data written inside a container with no volume when it is removed?}
+\iq{A container exits with code 137. Walk me through your diagnosis.}
+\iq{Why does \code{RUN rm -rf} in a later layer fail to shrink an image?}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item Docker Docs --- "Building best practices" (docs.docker.com/build/building/best-practices/): layer ordering, \code{.dockerignore}, multi-stage, digest pinning, non-root \code{USER}.
+  \item Docker Docs --- "Optimize cache usage in builds" (docs.docker.com/build/cache/optimize/): cache mounts, and why apt needs \code{sharing=locked}.
+  \item Docker Docs --- "Use the OverlayFS storage driver": \code{lowerdir}/\code{upperdir}/\code{merged}, copy-up, whiteouts, page-cache sharing.
+  \item \code{man 7 namespaces} and \code{man 7 cgroups} --- the authoritative kernel-side description of both mechanisms.
+  \item The Linux kernel documentation for Control Group v2 --- \code{memory.max}, \code{memory.high}, \code{cpu.max} and \code{memory.oom.group}.
+  \item The OCI Image Specification and Runtime Specification (github.com/opencontainers) --- what an image and a runtime actually are, independent of Docker.
+  \item Netflix TechBlog --- "Titus, the Netflix container management platform, is now open source": scheduler, agents, and AWS VPC/IAM integration per container.
+  \item Uber Engineering --- "Makisu" and "uBuild": why unprivileged image builds and a distributed layer cache matter at 100k builds per week.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Every Dockerfile is multi-stage; no compiler or package manager in the runtime image.
+  \item Every base image is pinned to an explicit tag, and to a digest where supply chain matters.
+  \item Every image runs as an explicit numeric non-root UID.
+  \item A \code{.dockerignore} exists and the build context is measured, not assumed.
+  \item \code{ENTRYPOINT} is exec form (or \code{exec}-prefixed) so PID 1 receives SIGTERM.
+  \item Memory and CPU limits are set from measured usage, with headroom above p99.
+  \item All state is on named volumes, and every volume has a backup path that is not the volume.
+  \item Logs go to stdout and stderr, never to a file in the writable layer.
+  \item No secret is ever passed as \code{ARG} or baked into \code{ENV}.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 5).} You now have one immutable artifact and a way to run it on one host. Tomorrow you hand that artifact to something that runs it on \emph{many} hosts and keeps it running: Kubernetes' architecture --- the API server as the single source of truth, etcd as its store, controllers reconciling desired state against observed state, and the scheduler placing Pods. Every container concept from today reappears there wearing a different name, which is exactly why today had to come first.
+\end{keyidea}

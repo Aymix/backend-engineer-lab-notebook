@@ -1,0 +1,719 @@
+% SPDX-License-Identifier: CC-BY-NC-ND-4.0
+% Copyright (c) 2026 Aymix — workbook content. See LICENSE-CONTENT.
+% ============================ DAY 10 ============================
+\daychapter{10}{Cloud}{Cloud Infrastructure on AWS}{VPC, IAM, compute, storage, load balancing and managed databases}{9 hours}
+
+\begin{objectives}
+\begin{wbitem}
+  \item Design a VPC whose public/private separation is enforced by \emph{routing}, not by hope.
+  \item Explain how AWS decides to allow or deny a request --- explicit deny, implicit deny, and the order in between.
+  \item Replace long-lived access keys with roles, and say precisely where the temporary credentials come from.
+  \item Choose between an ALB and an NLB, and describe what a target group's health check actually changes.
+  \item Distinguish Multi-AZ from a read replica, and read an AWS bill as an architecture review.
+\end{wbitem}
+\end{objectives}
+
+% -----------------------------------------------------------------
+\wbpart{1}{The Big Picture}
+
+\glabel{What problem this solves.} For nine days you have been building things that need somewhere to run. Day 3 gave you CIDR blocks and routing as theory. Day 7 gave you Terraform, which declares resources --- but resources \emph{in what?} Day 9 gave you a pipeline that builds an image and then has nowhere to push it. Today all of that lands on real infrastructure: a network you own, identities that can act inside it, machines that run your containers, a load balancer that is the only door in, storage that outlives every machine, and a database somebody else patches at 3am.
+
+\glabel{Why DevOps engineers need it.} A cloud provider is not a hosting company with an API. It is a set of \emph{primitives with enforcement semantics}, and almost every production incident on AWS comes from misunderstanding one of them: a route table that does not have the route you assumed, a security group that references a CIDR instead of another security group, an IAM policy that is allowed by one document and denied by another, a database in a subnet that quietly has a path to the internet. None of those are visible in the console at a glance. All of them are obvious once you know the mechanism.
+
+\begin{keyidea}
+On AWS there are only three questions that ever matter, and everything in this chapter is one of them. \textbf{Is there a network path?} (route tables, gateways, security groups). \textbf{Is the caller allowed?} (IAM evaluation). \textbf{Who pays for it, and how much?} (data transfer, idle resources, per-hour charges). An engineer who can answer those three about any architecture can debug and design on any cloud, because the other providers use the same shapes with different nouns.
+\end{keyidea}
+
+\glabel{Where it fits in a modern cloud architecture.} Everything you built earlier resolves downward into this chapter's primitives. Read the diagram as a stack of \emph{claims}: the layer above only works because the layer below granted it a path and an identity.
+
+\begin{wbfigure}{Fig 10.0 — Where today sits. Days 4--9 produced artifacts and manifests; Day 10 produces the substrate that grants them a network path and an identity.}
+\wbscale{\begin{tikzpicture}[node distance=4.2mm, every node/.style={font=\sffamily\scriptsize},
+   lyr/.style={wbbox, minimum width=68mm, minimum height=7.4mm, align=left, text width=62mm}]
+  \node[lyr, wbboxops] (cd) {\textbf{CI/CD pipeline} \hfill \scriptsize Day 9};
+  \node[lyr, wbboxk8s, below=of cd] (k8s) {\textbf{Kubernetes workloads} \hfill \scriptsize Day 5--6};
+  \node[lyr, below=of k8s] (tf) {\textbf{Terraform declarations} \hfill \scriptsize Day 7};
+  \node[lyr, wbboxaccent, below=of tf] (aws) {\textbf{AWS: VPC · IAM · EC2 · ALB · S3 · RDS} \hfill \scriptsize \textbf{this chapter}};
+  \node[lyr, wbboxcloud, below=of aws] (net) {\textbf{IP, CIDR, routing, DNS, TLS} \hfill \scriptsize Day 3};
+  \node[lyr, wbboxghost, below=of net] (lx) {\textbf{Linux: processes · files · signals} \hfill \scriptsize Day 1};
+  \foreach \a/\b in {cd/k8s,k8s/tf,tf/aws,aws/net,net/lx}{\draw[wbarrowg] (\a)--(\b);}
+  \node[wbcap, right=4mm of aws, text width=22mm, anchor=west] {the substrate everything above assumes};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{How it connects to previous chapters.} Day 3's \code{/16} and \code{/24} become a VPC CIDR and subnet CIDRs. Day 3's default gateway becomes a route table entry pointing at an internet gateway. Day 1's "grant to an identity, not to everyone" becomes an IAM policy. Day 4's image registry becomes ECR, backed by S3. Day 7's remote state becomes an S3 bucket with a lock. Day 6's Service of type \code{LoadBalancer} becomes an actual ALB with actual target groups. You are not learning a new mental model today; you are learning the AWS spelling of one you already have.
+
+\glabel{Where companies use it in production.} Netflix runs its streaming control plane across multiple AWS regions in an active-active shape, and publishes engineering work on the network-visibility problem this creates: their TechBlog describes ingesting VPC Flow Logs from S3 at very high volume and \emph{enriching} each flow with workload metadata, because raw flow logs contain IP addresses and IP addresses in an autoscaled cloud mean nothing an hour later. That single detail tells you more about operating a large VPC than any architecture poster: at scale, the hard problem is not building the network, it is knowing what is talking to what inside it. Smaller organisations hit the same wall in miniature the first time a security group audit asks "who actually uses this rule?"
+
+\glabel{Common misconceptions.} That a "private subnet" is a checkbox (it is the \emph{absence} of a route to an internet gateway). That security groups are firewalls with allow \emph{and} deny rules (they only allow, and they are stateful). That an IAM role is a kind of user (it is a set of permissions with a trust policy, assumed to produce temporary credentials). That Multi-AZ is a scaling feature (it is availability; it serves no reads). That cloud cost is finance's problem (roughly half of a surprise AWS bill is architecture, and most of the rest is things nobody deleted).
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{2}{Concept Map}
+
+\begin{wbfigure}{Fig 10.1 — The Day 10 territory. The account is the blast-radius boundary; the VPC is the network boundary; IAM is the identity boundary; everything else is a resource placed inside those three.}
+\wbscale{\begin{tikzpicture}[node distance=5mm and 8mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxaccent] (acct) {AWS account\\region · AZs};
+  \node[wbboxcloud, right=10mm of acct] (vpc) {VPC\\CIDR block};
+  \node[wbboxsec, above=8mm of vpc] (iam) {IAM\\policies · roles};
+  \node[wbbox, below=8mm of vpc] (sn) {Subnets\\public · private};
+  \draw[wbarrow] (acct)--(vpc); \draw[wbarrow] (acct)--(iam); \draw[wbarrow] (vpc)--(sn);
+  \node[wbboxsec, right=9mm of iam] (sts) {STS\\temporary creds};
+  \node[wbboxcloud, right=9mm of vpc] (rt) {Route tables\\IGW · NAT};
+  \node[wbbox, right=9mm of sn] (sg) {Security groups\\NACLs};
+  \draw[wbarrow] (iam)--(sts); \draw[wbarrow] (vpc)--(rt); \draw[wbarrow] (sn)--(sg);
+  \node[wbboxops, right=9mm of sts] (ec2) {EC2 · ASG\\AMI};
+  \node[wbbox, right=9mm of rt] (alb) {ALB / NLB\\target groups};
+  \node[wbcyl, right=9mm of sg] (data) {RDS · S3};
+  \draw[wbarrow] (sts)--(ec2); \draw[wbarrow] (rt)--(alb); \draw[wbarrow] (sg)--(data);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{center}\small\itshape\color{cInk!70}
+Terminology to anchor: \keyterm{region} $\rightarrow$ \keyterm{availability zone} $\rightarrow$ \keyterm{VPC} $\rightarrow$ \keyterm{subnet} $\rightarrow$ \keyterm{route table} $\rightarrow$ \keyterm{internet gateway} $\rightarrow$ \keyterm{NAT gateway} $\rightarrow$ \keyterm{security group} $\rightarrow$ \keyterm{IAM role} $\rightarrow$ \keyterm{STS} $\rightarrow$ \keyterm{target group} $\rightarrow$ \keyterm{Multi-AZ}.
+\end{center}
+
+% -----------------------------------------------------------------
+\wbpart{3}{Guided Learning}
+
+\wbsub{3.1\quad The VPC --- A Network You Own, Defined in Software}
+
+\glabel{What is it?} A \keyterm{VPC} (Virtual Private Cloud) is a logically isolated IP network inside an AWS region. You choose its CIDR block --- say \code{10.0.0.0/16} --- and carve it into subnets, each of which lives in exactly one \keyterm{availability zone}. An availability zone is one or more physically separate data centres with independent power and cooling, connected to its siblings by low-latency links.
+
+\glabel{Why does it exist?} The original EC2 (retrospectively "EC2-Classic") put every customer's instances on a shared flat network. Isolation depended entirely on per-instance firewall rules, you could not choose your own address space, and you could not express "this machine has no route to the internet at all." Enterprises could not map that onto their existing network designs or their auditors' expectations. The VPC exists so that the network topology becomes a thing you \emph{declare} --- and so that "unreachable" is a structural property rather than a rule somebody might delete.
+
+\glabel{How does it work internally?} There is no physical switch anywhere that belongs to you. AWS implements the VPC as a distributed \keyterm{mapping service}: every packet leaving an instance's virtual NIC is encapsulated by the hypervisor (or, on Nitro instances, by a dedicated hardware card), the destination is looked up in a per-VPC mapping table, and the packet is tunnelled across the physical network to the host holding the destination. Route tables, security groups and NACLs are inputs to that lookup, evaluated in the data plane --- which is why a security group change takes effect essentially immediately and why there is no "firewall appliance" to become a bottleneck.
+
+The consequence that matters daily: \textbf{a subnet is not "public" or "private" by any attribute of its own.} It is public if and only if its associated route table contains a route to an \keyterm{internet gateway}. Delete that route and the same subnet is private. Add it to your database subnet by accident and your database is exposed to the extent its security group allows.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{30mm} X@{}}
+\wbtablehead{Route table entry} & \wbtablehead{What it means, operationally}\\
+10.0.0.0/16 $\rightarrow$ local & Always present, cannot be removed. Every subnet can reach every other subnet in the VPC by default.\\
+0.0.0.0/0 $\rightarrow$ igw-\ldots & \textbf{This line is the definition of a public subnet.} Two-way reachability, subject to security groups.\\
+0.0.0.0/0 $\rightarrow$ nat-\ldots & Outbound only. Return traffic for connections \emph{you} started; nothing may initiate inbound.\\
+0.0.0.0/0 absent & No internet path in either direction. The correct state for a database subnet.\\
+s3 prefix list $\rightarrow$ vpce-\ldots & A gateway VPC endpoint: S3 traffic leaves via AWS's network, not via NAT.\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 10.2 — The CloudBase topology. Public subnets hold only the load balancer and the NAT gateway; the application and data tiers have no inbound path from the internet at all.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbboxghost] (net) {Internet};
+  \node[wbboxsec, below=8mm of net] (igw) {Internet Gateway};
+  \node[wbbox, below=14mm of igw] (alb) {Application\\Load Balancer};
+  \node[wbboxcloud, right=16mm of alb] (nat) {NAT Gateway\\(one per AZ)};
+  \node[wbboxk8s, below=16mm of alb] (n1) {App nodes\\EC2 / EKS};
+  \node[wbcyl, below=16mm of n1] (rds) {RDS primary\\+ standby};
+  \draw[wbflow] (net)--(igw);
+  \draw[wbflow] (igw)--(alb);
+  \draw[wbflow] (alb)--(n1);
+  \draw[wbarrow] (n1)--(rds);
+  \draw[wbarrowg] (n1.east) -- ++(10mm,0) |- (nat.south);
+  \draw[wbarrowg] (nat)|-(igw.east);
+  \begin{scope}[on background layer]
+    \node[wbzone, fit=(alb)(nat)] (pub) {};
+    \node[wbzonelabel, anchor=north west] at (pub.north west) {public subnets · 2 AZs};
+    \node[wbzone, fit=(n1)] (app) {};
+    \node[wbzonelabel, anchor=north west] at (app.north west) {private app subnets};
+    \node[wbzonesec, fit=(rds)] (dat) {};
+    \node[wbzonelabelsec, anchor=north west] at (dat.north west) {private data subnets · no 0.0.0.0/0};
+  \end{scope}
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{When should I use it?} Always --- there is no non-VPC option any more. The real decision is how many VPCs: one per environment (dev, staging, prod) is the common baseline, because it makes "staging cannot reach prod" a property of the network rather than a promise.
+
+\glabel{When should I \emph{not}?} Do not build a fifteen-subnet, four-tier, transit-gateway-connected topology for a service with one database and two containers. Every extra AZ multiplies NAT gateway cost; every extra VPC adds peering or transit-gateway complexity and a new set of route tables somebody must keep correct. Start with two AZs, three subnet tiers, and grow when a specific requirement forces it.
+
+\begin{infranote}
+Choose your VPC CIDR as if you will one day peer it with another network --- because you will. Overlapping CIDRs cannot be peered, ever, and re-addressing a live VPC is a migration, not a change. Reserve a distinct \code{/16} per environment per region from a written plan (for example \code{10.10.0.0/16} prod-eu, \code{10.20.0.0/16} staging-eu) before you create the first one. This is a ten-minute decision that either costs nothing or costs a quarter.
+\end{infranote}
+
+\wbsub{3.2\quad Security Groups, NACLs \& the Reachability Chain}
+
+\glabel{What is it?} A \keyterm{security group} is a stateful allow-list attached to a network interface. A \keyterm{network ACL} is a stateless, ordered allow/deny list attached to a subnet. Both must permit a packet for it to arrive.
+
+\glabel{Why does it exist?} Two filters exist because they answer two different questions. The NACL answers "what may cross this subnet boundary at all?" --- a coarse, subnet-wide, deny-capable control that a network team can own. The security group answers "what may talk to \emph{this workload}?" --- fine-grained, identity-shaped, and owned by the team that runs the service. Before security groups, the equivalent was maintaining iptables rules per host with a configuration-management tool and hoping they converged.
+
+\glabel{How does it work internally?} A security group has \textbf{no deny rules}. Its evaluation is a union of every rule across every group attached to the interface: if any rule matches, the packet is allowed; otherwise it is dropped. It is \keyterm{stateful} --- the data plane tracks connections, so if inbound TCP/443 is allowed, the response leaves without an outbound rule. A NACL is \keyterm{stateless} and \emph{numbered}: rules are evaluated in ascending order, the first match wins, and because it is stateless you must allow the ephemeral return ports (roughly 1024--65535) explicitly in the opposite direction. Forgetting that is the single most common NACL bug.
+
+The most powerful and most under-used feature: a security group rule's source can be \emph{another security group} rather than a CIDR. "Allow TCP/5432 from \code{sg-app}" means "from whatever instances currently carry the app security group", which stays correct through every autoscaling event, AMI replacement and IP change. A CIDR-based rule encodes a fact about addresses; a group-based rule encodes a fact about roles.
+
+\begin{consolemock}[EC2 Console — CloudBase database security group]
+\consolerow{Group ID}{sg-0db1cloudbase}
+\consolerow{Inbound}{tcp/5432 from sg-0app1cloudbase  (NOT 10.0.0.0/16)}
+\consolerow{Inbound}{-- no other rules --}
+\consolerow{Outbound}{none required (stateful return traffic)}
+\end{consolemock}
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{26mm} X X@{}}
+\wbtablehead{Property} & \wbtablehead{Security group} & \wbtablehead{Network ACL}\\
+Attached to & Network interface & Subnet\\
+State & Stateful & Stateless\\
+Rules & Allow only & Allow and deny, numbered\\
+Evaluation & Union of all rules & First match wins\\
+Best used for & Workload-to-workload access & Coarse subnet-wide guardrails\\
+\end{tabularx}
+\end{center}
+
+\begin{misconception}
+"I opened the security group and it still does not connect." A security group is only one link in the chain. A packet reaches your process only if \emph{all} of these hold: a route exists in the source subnet's route table; the source security group allows egress; the source NACL allows out; the destination NACL allows in \emph{and} allows the return; the destination security group allows in; the host firewall (Day 1) allows it; and the process is actually listening on that interface, not on \code{127.0.0.1}. Debug the chain in order rather than repeatedly widening the group.
+\end{misconception}
+
+\wbsub{3.3\quad IAM --- How AWS Actually Decides to Allow or Deny}
+
+\glabel{What is it?} \keyterm{IAM} is the authorisation engine in front of every AWS API call. Every request carries a request context --- principal, action, resource, and condition keys such as source IP or MFA state --- and IAM evaluates the applicable policy documents against it to return exactly one answer: allow or deny.
+
+\glabel{Why does it exist?} Early cloud access control was a shared root credential, which makes "who did this?" unanswerable and "revoke one person" impossible. IAM exists to make permission a first-class, auditable, machine-readable object --- and, critically, to let a \emph{machine} have an identity, so that credentials never need to be written down anywhere.
+
+\glabel{How does it work internally?} This is the part beginners memorise as a slogan and seniors can actually walk through. AWS gathers every policy that applies --- identity-based policies on the principal, resource-based policies on the target, permissions boundaries, session policies, and organisation-level service control policies (SCPs) and resource control policies (RCPs) --- and evaluates them with these rules:
+
+\begin{wbitem}
+  \item \textbf{Deny by default.} If nothing explicitly allows the request, it is denied. This is the \emph{implicit deny} and it is the resting state of every permission in AWS.
+  \item \textbf{An explicit \code{Deny} in any applicable policy wins, always.} It cannot be overridden by an Allow anywhere else. This is what makes guardrails possible.
+  \item Identity-based and resource-based policies \emph{union}: an allow in either is enough within one account.
+  \item Permissions boundaries, SCPs and RCPs \emph{intersect}: they can only ever reduce what an identity policy grants. An SCP that allows something grants nothing by itself.
+\end{wbitem}
+
+\begin{wbfigure}{Fig 10.3 — IAM evaluation as a decision chain. Only the bottom-left path ends in Allow; everything else falls through to a deny.}
+\wbscale{\begin{tikzpicture}[node distance=4.4mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=62mm, minimum height=7.2mm, align=left, text width=56mm}]
+  \node[stg, wbboxghost] (ctx) {\textbf{1 · Request context} \hfill \scriptsize principal · action · resource};
+  \node[stg, wbboxwarn, below=of ctx] (deny) {\textbf{2 · Any explicit Deny?} \hfill \scriptsize yes $\rightarrow$ DENY, final};
+  \node[stg, wbboxsec, below=of deny] (scp) {\textbf{3 · SCP / RCP allow?} \hfill \scriptsize no $\rightarrow$ deny};
+  \node[stg, below=of scp] (rbp) {\textbf{4 · Resource policy allow?} \hfill \scriptsize union with step 5};
+  \node[stg, below=of rbp] (idp) {\textbf{5 · Identity policy allow?} \hfill \scriptsize union with step 4};
+  \node[stg, wbboxsec, below=of idp] (pb) {\textbf{6 · Boundary / session allow?} \hfill \scriptsize intersection};
+  \node[stg, wbboxgood, below=of pb] (ok) {\textbf{7 · ALLOW} \hfill \scriptsize otherwise: implicit deny};
+  \foreach \a/\b in {ctx/deny,deny/scp,scp/rbp,rbp/idp,idp/pb,pb/ok}{\draw[wbarrow] (\a)--(\b);}
+  \node[wbcap, right=4mm of deny, text width=22mm, anchor=west] {guardrails live here};
+  \node[wbcap, right=4mm of ok, text width=22mm, anchor=west] {the only exit that grants access};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\glabel{Roles, and where the credentials come from.} An \keyterm{IAM role} is not a user. It is a permission set plus a \emph{trust policy} saying which principals may assume it. Assuming it calls \code{sts:AssumeRole}, and \keyterm{STS} returns a short-lived triple: access key ID, secret, and a session token that expires. On EC2 the instance profile makes this invisible --- the AWS SDK fetches credentials from the \keyterm{instance metadata service} at \code{169.254.169.254} and refreshes them before expiry, so nothing is ever stored on disk. In EKS the equivalents are IAM Roles for Service Accounts (a projected OIDC token the pod exchanges with STS) and the newer EKS Pod Identity, where a node-local agent supplies credentials and the association lives in EKS rather than in service-account annotations.
+
+\begin{propsbox}[cloudbase-uploads-policy.json]
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteOwnPrefixOnly",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::cloudbase-uploads-prod/tenant/*"
+    },
+    {
+      "Sid": "ListOnlyThatBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::cloudbase-uploads-prod",
+      "Condition": { "StringLike": { "s3:prefix": "tenant/*" } }
+    },
+    {
+      "Sid": "NeverOutsideTLS",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": "arn:aws:s3:::cloudbase-uploads-prod/*",
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+\end{propsbox}
+
+Read that document as three separate decisions. Object actions are scoped to a prefix, not the bucket. \code{ListBucket} is a \emph{bucket-level} action, so its resource is the bucket ARN without \code{/*} --- getting this wrong is why "I granted s3:GetObject and listing still fails" is such a common ticket. And the explicit \code{Deny} is a guardrail: no future Allow, from any policy, can permit plaintext access.
+
+\begin{secwarn}[why a static access key is a different class of risk]
+A long-lived key pair does not expire, works from any machine on earth, appears in \code{git} history forever once committed, and is harvested by scanners crawling public repositories continuously. A role-derived credential expires in hours, is bound to a session, is never written to disk, and is revocable by editing one policy. The engineering point is not "keys are bad" but that a role removes the \emph{secret} entirely: there is nothing to leak because nothing was ever stored. If you must issue a static key --- a legacy on-prem job, say --- treat it as an incident waiting to happen: scope it to one action, add a condition on source IP, and put an expiry date in the calendar.
+\end{secwarn}
+
+\begin{behind}
+The metadata service is why a compromised web application can sometimes escalate to full AWS access: a server-side request forgery that makes your app fetch \code{169.254.169.254} returns the instance role's live credentials. IMDSv2 closes this by requiring a session token obtained via a \code{PUT} with a hop limit that stops the response crossing a proxy or a container boundary --- and since 2024 AWS lets you make IMDSv2 the account-wide default for new launches, with newer instance types IMDSv2-only. Turn it on, then set the hop limit to 1 for anything not running containers.
+\end{behind}
+
+\wbsub{3.4\quad Compute \& the Load-Balancing Tier}
+
+\glabel{What is it?} \keyterm{EC2} rents you a virtual machine by the second, booted from an \keyterm{AMI} (a machine image). An \keyterm{Auto Scaling Group} maintains a desired count of healthy instances from a launch template, replacing any that fail. An \keyterm{Application Load Balancer} terminates HTTP and TLS, applies routing rules, and forwards to a \keyterm{target group} of registered targets.
+
+\glabel{Why does it exist?} Before autoscaling groups, capacity was a spreadsheet and a purchase order, and a failed machine was a pager at 3am followed by manual reprovisioning. The ASG turns "we have five healthy web servers" from an observation into a \emph{declared state} the platform enforces --- exactly the same shift Kubernetes makes with a ReplicaSet, one layer down. Before managed load balancers, teams ran HAProxy or nginx pairs with keepalived and a floating IP, and the load balancer itself was the most fragile component in the system.
+
+\glabel{How does it work internally?} An ALB is not a machine; it is a fleet of nodes, one or more per enabled subnet, fronted by a DNS name that resolves to changing IP addresses --- which is why you point a Route 53 alias record at it and never hardcode an IP. Traffic arriving at a listener is matched against ordered rules (host header, path, HTTP method, header, source IP) and forwarded to a target group. The target group runs an independent health check against each target on a configured path and interval; a target must pass a threshold to be considered healthy, and unhealthy targets stop receiving new requests without being terminated. Because the ALB terminates the connection, it can also do sticky sessions, request tracing headers, and per-rule authentication --- all things a Layer 4 balancer structurally cannot.
+
+An NLB operates at Layer 4. It does not parse HTTP, preserves the client source IP by default, supports static IPs and Elastic IPs per AZ, and handles protocols an ALB cannot (arbitrary TCP, UDP, TLS passthrough). Its lower latency comes from doing less.
+
+\begin{center}\small
+\wbrowcolors
+\begin{tabularx}{\linewidth}{@{}L{24mm} X X@{}}
+\wbtablehead{Need} & \wbtablehead{Choose} & \wbtablehead{Because}\\
+Path or host routing & ALB & It parses HTTP; an NLB never sees a URL.\\
+Terminate TLS with ACM & Either & Both integrate with ACM; the ALB can also re-encrypt to targets.\\
+Static IP for a firewall allow-list & NLB & An ALB's addresses change.\\
+Raw TCP, UDP, or mTLS passthrough & NLB & The ALB only speaks HTTP/HTTPS/gRPC.\\
+Extreme connection rates, low latency & NLB & Less per-packet work.\\
+WebSockets, gRPC, redirect rules & ALB & Protocol-aware features.\\
+\end{tabularx}
+\end{center}
+
+\begin{wbfigure}{Fig 10.4 — The request path. Health checks are a separate, continuous loop; they decide which targets the listener rule is allowed to choose.}
+\wbscale{\begin{tikzpicture}[node distance=5mm, every node/.style={font=\sffamily\scriptsize},
+   stg/.style={wbbox, minimum width=56mm, minimum height=7mm, align=left, text width=50mm}]
+  \node[stg, wbboxghost] (dns) {\textbf{Route 53 alias} \hfill \scriptsize api.cloudbase.io};
+  \node[stg, below=of dns] (lis) {\textbf{ALB listener :443} \hfill \scriptsize ACM cert, TLS terminated};
+  \node[stg, wbboxaccent, below=of lis] (rule) {\textbf{Rule match} \hfill \scriptsize host + path prefix};
+  \node[stg, wbboxk8s, below=of rule] (tg) {\textbf{Target group} \hfill \scriptsize healthy targets only};
+  \node[stg, wbboxgood, below=of tg] (t) {\textbf{App instance / pod} \hfill \scriptsize :8080};
+  \foreach \a/\b in {dns/lis,lis/rule,rule/tg,tg/t}{\draw[wbflow] (\a)--(\b);}
+  \node[wbboxops, right=12mm of tg, text width=22mm, align=left] (hc) {health check\\GET /healthz\\every 15s};
+  \draw[wbarrowg] (hc.south) |- (t.east);
+  \draw[wbarrowg] (t.north east) -- (hc.west);
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{reliability}
+Your health check endpoint must reflect the thing the load balancer is deciding: \emph{can this instance serve a request right now?} A \code{/healthz} that returns 200 unconditionally hides a broken instance and keeps sending it traffic. A \code{/healthz} that queries the database on every check turns a database blip into all targets going unhealthy simultaneously --- an outage manufactured by the health check itself. The usual resolution is two endpoints: a shallow liveness check for the balancer, and a deeper readiness check that gates startup and deployment. This is the same distinction Kubernetes draws on Day 6, for the same reason.
+\end{reliability}
+
+\begin{tradeoff}
+Scaling on CPU is the default and is usually wrong for a request-serving service. CPU is a lagging, indirect signal --- an I/O-bound API can be saturated at 30\% CPU. Target-tracking on \emph{requests per target} or on p99 latency reacts to the thing users experience. The trade-off is noise: a request-based metric is spikier, so pair it with a cooldown and a sensible minimum capacity, or you will pay for a fleet that oscillates.
+\end{tradeoff}
+
+\wbsub{3.5\quad S3 --- Object Storage as the Platform's Substrate}
+
+\glabel{What is it?} S3 stores immutable \keyterm{objects} in flat \keyterm{buckets}, addressed by key. There is no filesystem, no in-place edit, no rename: writing to an existing key replaces the whole object. Keys containing slashes look like directories in the console, but the prefix is just part of the name.
+
+\glabel{Why does it exist?} Shared filesystems do not scale across data centres, and POSIX semantics --- in-place partial writes, locking, atomic rename, directory metadata --- are exactly what makes them hard to distribute. S3 dropped all of it. Because objects are immutable and namespaced by key, S3 can replicate and shard aggressively, which is why it can be effectively unbounded in capacity and durability while a NAS cannot.
+
+\glabel{How does it work internally?} The bucket namespace is partitioned by key prefix; S3 splits and rebalances partitions automatically as request rates grow, which is why highly sequential key prefixes (a timestamp at the front of every key) can hot-spot a partition while high-entropy prefixes spread naturally. Durability comes from erasure-coding each object's shards across multiple facilities within the region. Since 2020 all GET/PUT/LIST operations are strongly read-after-write consistent --- older tutorials warning about eventual consistency describe a system that no longer exists.
+
+\glabel{When should I use it?} Build artifacts, container-adjacent blobs, Terraform state, backups, logs, static assets, data-lake storage, and anything a user uploads. In CloudBase, S3 is the Day 7 state backend and the Day 9 artifact store; both were already S3 without you looking at it closely.
+
+\glabel{When should I \emph{not}?} As a database, or as a filesystem for a running application. Objects have no partial update and no locking; "read, modify, write the whole object" from two processes silently loses one of them. If you need POSIX semantics, use EFS and accept its cost; if you need transactions, use RDS.
+
+\begin{secwarn}[the default changed, and you should still be explicit]
+Publicly readable buckets remain one of the most common causes of real-world data exposure. Since April 2023 AWS enables S3 Block Public Access and disables ACLs on all \emph{newly created} buckets, which removes the classic accidental-\code{public-read} footgun. That is a floor, not a strategy: existing buckets were not changed, and any engineer with the right permission can still turn it off. Set Block Public Access at the \emph{account} level, enforce it with an SCP, and serve genuinely public content through CloudFront with an origin access control rather than by opening the bucket.
+\end{secwarn}
+
+\begin{costnote}
+Storage class and lifecycle are the whole cost story for S3. A bucket collecting build artifacts, CI logs and old backups grows monotonically and nobody ever deletes anything, because deleting feels risky and costs nothing to postpone. Write the lifecycle rule when you create the bucket: transition to Infrequent Access or Glacier at a defined age, expire non-current versions, and abort incomplete multipart uploads after seven days. That last one is the invisible leak --- failed uploads leave parts you are charged for and cannot see in the object listing.
+\end{costnote}
+
+\begin{tfbox}[storage.tf --- artifacts bucket with lifecycle and lock-down]
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "cloudbase-artifacts-prod"
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+
+  rule {
+    id     = "expire-old-artifacts"
+    status = "Enabled"
+    filter { prefix = "builds/" }
+    noncurrent_version_expiration { noncurrent_days = 30 }
+    abort_incomplete_multipart_upload { days_after_initiation = 7 }
+  }
+}
+\end{tfbox}
+
+\wbsub{3.6\quad RDS --- Managed Databases, Multi-AZ vs Read Replicas}
+
+\glabel{What is it?} \keyterm{RDS} runs a standard engine (PostgreSQL, MySQL, and others) on instances AWS operates: it handles patching, automated backups with point-in-time recovery, parameter groups, and failover. You get a hostname and a port; you do not get the operating system.
+
+\glabel{Why does it exist?} Running a production relational database means backups you have actually tested, replication that is monitored, failover that is rehearsed, and minor-version upgrades that do not lose data. Teams that ran their own Postgres spent a meaningful fraction of an engineer on those four things forever. RDS trades some control for the removal of that standing cost.
+
+\glabel{How does it work internally?} The two features people conflate work completely differently.
+
+\keyterm{Multi-AZ} provisions a standby in a second availability zone kept in sync \emph{synchronously} at the storage layer. The standby serves no traffic --- it accepts no connections and answers no reads. On failure, AWS repoints the database's DNS record at the standby; your application reconnects to the same hostname and continues. It buys \emph{availability}, and it costs roughly double, and it slightly increases write latency because a commit must be acknowledged in two AZs.
+
+A \keyterm{read replica} is an \emph{asynchronous} copy that does serve reads. It has its own endpoint, so the application must deliberately route read-only queries to it, and it lags the primary by an amount that varies with write load. It buys \emph{read capacity}. It is not failover: promoting a replica is a manual (or scripted) operation, and any transactions not yet replicated at the moment of failure are lost.
+
+\begin{wbfigure}{Fig 10.5 — Two different problems. The standby answers nothing and exists for failover; the replica answers reads and lags.}
+\wbscale{\begin{tikzpicture}[node distance=6mm, every node/.style={font=\sffamily\scriptsize}]
+  \node[wbcyl] (p1) {Primary\\AZ-a};
+  \node[wbcyl, wbboxghost, right=14mm of p1, draw=cInk!35, fill=cInk!4] (sb) {Standby\\AZ-b};
+  \draw[wbarrow] (p1)--node[wbcap,above]{sync}(sb);
+  \node[wbcap, below=3mm of p1, text width=30mm] {app writes and reads};
+  \node[wbcap, below=3mm of sb, text width=30mm] {serves nothing until failover};
+  \node[wbcyl, below=20mm of p1] (p2) {Primary\\AZ-a};
+  \node[wbcyl, right=14mm of p2] (rr) {Read replica\\AZ-b};
+  \draw[wbarrowg] (p2)--node[wbcap,above]{async · lag}(rr);
+  \node[wbcap, below=3mm of p2, text width=30mm] {all writes};
+  \node[wbcap, below=3mm of rr, text width=30mm] {reports, read-only APIs};
+\end{tikzpicture}}
+\end{wbfigure}
+
+\begin{drtip}
+Multi-AZ is not a backup. It replicates faithfully --- including the \code{DELETE} that a bad migration just ran, and including corruption. Availability protects you from infrastructure failure; backups protect you from \emph{you}. Keep automated backups with a retention window that matches how long a logical error can go unnoticed (often longer than you think), enable deletion protection, and restore a snapshot into a scratch instance on a schedule. A backup you have never restored is a hypothesis.
+\end{drtip}
+
+\begin{scalenote}
+Read replicas move read load, not write load, and they do not remove the primary's bottleneck --- they add to it, because replication itself is work. When writes are the constraint the answers are different in kind: connection pooling in front of the database (RDS Proxy or PgBouncer), caching, batching, then partitioning or sharding. Reaching for a read replica when the primary is write-saturated makes the problem slightly worse and buys nothing.
+\end{scalenote}
+
+\wbsub{3.7\quad Cost as an Engineering Concern}
+
+\glabel{Why does it exist as a topic?} On-premises, capacity was capital expenditure decided once a year; a bad architecture wasted hardware you had already bought. In the cloud every architectural decision has a recurring price, charged hourly, forever, whether or not anyone uses the resource. Cost is therefore a property of the design --- and reviewing it is an engineering activity, not an accounting one.
+
+\glabel{How does it work internally?} Almost all surprising AWS bills come from three mechanisms rather than from compute:
+
+\begin{wbitem}
+  \item \textbf{Per-hour charges for provisioned things.} A NAT gateway is billed for every hour it exists plus a per-GB data-processing charge, and production guidance is one per AZ for availability --- so a three-AZ VPC pays three hourly charges before a single byte moves. Load balancers, Elastic IPs and provisioned IOPS bill the same way.
+  \item \textbf{Data transfer, especially across boundaries.} Traffic between availability zones is charged in both directions; traffic out to the internet is charged again. A chatty service placed in one AZ talking to a database in another pays for every round trip, permanently, invisibly.
+  \item \textbf{Orphans.} Unattached EBS volumes after an instance is terminated, snapshots of deleted volumes, idle load balancers left behind by a deleted environment, old AMIs and their backing snapshots. Each is small; together they are the steady-state waste in most accounts.
+\end{wbitem}
+
+\begin{costnote}[the NAT gateway is usually the first thing worth fixing]
+If your private subnets pull container images, packages and S3 objects through a NAT gateway, you are paying a per-GB processing fee for traffic that never needed to leave AWS. A \emph{gateway VPC endpoint} for S3 and DynamoDB costs nothing and routes that traffic off the NAT path entirely --- one route-table entry. Interface endpoints for ECR, CloudWatch Logs and Secrets Manager do carry an hourly charge, so compare them against the NAT data volume they displace rather than adding them reflexively. Measure first: VPC Flow Logs will tell you exactly what is crossing the NAT gateway.
+\end{costnote}
+
+\begin{seniornote}
+Tag everything at creation, in Terraform, with \code{owner}, \code{environment} and \code{service} --- and make untagged resources fail the pipeline. The reason is not the bill; it is that six months from now somebody will find a load balancer costing money and nobody will know whether deleting it takes down a customer. Tags are how an infrastructure estate stays legible. A cost report grouped by service tag is one of the most honest architecture reviews you will ever read: it shows what you actually built, weighted by what it actually costs.
+\end{seniornote}
+
+\begin{bestpractices}
+\begin{wbitem}
+  \item Only load balancers and NAT gateways live in public subnets. Application and data tiers have no \code{0.0.0.0/0} route to an internet gateway.
+  \item Security group rules reference other security groups, not CIDR ranges, wherever both sides are yours.
+  \item Compute gets an IAM role; static access keys are reserved for things that genuinely cannot assume one, and are scoped and conditioned when they are.
+  \item Scope policies to specific actions and specific ARNs, and add explicit \code{Deny} guardrails for the things that must never happen.
+  \item Block public access on S3 at the account level, enforce it with an SCP, and write the lifecycle rule when you create the bucket.
+  \item Spread across at least two AZs, and check that both the ASG and the load balancer are actually enabled in both.
+  \item Tag every resource at creation with owner, environment and service, from code.
+\end{wbitem}
+\end{bestpractices}
+\begin{mistakes}
+\begin{wbitem}
+  \item Putting the database in a public subnet "so it is easier to connect" --- then adding \code{0.0.0.0/0} on port 5432 to make it work.
+  \item Granting \code{s3:*} on \code{*} because a scoped policy returned AccessDenied once.
+  \item Hardcoding an access key in a container image, a Terraform variable file, or CI --- and assuming a private repository is a control.
+  \item Assuming a read replica will fail over automatically the way a Multi-AZ standby does.
+  \item Health checks that always return 200, or that call the database and take the whole fleet down together.
+  \item Running one NAT gateway shared across AZs to save money, creating a single point of failure and cross-AZ transfer charges.
+  \item Never deleting anything, then being surprised by the bill and blaming "the cloud".
+\end{wbitem}
+\end{mistakes}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{4}{Visualizations to Internalize}
+
+Redraw these from memory. If you can draw the reachability chain and the IAM decision chain on a whiteboard, you can debug most AWS incidents without opening the console.
+
+\begin{writespace}[Redraw: the CloudBase VPC --- two AZs, three subnet tiers, IGW, NAT, ALB, RDS. Label which route table entry makes each subnet public or private]
+\reflectionlines[7]
+\end{writespace}
+
+\begin{writespace}[Redraw: the IAM evaluation chain from request context to Allow, marking where an explicit Deny short-circuits and where policies intersect rather than union]
+\reflectionlines[6]
+\end{writespace}
+
+% -----------------------------------------------------------------
+\wbpart[cLab]{5}{Guided Hands-On Lab — Stand Up the CloudBase AWS Environment}
+
+\textbf{Goal.} Build --- in Terraform, extending Day 7 --- a two-AZ VPC with public, private-app and private-data tiers, an ALB as the only public entry point, an autoscaled compute tier, an RDS instance with no internet route, and an S3 bucket for artifacts. You are practising the \emph{decisions}, not typing HCL from a tutorial.
+
+\resetlab
+\labstep{Choose the address plan before you write any code}
+Pick a \code{/16} for this environment from a written allocation table, then split it: \code{/20} per tier per AZ leaves room to grow, and keeps subnet boundaries readable at a glance.
+\labwhy{CIDR choice is the one decision here that is expensive to reverse. Overlapping ranges cannot be peered, and re-addressing a live VPC is a migration project. Ten minutes now, or a quarter later.}
+
+\labstep{Create the VPC, subnets and route tables as three explicit tiers}
+Public, private-app and private-data --- each with its own route table, even where two tables start identical.
+\labwhy{Sharing a route table between tiers means a future edit intended for one tier silently applies to another. Separate tables make "the data tier has no internet route" a structural fact that a diff will show.}
+
+\labstep{Attach an internet gateway and add the default route to the public tier only}
+Then verify by reading the private tiers' route tables and confirming no \code{0.0.0.0/0} entry exists.
+\labwhy{This is the moment the words "public subnet" acquire meaning. Reading the table back is the habit that catches the mistake; trusting the module name is what causes it.}
+
+\labstep{Place one NAT gateway per AZ and point each private-app route table at its own}
+Note the cost of what you just did, and note what a single shared NAT would have cost you in availability.
+\labwhy{A shared NAT gateway is a cheaper single point of failure that also generates cross-AZ transfer charges. Making the trade-off consciously --- and writing it in the README --- is the senior behaviour.}
+
+\labstep{Add a gateway VPC endpoint for S3}
+Route S3 traffic from the private subnets through the endpoint instead of the NAT gateway.
+\labwhy{Gateway endpoints are free and remove a per-GB charge on traffic that never needed to leave AWS. It is the highest ratio of saving to effort in this entire chapter.}
+
+\labstep{Define security groups that reference each other}
+ALB accepts 443 from the internet; app accepts its port from the ALB's group; database accepts 5432 from the app's group. No CIDR ranges between your own tiers.
+\labwhy{Group-to-group rules survive every autoscaling event and AMI swap. They also read as intent --- "the app may reach the database" --- rather than as a list of addresses somebody must maintain.}
+
+\labstep{Give the compute tier an instance profile, and remove every credential}
+Attach a role granting exactly the S3 prefix and Secrets Manager entries the app needs. Confirm no key exists in the AMI, the user data, or the environment.
+\labwhy{You are converting a secret into an identity. Verify by looking for what should be absent --- that inversion is the whole discipline of credential hygiene.}
+
+\labstep{Launch RDS into the data subnets, Multi-AZ, and prove the isolation}
+Then attempt to connect from outside the VPC and watch it time out rather than refuse.
+\labwhy{A timeout means no route; a refusal means a route existed and something rejected you. Learning to read that difference will save you hours later.}
+
+\begin{prodtip}
+Before you call it done, force a failover on the RDS instance (there is an explicit reboot-with-failover option) while a client is connected, and watch what your application does. Most applications discover for the first time in a real incident that their connection pool caches DNS forever and never reconnects. A rehearsed failover during working hours is a ten-minute exercise; an unrehearsed one is an outage with an audience.
+\end{prodtip}
+
+% -----------------------------------------------------------------
+\wbpart[cThink]{6}{Thinking Exercises}
+
+\begin{thinkbox}
+AWS made explicit \code{Deny} unconditionally win over any \code{Allow}, rather than using a "most specific rule wins" model like many firewalls. What class of mistake does that choice prevent, and what does it make harder or more frustrating in day-to-day work?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+A private subnet has no inbound path from the internet, yet a machine in one can still be compromised --- through a poisoned dependency, a vulnerable outbound HTTP client, or a stolen credential used from inside. Given that, what is the private subnet actually buying you, and what should you add so that it is not the only thing standing between an attacker and your data?
+\reflectionlines[3]
+\end{thinkbox}
+
+\begin{thinkbox}
+Cross-AZ data transfer is charged in both directions, yet spreading across AZs is the standard availability advice. Describe a concrete workload where the correct engineering answer is to keep chatty components in a single AZ, and what you would put in place to make that choice safe.
+\reflectionlines[3]
+\end{thinkbox}
+
+% -----------------------------------------------------------------
+\wbpart[cDebug]{7}{Debugging Practice}
+
+\begin{debuglab}{Pods in the new private subnet cannot pull images}
+\textbf{Symptom.} After adding a third availability zone, workloads scheduled onto nodes in the new subnet sit in \code{ImagePullBackOff}. The same image pulls fine on nodes in the two original AZs.
+
+\begin{outbox}[route table for the new private subnet, and a pod event]
+$ aws ec2 describe-route-tables --route-table-ids rtb-0c3newprivate
+DestinationCidrBlock   GatewayId / NatGatewayId   State
+10.0.0.0/16            local                      active
+# ...no other routes...
+
+Events:
+  Warning  Failed  kubelet  Failed to pull image "1234.dkr.ecr.eu-west-1.amazonaws.com/cloudbase-api:9f21c":
+  rpc error: code = Unknown desc = failed to resolve reference: dial tcp 52.x.x.x:443: i/o timeout
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} A timeout, not a refusal or an authentication error --- and it is scoped to one subnet. That combination points at routing, not at credentials or the registry.
+  \item \textbf{Hypothesise.} The new private subnet was created but never associated with a route table containing a NAT route, so it fell back to the VPC main route table, which only has \code{local}.
+  \item \textbf{Investigate.} Compare the three private subnets' route table associations. Confirm the NAT gateway for the new AZ exists and is in the \emph{public} subnet of that AZ, not the private one.
+  \item \textbf{Root cause.} A missing subnet-to-route-table association. The Terraform module created the subnet and the NAT gateway but the association resource was not extended to the third AZ.
+  \item \textbf{Fix.} Add the association and the \code{0.0.0.0/0} $\rightarrow$ NAT route for the new AZ, apply, and let the kubelet retry.
+  \item \textbf{Prevent.} Drive subnets, NAT gateways, route tables and associations from a single \code{for\_each} over the AZ list so a new AZ cannot be half-created --- and add an ECR interface endpoint so image pulls stop depending on NAT at all.
+\end{tickcheck}
+\end{debuglab}
+
+\begin{debuglab}{AccessDenied on S3 despite an Allow policy that looks correct}
+\textbf{Symptom.} The application's role has an \code{s3:PutObject} Allow on the bucket, but uploads fail. The same call succeeds from an administrator's session.
+
+\begin{outbox}[application log and a policy simulation]
+2026-07-19T11:04:22Z ERROR upload failed: AccessDenied: User:
+arn:aws:sts::1234:assumed-role/cloudbase-app/i-0ab12 is not authorized to
+perform: s3:PutObject on resource: arn:aws:s3:::cloudbase-uploads-prod/tenant/42/a.png
+with an explicit deny in a service control policy
+\end{outbox}
+
+\begin{tickcheck}
+  \item \textbf{Observe.} The error text names the deciding factor: \emph{an explicit deny in a service control policy}. AWS usually tells you which layer denied the request --- read the whole message before theorising.
+  \item \textbf{Hypothesise.} An organisation-level SCP denies S3 writes that do not meet a condition --- commonly a required encryption header, a TLS-only condition, or a region restriction.
+  \item \textbf{Investigate.} Read the SCPs attached to the account and its parent OUs, then re-run the call with the condition satisfied. The IAM policy simulator can evaluate with organisation policies included.
+  \item \textbf{Root cause.} The SCP denies \code{s3:PutObject} unless \code{s3:x-amz-server-side-encryption} is present; the SDK call omitted it because the bucket relies on default encryption, which does not set the request header.
+  \item \textbf{Fix.} Set the encryption header in the client, or narrow the SCP condition to match how default bucket encryption actually behaves.
+  \item \textbf{Prevent.} Test guardrails against a real workload in a sandbox account before attaching them to production OUs, and remember the rule: an SCP can only subtract. Widening the role's policy would never have fixed this.
+\end{tickcheck}
+\end{debuglab}
+
+% -----------------------------------------------------------------
+\wbpart{8}{Mini-Labs}
+
+\begin{minilab}{Beginner}{~45 min}
+\textbf{Goal.} Write a least-privilege IAM policy and prove it is minimal.\\
+\textbf{Business context.} An image-processing service must read and write one prefix of one bucket, nothing else.\\
+\textbf{Architecture.} One role, one policy document, one bucket with two prefixes.\\
+\textbf{Requirements.} Scope object actions to \code{tenant/*}; add a separate \code{ListBucket} statement with a prefix condition; add an explicit \code{Deny} for non-TLS requests.\\
+\textbf{Constraints.} No wildcard action, no wildcard resource, no managed policy shortcuts.\\
+\textbf{Hints.} Object actions take the bucket ARN plus \code{/*}; bucket-level actions take the bucket ARN alone.\\
+\textbf{Expected outcome.} Reading the permitted prefix succeeds; reading a sibling prefix and any plaintext call fail.\\
+\textbf{Production considerations.} How would you discover the true minimum set of actions for an existing service? (CloudTrail, then IAM Access Analyzer policy generation.)\\
+\textbf{Common pitfalls.} Putting \code{/*} on a \code{ListBucket} resource; assuming default bucket encryption satisfies a request-header condition.
+\end{minilab}
+
+\begin{minilab}{Intermediate}{~75 min}
+\textbf{Goal.} Build the two-AZ VPC in Terraform and prove the isolation properties empirically.\\
+\textbf{Business context.} A security review asks you to demonstrate --- not assert --- that the data tier is unreachable from the internet.\\
+\textbf{Architecture.} VPC, three subnet tiers across two AZs, IGW, one NAT per AZ, S3 gateway endpoint, group-to-group security rules.\\
+\textbf{Requirements.} Every subnet, route table and association driven from a single AZ list; an output listing each subnet's effective default route.\\
+\textbf{Constraints.} No default VPC, no \code{0.0.0.0/0} ingress except on the ALB's group, port 443 only.\\
+\textbf{Hints.} Use \code{for\_each} over a map of AZ to CIDR so adding an AZ is a one-line change.\\
+\textbf{Expected outcome.} A short written proof: for each tier, the route table contents and a connection test whose result matches.\\
+\textbf{Production considerations.} Enable VPC Flow Logs and identify what is crossing the NAT gateway; estimate the monthly cost of that traffic.\\
+\textbf{Common pitfalls.} Creating a NAT gateway in a private subnet; forgetting the route-table association; enabling the ALB in only one AZ.
+\end{minilab}
+
+\begin{minilab}{Production-style}{~2.5 hours}
+\textbf{Goal.} Deliver the complete CloudBase AWS environment, with a failover rehearsal and a cost review.\\
+\textbf{Business context.} This environment will receive the Day 9 pipeline's deployments tomorrow; it must be reproducible from an empty account.\\
+\textbf{Architecture.} VPC (2 AZs, 3 tiers) $\rightarrow$ ALB $\rightarrow$ autoscaled compute $\rightarrow$ RDS Multi-AZ $\rightarrow$ S3 for artifacts and state, roles throughout.\\
+\textbf{Requirements.} No static credentials anywhere; account-level S3 public access block; lifecycle rules; deletion protection and backups on RDS; every resource tagged with owner, environment and service.\\
+\textbf{Constraints.} \code{terraform destroy} then \code{apply} must reproduce the environment exactly; no console clicks.\\
+\textbf{Hints.} Split into modules --- network, compute, data --- with explicit outputs, so the network module can be reused per environment.\\
+\textbf{Expected outcome.} A working environment, a forced RDS failover with the observed application behaviour written down, and a one-page cost estimate naming the three largest line items.\\
+\textbf{Production considerations.} Which resources would you protect with \code{prevent\_destroy}, and what is your recovery story if the state file is lost?\\
+\textbf{Common pitfalls.} Hardcoding AZ names; forgetting that a security group cannot be deleted while an ENI references it; discovering the NAT gateway cost only after the first bill.
+\end{minilab}
+
+% -----------------------------------------------------------------
+\wbpart{9}{Engineering Notes}
+
+\begin{opsnote}
+The AWS console is a debugging tool, not a change interface. Anything you click is invisible to your Terraform state, unreviewed, undocumented, and gone the next time somebody applies. The discipline that keeps a cloud account comprehensible is simple and unpopular: read in the console, write in code. When an emergency genuinely forces a manual change, open the pull request that codifies it before you close the incident, not "later".
+\end{opsnote}
+
+\begin{infranote}
+Availability zone names are not stable across accounts. \code{eu-west-1a} in your account may be different physical infrastructure from \code{eu-west-1a} in a colleague's --- AWS randomises the mapping per account to spread load. Pin placement by AZ \emph{ID} when it matters (for example when co-locating with a partner's resources), and never assume two accounts' "same" AZ are the same building.
+\end{infranote}
+
+\begin{autotip}
+Guardrails belong in policy, not in review comments. An SCP that denies creating an IAM user, or denies disabling S3 public access blocks, or denies launching outside approved regions, enforces itself at 3am on a Sunday when nobody is reading pull requests. Combine that with IAM Access Analyzer to find resources shared outside the account, and with Config rules for drift you cannot express as a deny.
+\end{autotip}
+
+\begin{interview}
+Expect: \emph{"How does AWS decide whether to allow a request?"} The answer that lands is the chain: deny by default, an explicit Deny anywhere is final, identity and resource policies union within an account, and boundaries and SCPs intersect --- they can only subtract. Then close it with the practical consequence: when you get AccessDenied, read which layer denied you before widening any policy, because if an SCP denied it, no amount of granting will ever help.
+\end{interview}
+
+\begin{drtip}
+Your disaster-recovery story is only as good as the thing that is hardest to rebuild. Machines are disposable and defined in code; data is not. Rank your recovery work by what cannot be regenerated: the database, the object store, and the Terraform state. Everything else can be re-created from the repository in an afternoon --- provided the repository actually describes it, which is precisely why the console discipline above matters.
+\end{drtip}
+
+% -----------------------------------------------------------------
+\wbpart[cBuild]{10}{Build-Along Project — CloudBase}
+
+Day 3 gave CloudBase an address plan on paper. Day 7 declared infrastructure in Terraform with remote state. Day 9 built and pushed an image through a pipeline that, until now, had nowhere to deploy to. Today all three become one running environment in a real AWS account.
+
+\begin{buildalong}[Day 10 — the real network, identity and data tier]
+\begin{wbitem}
+  \item Realise the Day 3 address plan: a VPC with public, private-app and private-data subnets across two AZs, each tier with its own route table.
+  \item Attach an internet gateway to the public tier only; place one NAT gateway per AZ and route the private-app tier through it. Add a free S3 gateway endpoint and confirm S3 traffic no longer crosses NAT.
+  \item Deploy an Application Load Balancer as the \emph{only} public entry point --- HTTPS listener with an ACM certificate, health-checked target group, enabled in both AZs.
+  \item Run the compute tier (EC2 autoscaling group or EKS nodes, matching Day 5--6) in the private-app subnets, registered with the target group.
+  \item Launch RDS Multi-AZ into the private-data subnets, with a subnet group spanning both AZs, deletion protection on, automated backups on, and a security group that accepts 5432 only from the application's security group.
+  \item Replace every credential with an identity: instance profile or Pod Identity for the app, an OIDC-federated role for the Day 9 pipeline. Grep the repository, the image and the launch template to prove no access key survives.
+  \item Move Terraform state and build artifacts into S3 buckets with versioning, lifecycle rules and public access blocked at the account level.
+  \item Tag every resource with \code{owner}, \code{environment} and \code{service}; produce a one-page cost estimate naming the three largest recurring line items and one change that would reduce each.
+\end{wbitem}
+\smallskip\textbf{Definition of done:} from an empty account, \code{terraform apply} produces a reachable HTTPS endpoint served by instances in private subnets; the database is unreachable from outside the VPC (a timeout, not a refusal); no static AWS credential exists anywhere in the repository, image or instance configuration; a forced RDS failover is survived by the application with the behaviour written down; and the cost estimate is committed alongside the code.
+\end{buildalong}
+
+% -----------------------------------------------------------------
+\wbpart{11}{Chapter Summary}
+
+\wbsub{Key takeaways}
+\begin{tickcheck}
+  \item A subnet is private because its route table lacks a route to an internet gateway --- nothing else makes it private.
+  \item Security groups are stateful and allow-only; NACLs are stateless and ordered, and need explicit return-traffic rules.
+  \item Reference security groups from other security groups, not CIDRs, so rules survive autoscaling.
+  \item IAM denies by default; an explicit \code{Deny} anywhere is final; boundaries and SCPs only ever subtract.
+  \item A role plus STS removes the secret entirely --- there is nothing to leak because nothing is stored.
+  \item ALB is Layer 7 (host and path routing, HTTP awareness); NLB is Layer 4 (static IPs, raw TCP/UDP, lower latency).
+  \item Multi-AZ is availability and serves nothing; a read replica is read capacity and does not fail over.
+  \item Cost is architecture: NAT hours, cross-AZ transfer, and resources nobody deleted.
+\end{tickcheck}
+
+\wbsub{Things to remember}
+\begin{wbitem}
+  \item A connection \emph{timeout} means no route; a \emph{refusal} means a route existed and something said no. Different bugs.
+  \item Bucket-level actions like \code{s3:ListBucket} take the bucket ARN \emph{without} \code{/*}; object actions take it \emph{with}.
+  \item AZ names are randomised per account; AZ IDs are not.
+  \item Read in the console, write in code. Every console change is future drift.
+\end{wbitem}
+
+\wbsub{Common pitfalls (last look)}
+\begin{wbitem}
+  \item Database in a public subnet \quad$\bullet$\quad \code{s3:*} on \code{*} \quad$\bullet$\quad hardcoded access keys
+  \item NAT gateway in a private subnet \quad$\bullet$\quad ALB enabled in one AZ only \quad$\bullet$\quad health checks that always pass
+  \item Expecting a read replica to fail over \quad$\bullet$\quad no lifecycle rules \quad$\bullet$\quad untagged resources
+\end{wbitem}
+
+\begin{cheatsheet}
+\cheatitem{VPC}{your CIDR in one region; subnets each live in exactly one AZ.}
+\cheatitem{Public subnet}{a route table with \code{0.0.0.0/0} $\rightarrow$ internet gateway. That line \emph{is} the definition.}
+\cheatitem{NAT gateway}{outbound-only egress for private subnets; per-hour plus per-GB; one per AZ in production.}
+\cheatitem{Security group}{stateful, allow-only, union of rules; source may be another security group.}
+\cheatitem{IAM}{deny by default $\rightarrow$ explicit Deny wins $\rightarrow$ identity/resource union $\rightarrow$ boundary and SCP intersect.}
+\cheatitem{Role + STS}{temporary credentials from the instance profile or Pod Identity; no secret to leak.}
+\cheatitem{ALB vs NLB}{L7 host/path routing versus L4 static IP and raw TCP/UDP.}
+\cheatitem{Multi-AZ vs replica}{synchronous standby for failover (serves nothing) versus async copy for reads (no failover).}
+\end{cheatsheet}
+
+\wbsub{CLI quick reference}
+\begin{bashbox}[Day 10 commands worth memorising]
+# who am I, really? (the single most useful AWS command)
+aws sts get-caller-identity
+
+# reachability: read the route table before widening any security group
+aws ec2 describe-route-tables --filters Name=association.subnet-id,Values=subnet-0ab
+aws ec2 describe-security-groups --group-ids sg-0ab --query 'SecurityGroups[].IpPermissions'
+
+# who can reach what, end to end, without sending a packet
+aws ec2 describe-network-insights-analyses
+
+# load balancer health: the answer to "why is traffic not arriving?"
+aws elbv2 describe-target-health --target-group-arn <arn>
+
+# storage hygiene
+aws s3api get-public-access-block --bucket cloudbase-artifacts-prod
+aws s3api get-bucket-lifecycle-configuration --bucket cloudbase-artifacts-prod
+
+# database posture
+aws rds describe-db-instances --query \
+  'DBInstances[].{id:DBInstanceIdentifier,az:MultiAZ,pub:PubliclyAccessible}'
+
+# orphans that quietly cost money every hour
+aws ec2 describe-volumes --filters Name=status,Values=available
+aws ec2 describe-addresses --query 'Addresses[?AssociationId==null]'
+\end{bashbox}
+
+\begin{iqbox}
+\iq{Why can a private subnet not be reached directly from the internet, by design --- and what exactly enforces that?}
+\iq{What is the practical difference between an ALB and an NLB, and when would you be forced to choose the NLB?}
+\iq{Why is a static IAM access key a bigger long-term risk than an assumed role?}
+\iq{Multi-AZ versus read replica --- what problem does each actually solve, and which one is a backup?}
+\iq{How would you scope an IAM policy to the minimum permissions a service needs, and how would you discover that minimum?}
+\iq{Walk me through IAM's evaluation order. Where does an explicit Deny fit, and can an SCP ever grant access?}
+\iq{What is the blast-radius difference between compromising something in a public subnet and something in a private one?}
+\iq{Name three line items that make an AWS bill larger than people expect, and what you would do about each.}
+\end{iqbox}
+
+\wbsub{Further reading \& official docs}
+\begin{wbitem}
+  \item AWS IAM User Guide --- "Policy evaluation logic", on \code{docs.aws.amazon.com} under \code{IAM/latest/UserGuide}: the authoritative evaluation order, including SCPs, RCPs, permissions boundaries and the explicit-deny rule.
+  \item Amazon VPC User Guide --- "Pricing for NAT gateways" and the VPC pricing page: read these before you design your AZ layout, not after.
+  \item Amazon S3 User Guide --- "Blocking public access to your Amazon S3 storage", plus the AWS announcement that Block Public Access is enabled and ACLs disabled by default for new buckets from April 2023.
+  \item Amazon EKS User Guide --- "IAM roles for service accounts" and "EKS Pod Identity": the two ways a pod gets an AWS identity, and why the newer one exists.
+  \item AWS News Blog --- "Amazon EC2 Instance Metadata Service IMDSv2 by default": what changed, and how to enforce it account-wide.
+  \item Netflix TechBlog --- "How Netflix is able to enrich VPC Flow Logs at Hyper Scale to provide Network Insight": what network observability looks like when the VPC is very large and IP addresses are ephemeral.
+  \item AWS Well-Architected Framework --- the Security and Cost Optimization pillars, read as a review checklist rather than as prose.
+\end{wbitem}
+
+\wbsub{Production checklist}
+\begin{checklist}
+  \item Application and data tiers sit in subnets with no \code{0.0.0.0/0} route to an internet gateway.
+  \item The load balancer is the only resource accepting traffic from the internet, on 443 only.
+  \item Security group rules between your own tiers reference groups, not CIDR ranges.
+  \item Every compute resource uses an IAM role; a repository-wide search finds no access key.
+  \item S3 public access is blocked at the account level and enforced by an SCP.
+  \item Every bucket has versioning and a lifecycle rule, including multipart-upload cleanup.
+  \item RDS has Multi-AZ, automated backups, deletion protection --- and a restore that has been tested.
+  \item Resources are spread across at least two AZs, and both the ASG and the load balancer are enabled in both.
+  \item Every resource is tagged with owner, environment and service, from code.
+  \item Someone has looked at the cost report this month and can explain the top three line items.
+\end{checklist}
+
+\begin{keyidea}
+\textbf{What you will learn next (Day 11).} You now have infrastructure that is reachable, authorised and paid for --- and almost entirely opaque. Tomorrow you make it observable: metrics that answer whether users are being served, the difference between a metric, a log and a trace, Prometheus's pull model and why it works the way it does, and alerts that fire on symptoms rather than on causes. The ALB target-health check you wrote today is the first monitor in that system; Day 11 turns it into a signal you can actually act on.
+\end{keyidea}
